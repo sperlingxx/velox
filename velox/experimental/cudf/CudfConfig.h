@@ -41,10 +41,14 @@ struct CudfConfig {
   static constexpr const char* kCudfLogFallback{"cudf.log_fallback"};
   static constexpr const char* kCudfGpuTargetBatchRows{
       "cudf.gpu_target_batch_rows"};
+  static constexpr const char* kCudfGpuTargetBatchBytes{
+      "cudf.gpu_target_batch_bytes"};
   static constexpr const char* kCudfPinnedPoolSize{
       "cudf.pinned_pool_size"};
   static constexpr const char* kCudfHostAsPinnedThreshold{
       "cudf.host_as_pinned_threshold"};
+  static constexpr const char* kCudfPackedDtoH{
+      "cudf.packed_dtoh"};
 
   /// Singleton CudfConfig instance.
   /// Clients must set the configs below before invoking registerCudf().
@@ -112,6 +116,15 @@ struct CudfConfig {
   /// until this threshold is reached before launching GPU kernels.
   /// Set to 0 to disable accumulation (process each batch individually).
   int32_t gpuTargetBatchRows{1'000'000};
+
+  /// Target minimum byte size for a GPU batch. When non-zero, used as
+  /// the primary coalescing threshold instead of row counts.
+  /// Default 2 GiB. Set to 0 to fall back to row-based accumulation.
+  int64_t gpuTargetBatchBytes{2'147'483'648L};
+
+  /// Use cudf::pack to consolidate GPU column buffers into a single
+  /// contiguous device buffer before D2H, reducing cudaMemcpyAsync calls.
+  bool packedDtoH{true};
 };
 
 } // namespace facebook::velox::cudf_velox

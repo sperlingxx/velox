@@ -28,8 +28,16 @@ struct source_info;
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace facebook::velox::cudf_velox::connector::hive {
+
+struct CoalescedFileRange {
+  std::string path;
+  uint64_t start;
+  uint64_t length;
+  std::unordered_map<std::string, std::string> infoColumns;
+};
 
 struct CudfHiveConnectorSplit
     : public facebook::velox::connector::ConnectorSplit {
@@ -44,6 +52,9 @@ struct CudfHiveConnectorSplit
   /// associated with the CudfHiveConnectorSplit.
   std::unordered_map<std::string, std::string> infoColumns = {};
 
+  /// Additional files coalesced into this split for batched reading.
+  std::vector<CoalescedFileRange> coalescedFiles;
+
   CudfHiveConnectorSplit(
       const std::string& connectorId,
       const std::string& _filePath,
@@ -51,6 +62,15 @@ struct CudfHiveConnectorSplit
       uint64_t _length = std::numeric_limits<uint64_t>::max(),
       int64_t _splitWeight = 0,
       const std::unordered_map<std::string, std::string>& _infoColumns = {});
+
+  CudfHiveConnectorSplit(
+      const std::string& connectorId,
+      const std::string& _filePath,
+      uint64_t _start,
+      uint64_t _length,
+      int64_t _splitWeight,
+      const std::unordered_map<std::string, std::string>& _infoColumns,
+      std::vector<CoalescedFileRange> _coalescedFiles);
 
   std::string toString() const override;
   std::string getFileName() const;

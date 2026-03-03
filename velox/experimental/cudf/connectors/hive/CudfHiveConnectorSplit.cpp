@@ -60,6 +60,22 @@ CudfHiveConnectorSplit::CudfHiveConnectorSplit(
       cudfSourceInfo(std::make_unique<cudf::io::source_info>(filePath)),
       infoColumns(_infoColumns) {}
 
+CudfHiveConnectorSplit::CudfHiveConnectorSplit(
+    const std::string& connectorId,
+    const std::string& _filePath,
+    uint64_t _start,
+    uint64_t _length,
+    int64_t _splitWeight,
+    const std::unordered_map<std::string, std::string>& _infoColumns,
+    std::vector<CoalescedFileRange> _coalescedFiles)
+    : facebook::velox::connector::ConnectorSplit(connectorId, _splitWeight),
+      filePath(stripFilePrefix(_filePath)),
+      start(_start),
+      length(_length),
+      cudfSourceInfo(std::make_unique<cudf::io::source_info>(filePath)),
+      infoColumns(_infoColumns),
+      coalescedFiles(std::move(_coalescedFiles)) {}
+
 // static
 std::shared_ptr<CudfHiveConnectorSplit> CudfHiveConnectorSplit::create(
     const folly::dynamic& obj) {
