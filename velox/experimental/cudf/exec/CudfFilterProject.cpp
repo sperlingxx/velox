@@ -284,6 +284,13 @@ RowVectorPtr CudfFilterProject::getOutput() {
 
   if (hasFilter_) {
     filter(inputTableColumns, stream);
+    if (!inputTableColumns.empty() && inputTableColumns[0]->size() == 0) {
+      input_.reset();
+      if (!accumulatedOutputs_.empty() && noMoreInput_) {
+        return flushAccumulatedOutputs();
+      }
+      return nullptr;
+    }
   }
   auto outputColumns = project(inputTableColumns, stream);
 
