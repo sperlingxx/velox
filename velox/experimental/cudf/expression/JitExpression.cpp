@@ -41,15 +41,6 @@ ColumnOrView JitExpression::eval(
       expr_.inputRowSchema_,
       stream);
 
-  // Make table_view from input columns and precomputed columns
-  std::vector<cudf::column_view> allColumnViews(inputColumnViews);
-  allColumnViews.reserve(inputColumnViews.size() + precomputedColumns.size());
-  for (auto& precomputedCol : precomputedColumns) {
-    allColumnViews.push_back(asView(precomputedCol));
-  }
-
-  cudf::table_view astInputTableView(allColumnViews);
-
   auto result = [&]() -> ColumnOrView {
     if (auto colRefPtr = dynamic_cast<cudf::ast::column_reference const*>(
             &expr_.cudfTree_.back())) {

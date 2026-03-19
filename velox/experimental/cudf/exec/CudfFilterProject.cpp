@@ -294,6 +294,28 @@ RowVectorPtr CudfFilterProject::getOutput() {
   }
   auto outputColumns = project(inputTableColumns, stream);
 
+  // Validate all output columns have consistent row counts.
+  // A mismatch indicates a project evaluator returned a column with the
+  // wrong size (e.g., pre-filter row count instead of post-filter).
+  if (!outputColumns.empty()) {
+    cudf::size_type expectedRows = -1;
+    for (size_t i = 0; i < outputColumns.size(); ++i) {
+      if (outputColumns[i]) {
+        if (expectedRows < 0) {
+          expectedRows = outputColumns[i]->size();
+        } else {
+          VELOX_CHECK_EQ(
+              outputColumns[i]->size(),
+              expectedRows,
+              "CudfFilterProject output column {} has {} rows, expected {}",
+              i,
+              outputColumns[i]->size(),
+              expectedRows);
+        }
+      }
+    }
+  }
+
   auto outputTable = std::make_unique<cudf::table>(std::move(outputColumns));
   auto const numColumns = outputTable->num_columns();
   auto const size = outputTable->num_rows();
