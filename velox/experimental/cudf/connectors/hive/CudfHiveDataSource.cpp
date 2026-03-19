@@ -47,6 +47,7 @@
 #include <cudf/stream_compaction.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
+#include <cudf/transform.hpp>
 
 #include <cuda_runtime.h>
 
@@ -147,8 +148,6 @@ CudfHiveDataSource::CudfHiveDataSource(
 
     cudfExpressionEvaluator_ = velox::cudf_velox::createCudfExpression(
         remainingFilterExprSet_->exprs()[0], remainingFilterType_);
-    // TODO(kn): Get column names and subfields from remaining filter and add to
-    // readColumnNames_
   }
 
   // Build a combined AST for all subfield filters once. This is query-constant

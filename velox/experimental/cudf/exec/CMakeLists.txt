@@ -26,6 +26,7 @@ add_library(
   CudfOrderBy.cpp
   CudfShufflePartition.cpp
   CudfTopN.cpp
+  CudfTopNRowNumber.cpp
   DebugUtil.cpp
   OperatorAdapters.cpp
   PinnedArrowInterop.cpp
@@ -40,6 +41,7 @@ target_link_libraries(
   velox_cudf_exec
   PUBLIC cudf::cudf
   PRIVATE
+    velox_cudf_kernels
     arrow
     velox_arrow_bridge
     velox_exception

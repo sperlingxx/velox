@@ -88,6 +88,51 @@ TEST_F(CudfFilterProjectTest, hashWithSeedMultiColumns) {
   facebook::velox::test::assertEqualVectors(expected, hashResults);
 }
 
+TEST_F(CudfFilterProjectTest, xxhash64WithSeed) {
+  auto input = makeFlatVector<int64_t>({1, 0, -1});
+  auto data = makeRowVector({input});
+  parse::ParseOptions bigintOptions;
+  auto plan = PlanBuilder()
+                  .setParseOptions(bigintOptions)
+                  .values({data})
+                  .project({"xxhash64_with_seed(42, c0) AS c1"})
+                  .planNode();
+  auto results = AssertQueryBuilder(plan).copyResults(pool());
+
+  // Reference values from Spark: SELECT xxhash64(1), xxhash64(0), xxhash64(-1)
+  // (default seed is 42)
+  auto expected = makeRowVector({
+      makeFlatVector<int64_t>({
+          -7001672635703045582,
+          -5252525462095825812,
+          3858142552250413010,
+      }),
+  });
+  facebook::velox::test::assertEqualVectors(expected, results);
+}
+
+TEST_F(CudfFilterProjectTest, xxhash64WithSeedMultiColumns) {
+  auto c0 = makeFlatVector<StringView>({"hello"_sv, "hello"_sv});
+  auto c1 = makeFlatVector<StringView>({"world"_sv, ""_sv});
+  auto data = makeRowVector({c0, c1});
+  parse::ParseOptions bigintOptions;
+  auto plan = PlanBuilder()
+                  .setParseOptions(bigintOptions)
+                  .values({data})
+                  .project({"xxhash64_with_seed(42, c0, c1) AS c2"})
+                  .planNode();
+  auto results = AssertQueryBuilder(plan).copyResults(pool());
+
+  // Reference: SELECT xxhash64("hello", "world"), xxhash64("hello", "")
+  auto expected = makeRowVector({
+      makeFlatVector<int64_t>({
+          7824066149349576922,
+          -5179011742163812830,
+      }),
+  });
+  facebook::velox::test::assertEqualVectors(expected, results);
+}
+
 TEST_F(CudfFilterProjectTest, dateAdd) {
   const auto dateAdd = [&](const std::string& dateStr, int32_t value) {
     return evaluateOnce<int32_t>(

@@ -12,16 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-add_subdirectory(kernels)
-add_subdirectory(exec)
-add_subdirectory(connectors)
-add_subdirectory(vector)
-add_subdirectory(expression)
+# Shared GPU kernel library.
+# These kernels are designed to be reusable across projects (velox-cudf,
+# spark-rapids-jni) and may eventually be extracted into an independent repo.
 
-if(VELOX_BUILD_TESTING)
-  add_subdirectory(tests)
-endif()
+add_library(
+  velox_cudf_kernels
+  src/TopNRowNumber.cpp)
 
-if(VELOX_ENABLE_BENCHMARKS)
-  add_subdirectory(benchmarks)
-endif()
+set_target_properties(
+  velox_cudf_kernels
+  PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+target_include_directories(
+  velox_cudf_kernels
+  PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+target_link_libraries(velox_cudf_kernels PUBLIC cudf::cudf)

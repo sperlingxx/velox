@@ -22,6 +22,7 @@
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/expression/AstExpression.h"
 #include "velox/experimental/cudf/expression/AstExpressionUtils.h"
+#include "velox/experimental/cudf/expression/DecimalUtils.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 
 #include "velox/core/PlanNode.h"
@@ -525,6 +526,8 @@ CudfHashJoinProbe::CudfHashJoinProbe(
     VELOX_CHECK_EQ(exprs.exprs().size(), 1);
     useAstFilter_ = CudfConfig::getInstance().astExpressionEnabled &&
         !containsDecimalType(exprs.exprs()[0]);
+  }
+}
 
 void CudfHashJoinProbe::initialize() {
   Operator::initialize();
@@ -550,39 +553,25 @@ void CudfHashJoinProbe::initialize() {
   // and the column locations in that schema translate to column locations
   // in whole tables
 
-  // create ast tree
-  if (joinNode_->isRightJoin() || joinNode_->isRightSemiFilterJoin()) {
-    createAstTree(
-        exprs.exprs()[0],
-        facebook::velox::type::concatRowTypes(filterRowTypes));
-
-    // We don't need to get tables that contain conditional comparison columns
-    // We'll pass the entire table. The ast will handle finding the required
-    // columns. This is required because we build the ast with whole row schema
-    // and the column locations in that schema translate to column locations
-    // in whole tables
-
-    if (useAstFilter_) {
-      // create ast tree
-      if (joinNode_->isRightJoin() || joinNode_->isRightSemiFilterJoin()) {
-        createAstTree(
-            exprs.exprs()[0],
-            tree_,
-            scalars_,
-            buildType_,
-            probeType_,
-            rightPrecomputeInstructions_,
-            leftPrecomputeInstructions_);
-      } else {
-        createAstTree(
-            exprs.exprs()[0],
-            tree_,
-            scalars_,
-            probeType_,
-            buildType_,
-            leftPrecomputeInstructions_,
-            rightPrecomputeInstructions_);
-      }
+  if (useAstFilter_) {
+    if (joinNode_->isRightJoin() || joinNode_->isRightSemiFilterJoin()) {
+      createAstTree(
+          exprs.exprs()[0],
+          tree_,
+          scalars_,
+          buildType_,
+          probeType_,
+          rightPrecomputeInstructions_,
+          leftPrecomputeInstructions_);
+    } else {
+      createAstTree(
+          exprs.exprs()[0],
+          tree_,
+          scalars_,
+          probeType_,
+          buildType_,
+          leftPrecomputeInstructions_,
+          rightPrecomputeInstructions_);
     }
   }
 }
@@ -929,7 +918,7 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::innerJoin(
               auto filterTable =
                   std::make_unique<cudf::table>(std::move(joinedCols));
               auto filteredTable = cudf::apply_boolean_mask(
-                  *filterTable, filterColumn, stream, get_output_mr());
+                  *filterTable, filterColumn, stream, cudf::get_current_device_resource_ref());
               return filteredTable->release();
             };
         cudfOutputs.push_back(filteredOutput(
@@ -1023,7 +1012,7 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::leftJoin(
               auto filterTable =
                   std::make_unique<cudf::table>(std::move(joinedCols));
               auto filteredTable = cudf::apply_boolean_mask(
-                  *filterTable, filterColumn, stream, get_output_mr());
+                  *filterTable, filterColumn, stream, cudf::get_current_device_resource_ref());
               return filteredTable->release();
             };
         cudfOutputs.push_back(filteredOutput(
@@ -2055,7 +2044,7 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
           auto leftCudfDataType =
               veloxToCudfDataType(probeType_->childAt(probeChannel));
           auto nullScalar = cudf::make_default_constructed_scalar(
-              leftCudfDataType, stream, get_temp_mr());
+              leftCudfDataType, stream, cudf::get_current_device_resource_ref());
           outCols[outIdx] = cudf::make_column_from_scalar(
               *nullScalar, m, stream, cudf::get_current_device_resource_ref());
         }

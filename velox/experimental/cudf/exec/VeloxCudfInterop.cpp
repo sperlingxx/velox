@@ -305,9 +305,7 @@ AsyncHtoD toCudfTableNoSync(
   AsyncHtoD result;
   ArrowOptions arrowOptions{
       .flattenDictionary = true,
-      .flattenConstant = true,
-      .exportVarbinaryAsString = true,
-      .useDecimalTypeWidth = true};
+      .flattenConstant = true};
   exportToArrow(
       std::dynamic_pointer_cast<facebook::velox::BaseVector>(flat),
       result.arrowArray,

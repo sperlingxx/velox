@@ -53,6 +53,10 @@
 #include <cudf/types.hpp>
 #include <cudf/unary.hpp>
 #include <cudf/utilities/traits.hpp>
+#include <cudf/search.hpp>
+#include <cudf/concatenate.hpp>
+
+#include <algorithm>
 
 namespace facebook::velox::cudf_velox {
 namespace {
@@ -1285,6 +1289,42 @@ class HashFunction : public CudfFunction {
   uint32_t seedValue_;
 };
 
+class XxHash64Function : public CudfFunction {
+ public:
+  XxHash64Function(const std::shared_ptr<velox::exec::Expr>& expr) {
+    using velox::exec::ConstantExpr;
+    VELOX_CHECK_GE(
+        expr->inputs().size(), 2, "xxhash64 expects at least 2 inputs");
+    auto seedExpr = std::dynamic_pointer_cast<ConstantExpr>(expr->inputs()[0]);
+    VELOX_CHECK_NOT_NULL(seedExpr, "xxhash64 seed must be a constant");
+    auto seedVec = seedExpr->value();
+    if (seedVec->typeKind() == TypeKind::BIGINT) {
+      seedValue_ = static_cast<uint64_t>(
+          seedVec->as<SimpleVector<int64_t>>()->valueAt(0));
+    } else {
+      seedValue_ = static_cast<uint64_t>(
+          seedVec->as<SimpleVector<int32_t>>()->valueAt(0));
+    }
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    VELOX_CHECK(!inputColumns.empty());
+    std::vector<cudf::column_view> columns;
+    columns.reserve(inputColumns.size());
+    for (auto& col : inputColumns) {
+      columns.push_back(asView(col));
+    }
+    return cudf::hashing::xxhash_64(
+        cudf::table_view(columns), seedValue_, stream, mr);
+  }
+
+ private:
+  uint64_t seedValue_;
+};
+
 class YearFunction : public CudfFunction {
  public:
   explicit YearFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
@@ -1708,6 +1748,18 @@ bool registerBuiltinFunctions(const std::string& prefix) {
            .build()});
 
   registerCudfFunction(
+      prefix + "xxhash64_with_seed",
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<XxHash64Function>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("bigint")
+           .constantArgumentType("bigint")
+           .argumentType("any")
+           .variableArity()
+           .build()});
+
+  registerCudfFunction(
       prefix + "round",
       [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
         return std::make_shared<RoundFunction>(expr);
@@ -1959,12 +2011,6 @@ bool registerBuiltinFunctions(const std::string& prefix) {
       {
           // Cast needs special handling dynamically using cudf.
       });
-
-  if (CudfConfig::getInstance().functionEngine == "spark") {
-    registerSparkFunctions(prefix);
-  } else {
-    registerPrestoFunctions(prefix);
-  }
 
   //
   // regular binary operators
@@ -2331,6 +2377,68 @@ ColumnOrView FunctionExpression::eval(
     return result;
   }
 
+  // Handle 'in' expression: in(column, array_literal) → cudf::contains
+  if (expr_->name() == "in" && expr_->inputs().size() == 2) {
+    auto fieldExpr =
+        std::dynamic_pointer_cast<FieldReference>(expr_->inputs()[0]);
+    if (fieldExpr) {
+      auto columnIndex = inputRowSchema_->getChildIdx(fieldExpr->name());
+      auto haystackView = inputColumnViews[columnIndex];
+
+      auto constExpr = std::dynamic_pointer_cast<velox::exec::ConstantExpr>(
+          expr_->inputs()[1]);
+      if (constExpr && constExpr->value()) {
+        auto arrValue = constExpr->value();
+        if (arrValue->isConstantEncoding()) {
+          auto cv =
+              arrValue->asUnchecked<ConstantVector<ComplexType>>();
+          auto vv = cv->valueVector();
+          if (vv && vv->encoding() == VectorEncoding::Simple::ARRAY) {
+            auto arrayVec = vv->as<ArrayVector>();
+            auto idx = cv->index();
+            auto elements = arrayVec->elements();
+            auto offset = arrayVec->offsetAt(idx);
+            auto size = arrayVec->sizeAt(idx);
+
+            auto needlesVelox = elements->slice(offset, size);
+            std::vector<std::unique_ptr<cudf::scalar>> tmpScalars;
+            std::vector<cudf::ast::literal> tmpLiterals;
+            // Build a cudf column from the array elements
+            auto needleCols =
+                std::vector<std::unique_ptr<cudf::column>>();
+            for (vector_size_t i = 0; i < size; ++i) {
+              auto sc = VELOX_DYNAMIC_SCALAR_TYPE_DISPATCH(
+                  createCudfScalar,
+                  elements->typeKind(),
+                  elements->slice(offset + i, 1),
+                  std::nullopt);
+              tmpScalars.push_back(std::move(sc));
+            }
+            // Use cudf::make_column_from_scalar for the first, then
+            // concatenate. Simpler: build via cudf column_from_scalar.
+            auto needleCol = cudf::make_column_from_scalar(
+                *tmpScalars[0], 0, stream, mr);
+            // Actually use a simpler approach: create individual 1-row
+            // columns and concatenate.
+            std::vector<std::unique_ptr<cudf::column>> oneCols;
+            for (auto& sc : tmpScalars) {
+              oneCols.push_back(
+                  cudf::make_column_from_scalar(*sc, 1, stream, mr));
+            }
+            std::vector<cudf::column_view> oneViews;
+            oneViews.reserve(oneCols.size());
+            for (auto& c : oneCols) {
+              oneViews.push_back(c->view());
+            }
+            auto needlesCol = cudf::concatenate(oneViews, stream, mr);
+            return cudf::contains(
+                haystackView, needlesCol->view(), stream, mr);
+          }
+        }
+      }
+    }
+  }
+
   VELOX_FAIL(
       "Unsupported expression for recursive evaluation: " + expr_->name());
 }
@@ -2412,20 +2520,35 @@ std::shared_ptr<CudfExpression> createCudfExpression(
   ensureBuiltinExpressionEvaluatorsRegistered();
   const auto& registry = getCudfExpressionEvaluatorRegistry();
 
-  const CudfExpressionEvaluatorEntry* best = nullptr;
+  std::vector<const CudfExpressionEvaluatorEntry*> candidates;
   for (const auto& [name, entry] : registry) {
     if (except && name == *except) {
       continue;
     }
     if (entry.canEvaluate && entry.canEvaluate(expr)) {
-      if (best == nullptr || entry.priority > best->priority) {
-        best = &entry;
-      }
+      candidates.push_back(&entry);
+    }
+  }
+  std::sort(candidates.begin(), candidates.end(),
+      [](const auto* a, const auto* b) {
+        return a->priority > b->priority;
+      });
+
+  for (const auto* entry : candidates) {
+    try {
+      return entry->create(expr, inputRowSchema);
+    } catch (const VeloxException& e) {
+      LOG(WARNING) << "Expression evaluator failed for expr '"
+                   << expr->toString()
+                   << "': " << e.message() << ". Trying next evaluator.";
     }
   }
 
-  if (best != nullptr) {
-    return best->create(expr, inputRowSchema);
+  if (!candidates.empty()) {
+    LOG(WARNING) << "All " << candidates.size()
+                 << " expression evaluator candidates failed for expr '"
+                 << expr->toString()
+                 << "'. Falling back to FunctionExpression.";
   }
 
   return FunctionExpression::create(expr, inputRowSchema);

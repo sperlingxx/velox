@@ -214,6 +214,24 @@ TEST_F(CudfExpressionSelectionTest, signatureVarargsHashWithSeed) {
   }
 }
 
+TEST_F(CudfExpressionSelectionTest, signatureVarargsXxhash64WithSeed) {
+  facebook::velox::functions::sparksql::registerFunctions();
+
+  auto ok = compileExecExpr(
+      "xxhash64_with_seed(42, a, b)",
+      rowType_,
+      execCtx_.get(),
+      {.functionPrefix = ""});
+  ASSERT_TRUE(canBeEvaluatedByCudf(ok, /*deep=*/true));
+
+  auto okSingleCol = compileExecExpr(
+      "xxhash64_with_seed(0, a)",
+      rowType_,
+      execCtx_.get(),
+      {.functionPrefix = ""});
+  ASSERT_TRUE(canBeEvaluatedByCudf(okSingleCol, /*deep=*/true));
+}
+
 TEST_F(CudfExpressionSelectionTest, signatureTypeVariableCoalesce) {
   // OK: same type BIGINT
   auto ok1 = compileExecExpr("coalesce(a, b)", rowType_, execCtx_.get());

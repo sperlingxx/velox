@@ -740,7 +740,7 @@ include_directories(.)
 # Adding this down here prevents warnings in dependencies from stopping the
 # build
 if("${TREAT_WARNINGS_AS_ERRORS}")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Werror")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Werror -Wno-error=stringop-overread -Wno-error=stringop-overflow")
 endif()
 
 message("FINAL CMAKE_CXX_FLAGS=${CMAKE_CXX_FLAGS}")

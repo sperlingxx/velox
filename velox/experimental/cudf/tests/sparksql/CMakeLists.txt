@@ -25,6 +25,7 @@ set_tests_properties(velox_cudf_spark_aggregates_test PROPERTIES LABELS cuda_dri
 target_link_libraries(
   velox_cudf_spark_aggregates_test
   velox_cudf_exec
+  velox_cudf_gpu_guard_stub
   velox_exec_test_lib
   velox_vector_test_lib
   velox_functions_aggregates_test_lib
@@ -53,6 +54,7 @@ set_tests_properties(
 target_link_libraries(
   velox_cudf_spark_filter_project_test
   velox_cudf_exec
+  velox_cudf_gpu_guard_stub
   velox_exec_test_lib
   velox_vector_test_lib
   velox_functions_spark

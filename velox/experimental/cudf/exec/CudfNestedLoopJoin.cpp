@@ -163,9 +163,9 @@ void CudfNestedLoopJoinBuild::noMoreInput() {
     std::vector<std::unique_ptr<cudf::column>> emptyCols;
     for (size_t i = 0; i < buildType->size(); ++i) {
       auto cudfType =
-          veloxToCudfTypeId(buildType->childAt(i));
+          veloxToCudfDataType(buildType->childAt(i));
       auto scalar = cudf::make_default_constructed_scalar(
-          cudf::data_type{cudfType}, stream);
+          cudfType, stream);
       emptyCols.push_back(cudf::make_column_from_scalar(
           *scalar,
           0,
@@ -963,10 +963,9 @@ RowVectorPtr CudfNestedLoopJoinProbe::getOutput() {
           auto outIdx = leftColumnOutputIndices_[li];
           auto probeChannel = leftColumnIndicesToGather_[li];
           auto cudfType =
-              veloxToCudfTypeId(probeType_->childAt(probeChannel));
+              veloxToCudfDataType(probeType_->childAt(probeChannel));
           auto nullScalar =
-              cudf::make_default_constructed_scalar(
-                  cudf::data_type{cudfType});
+              cudf::make_default_constructed_scalar(cudfType);
           outCols[outIdx] = cudf::make_column_from_scalar(
               *nullScalar, m, stream, mr);
         }
