@@ -29,6 +29,7 @@
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 
+#include "velox/type/TypeUtil.h"
 #include "velox/exec/AssignUniqueId.h"
 #include "velox/exec/CallbackSink.h"
 #include "velox/exec/FilterProject.h"
@@ -332,6 +333,20 @@ class CudfHashJoinBaseAdapter : public OperatorAdapter {
     if (joinPlanNode->filter()) {
       if (!canBeEvaluatedByCudf(
               {joinPlanNode->filter()}, ctx->task->queryCtx().get())) {
+        return false;
+      }
+      // Verify that all field references in the filter exist in the
+      // combined left+right schema. Substrait plan conversion can produce
+      // expressions that reference fields from a different node ID than
+      // the join's actual probe/build output types.
+      auto combinedType = type::concatRowTypes(
+          {joinPlanNode->sources()[0]->outputType(),
+           joinPlanNode->sources()[1]->outputType()});
+      if (!allFieldsResolvable(joinPlanNode->filter(), combinedType)) {
+        LOG(WARNING)
+            << "CudfHashJoin: unresolvable field reference in filter '"
+            << joinPlanNode->filter()->toString()
+            << "', falling back to CPU";
         return false;
       }
     }
