@@ -904,6 +904,107 @@ class BetweenFunction : public CudfFunction {
   std::unique_ptr<cudf::scalar> maxLiteral_;
 };
 
+class InFunction : public CudfFunction {
+ public:
+  InFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
+    VELOX_CHECK_EQ(expr->inputs().size(), 2, "in expects exactly 2 inputs");
+    auto constExpr = std::dynamic_pointer_cast<velox::exec::ConstantExpr>(
+        expr->inputs()[1]);
+    VELOX_CHECK_NOT_NULL(
+        constExpr, "in second argument must be a constant array");
+    auto value = constExpr->value();
+    VELOX_CHECK_NOT_NULL(value, "ConstantExpr value is null");
+    buildHaystackColumn(value);
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    VELOX_CHECK(!inputColumns.empty(), "in requires at least one input column");
+    auto needles = asView(inputColumns[0]);
+    auto haystackView = haystack_->view();
+    if (haystackView.type() != needles.type()) {
+      if (cudf::is_supported_cast(haystackView.type(), needles.type())) {
+        auto castedHaystack =
+            cudf::cast(haystackView, needles.type(), stream, mr);
+        return cudf::contains(castedHaystack->view(), needles, stream, mr);
+      }
+      if (cudf::is_supported_cast(needles.type(), haystackView.type())) {
+        auto castedNeedles =
+            cudf::cast(needles, haystackView.type(), stream, mr);
+        return cudf::contains(haystackView, castedNeedles->view(), stream, mr);
+      }
+      VELOX_FAIL(
+          "IN type mismatch: haystack={} needles={}",
+          static_cast<int>(haystackView.type().id()),
+          static_cast<int>(needles.type().id()));
+    }
+    return cudf::contains(haystackView, needles, stream, mr);
+  }
+
+ private:
+  template <TypeKind Kind>
+  static std::unique_ptr<cudf::scalar> scalarFromElement(
+      const VectorPtr& vec,
+      const TypePtr& type,
+      vector_size_t idx) {
+    using T = typename TypeTraits<Kind>::NativeType;
+    auto val = vec->template as<SimpleVector<T>>()->valueAt(idx);
+    return makeScalarFromValue<T>(type, val, false);
+  }
+
+  void buildHaystackColumn(const VectorPtr& vector) {
+    auto stream = cudf::get_default_stream();
+    auto mr = cudf::get_current_device_resource_ref();
+
+    VELOX_CHECK(
+        vector->isConstantEncoding(), "Expected constant vector for IN list");
+
+    auto constantVector = vector->asUnchecked<ConstantVector<ComplexType>>();
+    VELOX_CHECK(!constantVector->isNullAt(0), "NULL array in IN not supported");
+
+    auto valueVector = constantVector->valueVector();
+    VELOX_CHECK(
+        valueVector->encoding() == VectorEncoding::Simple::ARRAY,
+        "Expected ARRAY encoding for IN list");
+
+    auto arrayVector = valueVector->as<ArrayVector>();
+    auto index = constantVector->index();
+    auto size = arrayVector->sizeAt(index);
+    auto offset = arrayVector->offsetAt(index);
+    auto elements = arrayVector->elements();
+    VELOX_CHECK_GT(size, 0, "Empty IN list");
+
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.reserve(size);
+
+    for (auto i = offset; i < offset + size; ++i) {
+      if (elements->isNullAt(i)) {
+        continue;
+      }
+      auto scalar = VELOX_DYNAMIC_SCALAR_TYPE_DISPATCH(
+          scalarFromElement, elements->typeKind(), elements, elements->type(), i);
+      columns.push_back(cudf::make_column_from_scalar(*scalar, 1, stream, mr));
+    }
+
+    VELOX_CHECK(!columns.empty(), "IN list has no non-null values");
+
+    if (columns.size() == 1) {
+      haystack_ = std::move(columns[0]);
+    } else {
+      std::vector<cudf::column_view> views;
+      views.reserve(columns.size());
+      for (const auto& col : columns) {
+        views.push_back(col->view());
+      }
+      haystack_ = cudf::concatenate(views, stream, mr);
+    }
+  }
+
+  std::unique_ptr<cudf::column> haystack_;
+};
+
 class GreatestLeastFunction : public CudfFunction {
  public:
   GreatestLeastFunction(
@@ -2331,7 +2432,11 @@ std::shared_ptr<FunctionExpression> FunctionExpression::create(
   node->inputRowSchema_ = inputRowSchema;
 
   auto name = expr->name();
-  node->function_ = createCudfFunction(name, expr);
+  if (name == "in") {
+    node->function_ = std::make_shared<InFunction>(expr);
+  } else {
+    node->function_ = createCudfFunction(name, expr);
+  }
 
   if (node->function_) {
     for (const auto& input : expr->inputs()) {
@@ -2377,68 +2482,6 @@ ColumnOrView FunctionExpression::eval(
     return result;
   }
 
-  // Handle 'in' expression: in(column, array_literal) → cudf::contains
-  if (expr_->name() == "in" && expr_->inputs().size() == 2) {
-    auto fieldExpr =
-        std::dynamic_pointer_cast<FieldReference>(expr_->inputs()[0]);
-    if (fieldExpr) {
-      auto columnIndex = inputRowSchema_->getChildIdx(fieldExpr->name());
-      auto haystackView = inputColumnViews[columnIndex];
-
-      auto constExpr = std::dynamic_pointer_cast<velox::exec::ConstantExpr>(
-          expr_->inputs()[1]);
-      if (constExpr && constExpr->value()) {
-        auto arrValue = constExpr->value();
-        if (arrValue->isConstantEncoding()) {
-          auto cv =
-              arrValue->asUnchecked<ConstantVector<ComplexType>>();
-          auto vv = cv->valueVector();
-          if (vv && vv->encoding() == VectorEncoding::Simple::ARRAY) {
-            auto arrayVec = vv->as<ArrayVector>();
-            auto idx = cv->index();
-            auto elements = arrayVec->elements();
-            auto offset = arrayVec->offsetAt(idx);
-            auto size = arrayVec->sizeAt(idx);
-
-            auto needlesVelox = elements->slice(offset, size);
-            std::vector<std::unique_ptr<cudf::scalar>> tmpScalars;
-            std::vector<cudf::ast::literal> tmpLiterals;
-            // Build a cudf column from the array elements
-            auto needleCols =
-                std::vector<std::unique_ptr<cudf::column>>();
-            for (vector_size_t i = 0; i < size; ++i) {
-              auto sc = VELOX_DYNAMIC_SCALAR_TYPE_DISPATCH(
-                  createCudfScalar,
-                  elements->typeKind(),
-                  elements->slice(offset + i, 1),
-                  std::nullopt);
-              tmpScalars.push_back(std::move(sc));
-            }
-            // Use cudf::make_column_from_scalar for the first, then
-            // concatenate. Simpler: build via cudf column_from_scalar.
-            auto needleCol = cudf::make_column_from_scalar(
-                *tmpScalars[0], 0, stream, mr);
-            // Actually use a simpler approach: create individual 1-row
-            // columns and concatenate.
-            std::vector<std::unique_ptr<cudf::column>> oneCols;
-            for (auto& sc : tmpScalars) {
-              oneCols.push_back(
-                  cudf::make_column_from_scalar(*sc, 1, stream, mr));
-            }
-            std::vector<cudf::column_view> oneViews;
-            oneViews.reserve(oneCols.size());
-            for (auto& c : oneCols) {
-              oneViews.push_back(c->view());
-            }
-            auto needlesCol = cudf::concatenate(oneViews, stream, mr);
-            return cudf::contains(
-                haystackView, needlesCol->view(), stream, mr);
-          }
-        }
-      }
-    }
-  }
-
   VELOX_FAIL(
       "Unsupported expression for recursive evaluation: " + expr_->name());
 }
@@ -2475,6 +2518,14 @@ bool FunctionExpression::canEvaluate(std::shared_ptr<velox::exec::Expr> expr) {
       opName == "row_constructor" ||
       opName == "row_constructor_with_all_null") {
     return true;
+  }
+
+  if (opName == "in") {
+    if (expr->inputs().size() != 2) {
+      return false;
+    }
+    return std::dynamic_pointer_cast<velox::exec::ConstantExpr>(
+               expr->inputs()[1]) != nullptr;
   }
 
   auto& registry = getCudfFunctionRegistry();

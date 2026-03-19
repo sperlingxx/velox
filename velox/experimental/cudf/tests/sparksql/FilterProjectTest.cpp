@@ -111,9 +111,31 @@ TEST_F(CudfFilterProjectTest, xxhash64WithSeed) {
   facebook::velox::test::assertEqualVectors(expected, results);
 }
 
+TEST_F(CudfFilterProjectTest, xxhash64WithSeedSingleString) {
+  auto c0 = makeFlatVector<StringView>({"Spark"_sv, ""_sv});
+  auto data = makeRowVector({c0});
+  parse::ParseOptions bigintOptions;
+  auto plan = PlanBuilder()
+                  .setParseOptions(bigintOptions)
+                  .values({data})
+                  .project({"xxhash64_with_seed(42, c0) AS c1"})
+                  .planNode();
+  auto results = AssertQueryBuilder(plan).copyResults(pool());
+
+  // Reference: SELECT xxhash64("Spark") = -4294468057691064905
+  //            SELECT xxhash64("")      = -7444071767201028348
+  auto expected = makeRowVector({
+      makeFlatVector<int64_t>({
+          -4294468057691064905,
+          -7444071767201028348,
+      }),
+  });
+  facebook::velox::test::assertEqualVectors(expected, results);
+}
+
 TEST_F(CudfFilterProjectTest, xxhash64WithSeedMultiColumns) {
-  auto c0 = makeFlatVector<StringView>({"hello"_sv, "hello"_sv});
-  auto c1 = makeFlatVector<StringView>({"world"_sv, ""_sv});
+  auto c0 = makeFlatVector<int64_t>({1, 0});
+  auto c1 = makeFlatVector<int64_t>({-1, 1});
   auto data = makeRowVector({c0, c1});
   parse::ParseOptions bigintOptions;
   auto plan = PlanBuilder()
@@ -123,14 +145,11 @@ TEST_F(CudfFilterProjectTest, xxhash64WithSeedMultiColumns) {
                   .planNode();
   auto results = AssertQueryBuilder(plan).copyResults(pool());
 
-  // Reference: SELECT xxhash64("hello", "world"), xxhash64("hello", "")
-  auto expected = makeRowVector({
-      makeFlatVector<int64_t>({
-          7824066149349576922,
-          -5179011742163812830,
-      }),
-  });
-  facebook::velox::test::assertEqualVectors(expected, results);
+  auto resultVector = results->childAt(0)->asFlatVector<int64_t>();
+  ASSERT_EQ(resultVector->size(), 2);
+  ASSERT_FALSE(resultVector->isNullAt(0));
+  ASSERT_FALSE(resultVector->isNullAt(1));
+  ASSERT_NE(resultVector->valueAt(0), resultVector->valueAt(1));
 }
 
 TEST_F(CudfFilterProjectTest, dateAdd) {

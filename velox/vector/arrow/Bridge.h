@@ -40,6 +40,9 @@ struct ArrowOptions {
   std::optional<std::string> timestampTimeZone{std::nullopt};
   // Export VARCHAR and VARBINARY to Arrow 15 StringView format
   bool exportToStringView = false;
+  // Export VARBINARY as Arrow utf-8 string instead of binary.
+  // Needed for interop with cudf which doesn't support Arrow binary type.
+  bool exportVarbinaryAsString{false};
 };
 
 namespace facebook::velox {
