@@ -512,7 +512,12 @@ cudf::ast::expression const& AstContext::pushExprToTree(
     try {
       int sideIdx = findExpressionSide(expr);
       if (sideIdx < 0) {
-        sideIdx = 0;
+        return nullptr;
+      }
+      for (const auto* field : expr->distinctFields()) {
+        if (!inputRowSchema[sideIdx].get()->containsChild(field->field())) {
+          return nullptr;
+        }
       }
       auto node = createCudfExpression(
           expr, inputRowSchema[sideIdx], kAstEvaluatorName);
@@ -765,12 +770,21 @@ cudf::ast::expression const& AstContext::pushExprToTree(
 
     VELOX_FAIL("Field not found, " + name);
   } else if (!allowPureAstOnly && canBeEvaluatedByCudf(expr, /*deep=*/false)) {
-    // Shallow check: only verify this operation is supported
-    // Children will be recursively handled by createCudfExpression
-    // Determine which side this expression references
     int sideIdx = findExpressionSide(expr);
     if (sideIdx < 0) {
-      sideIdx = 0; // Default to left side if no fields found
+      VELOX_FAIL(
+          "Precompute: no matching side for expression '{}', "
+          "cannot create single-side precompute instruction",
+          name);
+    }
+    for (const auto* field : expr->distinctFields()) {
+      VELOX_CHECK(
+          inputRowSchema[sideIdx].get()->containsChild(field->field()),
+          "Precompute: field '{}' not in side {} schema for expression '{}'; "
+          "cannot create single-side precompute instruction",
+          field->field(),
+          sideIdx,
+          name);
     }
     auto node =
         createCudfExpression(expr, inputRowSchema[sideIdx], kAstEvaluatorName);
