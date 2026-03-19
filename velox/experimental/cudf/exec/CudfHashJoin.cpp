@@ -556,24 +556,36 @@ void CudfHashJoinProbe::initialize() {
   // in whole tables
 
   if (useAstFilter_) {
-    if (joinNode_->isRightJoin() || joinNode_->isRightSemiFilterJoin()) {
-      createAstTree(
-          exprs.exprs()[0],
-          tree_,
-          scalars_,
-          buildType_,
-          probeType_,
-          rightPrecomputeInstructions_,
-          leftPrecomputeInstructions_);
-    } else {
-      createAstTree(
-          exprs.exprs()[0],
-          tree_,
-          scalars_,
-          probeType_,
-          buildType_,
-          leftPrecomputeInstructions_,
-          rightPrecomputeInstructions_);
+    try {
+      if (joinNode_->isRightJoin() || joinNode_->isRightSemiFilterJoin()) {
+        createAstTree(
+            exprs.exprs()[0],
+            tree_,
+            scalars_,
+            buildType_,
+            probeType_,
+            rightPrecomputeInstructions_,
+            leftPrecomputeInstructions_);
+      } else {
+        createAstTree(
+            exprs.exprs()[0],
+            tree_,
+            scalars_,
+            probeType_,
+            buildType_,
+            leftPrecomputeInstructions_,
+            rightPrecomputeInstructions_);
+      }
+    } catch (const VeloxException& e) {
+      LOG(WARNING)
+          << "CudfHashJoinProbe: AST tree creation failed for filter '"
+          << joinNode_->filter()->toString()
+          << "', disabling AST filter: " << e.what();
+      useAstFilter_ = false;
+      tree_ = {};
+      scalars_.clear();
+      leftPrecomputeInstructions_.clear();
+      rightPrecomputeInstructions_.clear();
     }
   }
 }

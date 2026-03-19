@@ -33,6 +33,8 @@
 #include <cudf/ast/detail/operators.hpp>
 #include <cudf/ast/expressions.hpp>
 #include <cudf/column/column_factories.hpp>
+#include <cudf/copying.hpp>
+#include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/transform.hpp>
 #include <cudf/unary.hpp>
@@ -814,6 +816,28 @@ std::vector<ColumnOrView> precomputeSubexpressions(
           stream,
           cudf::get_current_device_resource_ref(),
           /*finalize=*/true);
+      // Constant/scalar sub-expressions may produce 0/1-row output when all
+      // inputs are literals. Expand to match input row count to prevent
+      // "Column size mismatch" in table_view construction.
+      if (!inputColumnViews.empty()) {
+        auto expectedRows = inputColumnViews[0].size();
+        auto actualRows = asView(result).size();
+        if (actualRows != expectedRows && expectedRows > 0) {
+          if (actualRows == 1) {
+            auto scl = cudf::get_element(asView(result), 0, stream);
+            result = cudf::make_column_from_scalar(
+                *scl, expectedRows, stream,
+                cudf::get_current_device_resource_ref());
+          } else if (actualRows == 0) {
+            auto scl = cudf::make_default_constructed_scalar(
+                asView(result).type(), stream,
+                cudf::get_current_device_resource_ref());
+            result = cudf::make_column_from_scalar(
+                *scl, expectedRows, stream,
+                cudf::get_current_device_resource_ref());
+          }
+        }
+      }
       precomputedColumns.push_back(std::move(result));
       continue;
     }
