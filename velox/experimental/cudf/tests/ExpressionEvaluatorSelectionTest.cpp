@@ -289,4 +289,55 @@ TEST_F(CudfExpressionSelectionTest, constantFoldingStringAllocatesOnCompile) {
   ASSERT_EQ(c->value()->pool(), execCtx_->pool());
 }
 
+TEST_F(CudfExpressionSelectionTest, nodeIdFallbackResolvesField) {
+  // Compile a "plus(n11_1, n10_2)" expression against a schema that HAS
+  // both n11_1 and n10_2.  Then call createCudfExpression with a DIFFERENT
+  // schema that uses n10_* names for everything (n10_0, n10_1, n10_2).
+  // The colIdx fallback in AstExpressionUtils should resolve n11_1 → n10_1
+  // because both have the same _{1} suffix and it is the only match.
+
+  auto sourceType = ROW({
+      {"n11_1", BIGINT()},
+      {"n10_2", BIGINT()},
+  });
+  auto compiled =
+      compileExecExpr("n11_1 + n10_2", sourceType, execCtx_.get());
+
+  // Target schema has n10_* naming for all three columns.
+  auto targetType = ROW({
+      {"n10_0", BIGINT()},
+      {"n10_1", BIGINT()},
+      {"n10_2", BIGINT()},
+  });
+
+  // Should NOT crash — the colIdx fallback should resolve n11_1 to n10_1.
+  auto cudfExpr = createCudfExpression(compiled, targetType);
+  ASSERT_NE(cudfExpr, nullptr);
+}
+
+TEST_F(CudfExpressionSelectionTest, nodeIdFallbackNoMatchFallsBack) {
+  // When colIdx fallback finds NO match (e.g. n11_5 requested but schema
+  // only has colIdx 0-2), createCudfExpression should still return a
+  // FunctionExpression (non-null) because the field is a valid expr kind,
+  // but will fail at eval time.  The key is it must not crash during create.
+
+  auto sourceType = ROW({
+      {"n11_5", BIGINT()},
+      {"n10_2", BIGINT()},
+  });
+  auto compiled =
+      compileExecExpr("n11_5 + n10_2", sourceType, execCtx_.get());
+
+  auto targetType = ROW({
+      {"n10_0", BIGINT()},
+      {"n10_1", BIGINT()},
+      {"n10_2", BIGINT()},
+  });
+
+  // Should NOT crash at creation time — may return a FunctionExpression
+  // that defers the failure to eval time.
+  auto cudfExpr = createCudfExpression(compiled, targetType);
+  ASSERT_NE(cudfExpr, nullptr);
+}
+
 } // namespace

@@ -49,6 +49,32 @@
 
 namespace facebook::velox::cudf_velox {
 
+namespace {
+
+// Recursively check that all FieldAccessTypedExpr references in the
+// expression tree can be found in the given inputType.  Returns false
+// if any top-level field reference is missing from inputType.
+bool allFieldsResolvable(
+    const core::TypedExprPtr& expr,
+    const RowTypePtr& inputType) {
+  if (auto fieldAccess =
+          std::dynamic_pointer_cast<const core::FieldAccessTypedExpr>(expr)) {
+    if (fieldAccess->inputs().empty()) {
+      if (!inputType->containsChild(fieldAccess->name())) {
+        return false;
+      }
+    }
+  }
+  for (const auto& input : expr->inputs()) {
+    if (!allFieldsResolvable(input, inputType)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+} // namespace
+
 /// OperatorAdapterRegistry Implementation
 OperatorAdapterRegistry& OperatorAdapterRegistry::getInstance() {
   static OperatorAdapterRegistry instance;
@@ -169,6 +195,24 @@ class FilterProjectAdapter : public OperatorAdapter {
     if (projectPlanNode) {
       if (!canBeEvaluatedByCudf(
               projectPlanNode->projections(), ctx->task->queryCtx().get())) {
+        return false;
+      }
+      const auto& inputType = projectPlanNode->sources()[0]->outputType();
+      for (const auto& proj : projectPlanNode->projections()) {
+        if (!allFieldsResolvable(proj, inputType)) {
+          LOG(WARNING)
+              << "CudfFilterProject: unresolvable field reference in "
+              << proj->toString() << ", falling back to CPU";
+          return false;
+        }
+      }
+    }
+    if (filterNode) {
+      const auto& inputType = filterNode->sources()[0]->outputType();
+      if (!allFieldsResolvable(filterNode->filter(), inputType)) {
+        LOG(WARNING)
+            << "CudfFilterProject: unresolvable field reference in filter, "
+            << "falling back to CPU";
         return false;
       }
     }

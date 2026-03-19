@@ -28,6 +28,7 @@
 #include "velox/vector/ConstantVector.h"
 
 #include <optional>
+#include <regex>
 
 #include <cudf/ast/detail/operators.hpp>
 #include <cudf/ast/expressions.hpp>
@@ -407,6 +408,32 @@ cudf::ast::expression const& AstContext::addPrecomputeInstruction(
           sideIdx, columnIndex, instruction, fieldName, node);
     }
   }
+  // Fallback: resolve n{nodeId}_{colIdx} by matching the colIdx suffix.
+  static const std::regex kNodeNamePattern("^n\\d+_(\\d+)$");
+  std::smatch reqMatch;
+  if (std::regex_match(name, reqMatch, kNodeNamePattern)) {
+    auto reqSuffix = reqMatch[1].str();
+    for (size_t sideIdx = 0; sideIdx < inputRowSchema.size(); ++sideIdx) {
+      auto& schema = inputRowSchema[sideIdx];
+      int matchCount = 0;
+      size_t matchedCol = 0;
+      for (size_t col = 0; col < schema->size(); ++col) {
+        const auto& colName = schema->nameOf(col);
+        std::smatch schMatch;
+        if (std::regex_match(colName, schMatch, kNodeNamePattern) &&
+            schMatch[1].str() == reqSuffix) {
+          matchedCol = col;
+          ++matchCount;
+        }
+      }
+      if (matchCount == 1) {
+        LOG(WARNING) << "Resolved precompute field '" << name
+                     << "' via colIdx fallback to column " << matchedCol;
+        return addPrecomputeInstructionOnSide(
+            sideIdx, matchedCol, instruction, fieldName, node);
+      }
+    }
+  }
   VELOX_FAIL("Field not found, " + name);
 }
 
@@ -643,6 +670,38 @@ cudf::ast::expression const& AstContext::pushExprToTree(
           if (auto ref = resolveField(baseName)) {
             return tree.push(*ref);
           }
+        }
+      }
+    }
+
+    // Fallback for n{nodeId}_{colIdx} naming mismatches: the expression
+    // may reference a column by a different node ID than what the schema
+    // uses (e.g. n11_1 vs n10_1) when plan node IDs diverge.
+    // Extract colIdx and look for a schema column with the same suffix.
+    {
+      static const std::regex kNodeNamePattern("^n\\d+_(\\d+)$");
+      std::smatch reqMatch;
+      if (std::regex_match(fieldName, reqMatch, kNodeNamePattern)) {
+        auto reqSuffix = reqMatch[1].str();
+        std::optional<cudf::ast::column_reference> candidate;
+        int matchCount = 0;
+        for (size_t sideIdx = 0; sideIdx < inputRowSchema.size(); ++sideIdx) {
+          auto& schema = inputRowSchema[sideIdx];
+          for (size_t col = 0; col < schema->size(); ++col) {
+            const auto& colName = schema->nameOf(col);
+            std::smatch schMatch;
+            if (std::regex_match(colName, schMatch, kNodeNamePattern) &&
+                schMatch[1].str() == reqSuffix) {
+              auto side = static_cast<cudf::ast::table_reference>(sideIdx);
+              candidate = cudf::ast::column_reference(col, side);
+              ++matchCount;
+            }
+          }
+        }
+        if (matchCount == 1 && candidate.has_value()) {
+          LOG(WARNING) << "Resolved field '" << fieldName
+                       << "' via colIdx fallback";
+          return tree.push(*candidate);
         }
       }
     }
