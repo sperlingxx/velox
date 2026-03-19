@@ -636,12 +636,45 @@ struct MeanAggregator : cudf_velox::CudfHashAggregation::Aggregator {
             0,
             std::move(children));
       }
-      case core::AggregationNode::Step::kFinal: {
-        // Input column has two children: sum and count
+      case core::AggregationNode::Step::kIntermediate: {
         auto const sumCol = input.column(inputIndex).child(0);
         auto const countCol = input.column(inputIndex).child(1);
 
-        // sum the sums
+        VELOX_CHECK(outputType->isRow());
+        auto const& rowType = outputType->asRow();
+        auto const cudfSumType =
+            cudf_velox::veloxToCudfDataType(rowType.childAt(0));
+        auto const cudfCountType =
+            cudf_velox::veloxToCudfDataType(rowType.childAt(1));
+
+        auto const sumAgg =
+            cudf::make_sum_aggregation<cudf::reduce_aggregation>();
+        auto const sumScalar =
+            cudf::reduce(sumCol, *sumAgg, cudfSumType, stream);
+        auto sumResult = cudf::make_column_from_scalar(*sumScalar, 1, stream);
+
+        auto const countAgg =
+            cudf::make_sum_aggregation<cudf::reduce_aggregation>();
+        auto const countScalar =
+            cudf::reduce(countCol, *countAgg, cudfCountType, stream);
+        auto countResult =
+            cudf::make_column_from_scalar(*countScalar, 1, stream);
+
+        auto children = std::vector<std::unique_ptr<cudf::column>>();
+        children.push_back(std::move(sumResult));
+        children.push_back(std::move(countResult));
+        return std::make_unique<cudf::column>(
+            cudf::data_type(cudf::type_id::STRUCT),
+            1,
+            rmm::device_buffer{},
+            rmm::device_buffer{},
+            0,
+            std::move(children));
+      }
+      case core::AggregationNode::Step::kFinal: {
+        auto const sumCol = input.column(inputIndex).child(0);
+        auto const countCol = input.column(inputIndex).child(1);
+
         auto const sumAggRequest =
             cudf::make_sum_aggregation<cudf::reduce_aggregation>();
         auto const sumResultScalar =
@@ -649,13 +682,11 @@ struct MeanAggregator : cudf_velox::CudfHashAggregation::Aggregator {
         auto sumResultCol =
             cudf::make_column_from_scalar(*sumResultScalar, 1, stream);
 
-        // sum the counts
         auto const countAggRequest =
             cudf::make_sum_aggregation<cudf::reduce_aggregation>();
         auto const countResultScalar =
             cudf::reduce(countCol, *countAggRequest, countCol.type(), stream);
 
-        // divide the sums by the counts
         auto const cudfOutputType = cudf_velox::veloxToCudfDataType(outputType);
         return cudf::binary_operation(
             *sumResultCol,
