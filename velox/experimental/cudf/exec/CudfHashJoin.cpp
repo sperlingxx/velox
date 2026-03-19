@@ -51,6 +51,8 @@
 #include <rmm/device_uvector.hpp>
 #include <rmm/exec_policy.hpp>
 
+#include <limits>
+
 #include <nvtx3/nvtx3.hpp>
 
 namespace facebook::velox::cudf_velox {
@@ -882,14 +884,45 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::innerJoin(
       // Make build stream wait for probe tables to become valid
       cudaEvent_->recordFrom(stream).waitOn(buildStream_.value());
     }
-    auto [leftJoinIndices, rightJoinIndices] = hb->inner_join(
-        leftTableView.select(leftKeyIndices_),
-        std::nullopt,
-        buildStream_.has_value() ? buildStream_.value() : stream);
+
+    std::pair<
+        std::unique_ptr<rmm::device_uvector<cudf::size_type>>,
+        std::unique_ptr<rmm::device_uvector<cudf::size_type>>>
+        joinResult;
+    try {
+      joinResult = hb->inner_join(
+          leftTableView.select(leftKeyIndices_),
+          std::nullopt,
+          buildStream_.has_value() ? buildStream_.value() : stream);
+    } catch (const std::exception& e) {
+      VELOX_FAIL(
+          "GPU inner_join failed (probe={} rows, build={} rows, "
+          "planNode={}): {}",
+          leftTableView.num_rows(),
+          rightTableView.num_rows(),
+          joinNode_->id(),
+          e.what());
+    }
+    auto& [leftJoinIndices, rightJoinIndices] = joinResult;
+
     if (buildStream_.has_value()) {
       // Make probe stream wait for join completion before using indices
       cudaEvent_->recordFrom(buildStream_.value()).waitOn(stream);
     }
+
+    auto joinOutputRows =
+        static_cast<int64_t>(leftJoinIndices->size());
+    auto outputCols = static_cast<int64_t>(outputType_->size());
+    VELOX_CHECK_LE(
+        joinOutputRows,
+        static_cast<int64_t>(std::numeric_limits<cudf::size_type>::max()),
+        "Inner join output ({} rows) exceeds cudf::size_type limit. "
+        "Probe={} rows, build={} rows, planNode={}. "
+        "Consider increasing shuffle partitions to reduce data skew.",
+        joinOutputRows,
+        leftTableView.num_rows(),
+        rightTableView.num_rows(),
+        joinNode_->id());
 
     auto leftIndicesSpan =
         cudf::device_span<cudf::size_type const>{*leftJoinIndices};
@@ -899,43 +932,54 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::innerJoin(
     auto rightIndicesCol = cudf::column_view{rightIndicesSpan};
     std::vector<std::unique_ptr<cudf::column>> joinedCols;
 
-    if (joinNode_->filter()) {
-      if (useAstFilter_) {
-        cudfOutputs.push_back(filteredOutputIndices(
-            leftTableView,
-            leftIndicesCol,
-            rightTableView,
-            rightIndicesCol,
-            extendedLeftView,
-            extendedRightView,
-            cudf::join_kind::INNER_JOIN,
-            stream));
+    try {
+      if (joinNode_->filter()) {
+        if (useAstFilter_) {
+          cudfOutputs.push_back(filteredOutputIndices(
+              leftTableView,
+              leftIndicesCol,
+              rightTableView,
+              rightIndicesCol,
+              extendedLeftView,
+              extendedRightView,
+              cudf::join_kind::INNER_JOIN,
+              stream));
+        } else {
+          auto filterFunc =
+              [stream](
+                  std::vector<std::unique_ptr<cudf::column>>&& joinedCols,
+                  cudf::column_view filterColumn) {
+                auto filterTable =
+                    std::make_unique<cudf::table>(std::move(joinedCols));
+                auto filteredTable = cudf::apply_boolean_mask(
+                    *filterTable, filterColumn, stream, cudf::get_current_device_resource_ref());
+                return filteredTable->release();
+              };
+          cudfOutputs.push_back(filteredOutput(
+              leftTableView,
+              leftIndicesCol,
+              rightTableView,
+              rightIndicesCol,
+              filterFunc,
+              stream));
+        }
       } else {
-        auto filterFunc =
-            [stream](
-                std::vector<std::unique_ptr<cudf::column>>&& joinedCols,
-                cudf::column_view filterColumn) {
-              auto filterTable =
-                  std::make_unique<cudf::table>(std::move(joinedCols));
-              auto filteredTable = cudf::apply_boolean_mask(
-                  *filterTable, filterColumn, stream, cudf::get_current_device_resource_ref());
-              return filteredTable->release();
-            };
-        cudfOutputs.push_back(filteredOutput(
+        cudfOutputs.push_back(unfilteredOutput(
             leftTableView,
             leftIndicesCol,
             rightTableView,
             rightIndicesCol,
-            filterFunc,
             stream));
       }
-    } else {
-      cudfOutputs.push_back(unfilteredOutput(
-          leftTableView,
-          leftIndicesCol,
-          rightTableView,
-          rightIndicesCol,
-          stream));
+    } catch (const std::exception& e) {
+      VELOX_FAIL(
+          "GPU join gather/filter failed (joinOutput={} rows, "
+          "probe={} rows, build={} rows, planNode={}): {}",
+          joinOutputRows,
+          leftTableView.num_rows(),
+          rightTableView.num_rows(),
+          joinNode_->id(),
+          e.what());
     }
   }
   return cudfOutputs;
@@ -1491,6 +1535,10 @@ CudfHashJoinProbe::rightSemiFilterJoin(
   std::vector<std::unique_ptr<cudf::table>> cudfOutputs;
 
   auto& rightTables = hashObject_.value().first;
+  VELOX_CHECK(
+      !rightTables.empty(),
+      "rightTables is empty in rightSemiFilterJoin, planNode={}",
+      joinNode_->id());
   auto rightTableView = rightTables[0]->view();
 
   VELOX_CHECK_EQ(
@@ -2283,9 +2331,7 @@ exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
   }
 
   auto& rightTables = hashObject_.value().first;
-  // should be rightTable->numDistinct() but it needs compute,
-  // so we use num_rows()
-  if (rightTables[0]->num_rows() == 0) {
+  if (!rightTables.empty() && rightTables[0]->num_rows() == 0) {
     if (skipProbeOnEmptyBuild()) {
       if (operatorCtx_->driverCtx()
               ->queryConfig()
