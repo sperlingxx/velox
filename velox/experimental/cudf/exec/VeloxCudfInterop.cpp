@@ -38,9 +38,11 @@
 #include <arrow/io/interfaces.h>
 #include <arrow/table.h>
 
+#include <cstdlib>
 #include <cstring>
 
 #include <atomic>
+
 
 namespace facebook::velox::cudf_velox {
 
@@ -58,58 +60,81 @@ PinnedTransferStats& pinnedStats() {
 } // namespace
 
 cudf::type_id veloxToCudfTypeId(const TypePtr& type) {
+  // Legacy helper retained for compatibility. Note: returning cudf::type_id
+  // discards decimal scale; prefer veloxToCudfDataType when scale matters.
+  return veloxToCudfDataType(type).id();
+}
+
+cudf::data_type veloxToCudfDataType(const TypePtr& type) {
   switch (type->kind()) {
     case TypeKind::BOOLEAN:
-      return cudf::type_id::BOOL8;
+      return cudf::data_type{cudf::type_id::BOOL8};
     case TypeKind::TINYINT:
-      return cudf::type_id::INT8;
+      return cudf::data_type{cudf::type_id::INT8};
     case TypeKind::SMALLINT:
-      return cudf::type_id::INT16;
+      return cudf::data_type{cudf::type_id::INT16};
     case TypeKind::INTEGER:
       // TODO: handle interval types (durations?)
       // if (type->isIntervalYearMonth()) {
       //   return cudf::type_id::...;
       // }
       if (type->isDate()) {
-        return cudf::type_id::TIMESTAMP_DAYS;
+        return cudf::data_type{cudf::type_id::TIMESTAMP_DAYS};
       }
-      return cudf::type_id::INT32;
+      return cudf::data_type{cudf::type_id::INT32};
     case TypeKind::BIGINT:
-      return cudf::type_id::INT64;
+      // BIGINT is used for both INT64 and DECIMAL64
+      if (type->isDecimal()) {
+        auto const decimalType =
+            std::dynamic_pointer_cast<const ShortDecimalType>(type);
+        VELOX_CHECK(decimalType, "Invalid Decimal Type (failed dynamic_cast)");
+        auto const cudfScale = numeric::scale_type{-decimalType->scale()};
+        return cudf::data_type{cudf::type_id::DECIMAL64, cudfScale};
+      }
+      return cudf::data_type{cudf::type_id::INT64};
+    case TypeKind::HUGEINT: {
+      // HUGEINT is used only for DECIMAL128
+      // per facebookincubator/velox PR 4434 (May 2, 2023)
+      // although see commented-out HUGEINT -> DURATION_DAYS below
+      VELOX_CHECK(
+          type->isDecimal(), "HUGEINT should only be used for DECIMAL128");
+      auto const decimalType =
+          std::dynamic_pointer_cast<const LongDecimalType>(type);
+      VELOX_CHECK(decimalType, "Invalid Decimal Type (failed dynamic_cast)");
+      auto const cudfScale = numeric::scale_type{-decimalType->scale()};
+      return cudf::data_type{cudf::type_id::DECIMAL128, cudfScale};
+    }
     case TypeKind::REAL:
-      return cudf::type_id::FLOAT32;
+      return cudf::data_type{cudf::type_id::FLOAT32};
     case TypeKind::DOUBLE:
-      return cudf::type_id::FLOAT64;
+      return cudf::data_type{cudf::type_id::FLOAT64};
     case TypeKind::VARCHAR:
-      return cudf::type_id::STRING;
+      return cudf::data_type{cudf::type_id::STRING};
     case TypeKind::VARBINARY:
-      return cudf::type_id::STRING;
+      return cudf::data_type{cudf::type_id::STRING};
     case TypeKind::TIMESTAMP:
-      return cudf::type_id::TIMESTAMP_NANOSECONDS;
+      return cudf::data_type{cudf::type_id::TIMESTAMP_NANOSECONDS};
     // case TypeKind::HUGEINT: return cudf::type_id::DURATION_DAYS;
     // TODO: DATE was converted to a logical type:
     // https://github.com/facebookincubator/velox/commit/e480f5c03a6c47897ef4488bd56918a89719f908
     // case TypeKind::DATE: return cudf::type_id::DURATION_DAYS;
     // case TypeKind::INTERVAL_DAY_TIME: return cudf::type_id::EMPTY;
-    // TODO: Decimals are now logical types:
-    // https://github.com/facebookincubator/velox/commit/73d2f935b55f084d30557c7be94b9768efb8e56f
-    // case TypeKind::SHORT_DECIMAL: return cudf::type_id::DECIMAL64;
-    // case TypeKind::LONG_DECIMAL: return cudf::type_id::DECIMAL128;
     case TypeKind::ARRAY:
-      return cudf::type_id::LIST;
-    // case TypeKind::MAP: return cudf::type_id::EMPTY;
+      return cudf::data_type{cudf::type_id::LIST};
     case TypeKind::ROW:
-      return cudf::type_id::STRUCT;
+      return cudf::data_type{cudf::type_id::STRUCT};
+    // case TypeKind::MAP: return cudf::type_id::EMPTY;
     // case TypeKind::UNKNOWN: return cudf::type_id::EMPTY;
     // case TypeKind::FUNCTION: return cudf::type_id::EMPTY;
     // case TypeKind::OPAQUE: return cudf::type_id::EMPTY;
     // case TypeKind::INVALID: return cudf::type_id::EMPTY;
     default:
-      CUDF_FAIL(
-          "Unsupported Velox type: " +
-          std::string(TypeKindName::toName(type->kind())));
-      return cudf::type_id::EMPTY;
+      break;
   }
+  CUDF_FAIL(
+      "Unsupported Velox type: " +
+      std::string(TypeKindName::toName(type->kind())));
+  return cudf::data_type{cudf::type_id::EMPTY};
 }
 
 namespace with_arrow {
@@ -278,7 +303,11 @@ AsyncHtoD toCudfTableNoSync(
   flat->copy(veloxTable.get(), 0, 0, veloxTable->size());
 
   AsyncHtoD result;
-  ArrowOptions arrowOptions{true, true};
+  ArrowOptions arrowOptions{
+      .flattenDictionary = true,
+      .flattenConstant = true,
+      .exportVarbinaryAsString = true,
+      .useDecimalTypeWidth = true};
   exportToArrow(
       std::dynamic_pointer_cast<facebook::velox::BaseVector>(flat),
       result.arrowArray,
@@ -370,23 +399,92 @@ std::unique_ptr<cudf::table> toCudfTableBatched(
 
 namespace {
 
+void setArrowSchemaFormat(ArrowSchema* schema, const char* format) {
+  if (!schema) {
+    return;
+  }
+  if (schema->format != nullptr) {
+    std::free(const_cast<char*>(schema->format));
+    schema->format = nullptr;
+  }
+  if (format != nullptr) {
+    const size_t size = std::strlen(format) + 1;
+    auto* buffer = static_cast<char*>(std::malloc(size));
+    VELOX_CHECK_NOT_NULL(buffer);
+    std::memcpy(buffer, format, size);
+    schema->format = buffer;
+  }
+}
+
 RowVectorPtr toVeloxColumn(
     const cudf::table_view& table,
     memory::MemoryPool* pool,
     const std::vector<cudf::column_metadata>& metadata,
+    const RowTypePtr* expectedType,
     rmm::cuda_stream_view stream) {
   auto arrowDeviceArray = pinnedToArrowHost(table, stream);
-  auto& arrowArray = arrowDeviceArray->array;
+  ArrowArray arrayCopy = arrowDeviceArray->array;
+  arrowDeviceArray->array.release = nullptr;
 
   auto& stats = pinnedStats();
   auto callNum = stats.dtohCalls.fetch_add(1, std::memory_order_relaxed) + 1;
-  int64_t rows = arrowArray.length;
+  int64_t rows = arrayCopy.length;
   if ((callNum & (callNum - 1)) == 0) {
     LOG(WARNING) << "Pinned DtoH: calls=" << callNum << " rows=" << rows;
   }
 
   auto arrowSchema = cudf::to_arrow_schema(table, metadata);
-  auto veloxTable = importFromArrowAsOwner(*arrowSchema, arrowArray, pool);
+  ArrowSchema schemaCopy = *arrowSchema;
+  arrowSchema->release = nullptr;
+
+  if (expectedType) {
+    auto applyExpectedArrowFormat =
+        [&](auto&& self, ArrowSchema* schema, const TypePtr& type) -> void {
+      if (!schema || !schema->format) {
+        return;
+      }
+      switch (type->kind()) {
+        case TypeKind::ROW: {
+          if (schema->n_children != static_cast<int64_t>(type->size())) {
+            return;
+          }
+          for (size_t i = 0; i < type->size(); ++i) {
+            self(self, schema->children[i], type->childAt(i));
+          }
+          return;
+        }
+        case TypeKind::ARRAY: {
+          if (schema->n_children < 1) {
+            return;
+          }
+          self(self, schema->children[0], type->childAt(0));
+          return;
+        }
+        case TypeKind::MAP: {
+          if (schema->n_children < 1) {
+            return;
+          }
+          auto* entry = schema->children[0];
+          if (!entry || entry->n_children < 2) {
+            return;
+          }
+          self(self, entry->children[0], type->childAt(0));
+          self(self, entry->children[1], type->childAt(1));
+          return;
+        }
+        case TypeKind::VARBINARY: {
+          setArrowSchemaFormat(schema, "z");
+          return;
+        }
+        default:
+          return;
+      }
+    };
+    applyExpectedArrowFormat(
+        applyExpectedArrowFormat, &schemaCopy, *expectedType);
+  }
+
+  auto veloxTable = importFromArrowAsOwner(schemaCopy, arrayCopy, pool);
   auto castedPtr =
       std::dynamic_pointer_cast<facebook::velox::RowVector>(veloxTable);
   VELOX_CHECK_NOT_NULL(castedPtr);
@@ -415,7 +513,18 @@ facebook::velox::RowVectorPtr toVeloxColumn(
     std::string namePrefix,
     rmm::cuda_stream_view stream) {
   auto metadata = getMetadata(table.begin(), table.end(), namePrefix);
-  return toVeloxColumn(table, pool, metadata, stream);
+  return toVeloxColumn(table, pool, metadata, nullptr, stream);
+}
+
+facebook::velox::RowVectorPtr toVeloxColumn(
+    const cudf::table_view& table,
+    facebook::velox::memory::MemoryPool* pool,
+    const facebook::velox::RowTypePtr& expectedType,
+    std::string namePrefix,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref /*mr*/) {
+  auto metadata = getMetadata(table.begin(), table.end(), namePrefix);
+  return toVeloxColumn(table, pool, metadata, &expectedType, stream);
 }
 
 RowVectorPtr toVeloxColumn(
@@ -427,7 +536,7 @@ RowVectorPtr toVeloxColumn(
   for (auto name : columnNames) {
     metadata.emplace_back(cudf::column_metadata(name));
   }
-  return toVeloxColumn(table, pool, metadata, stream);
+  return toVeloxColumn(table, pool, metadata, nullptr, stream);
 }
 
 } // namespace with_arrow
