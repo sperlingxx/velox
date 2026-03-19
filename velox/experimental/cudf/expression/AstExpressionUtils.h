@@ -190,6 +190,13 @@ std::optional<Op> opFromFunctionName(const std::string& funcName) {
 bool isOpAndInputsSupported(
     const cudf::ast::ast_operator op,
     const std::vector<cudf::data_type>& inputCudfDataTypes) {
+  // cudf::compute_column / Jitify cannot handle variable-width types (STRING)
+  // in AST operations. These must go through FunctionExpression instead.
+  for (const auto& dt : inputCudfDataTypes) {
+    if (!cudf::is_fixed_width(dt)) {
+      return false;
+    }
+  }
   // check arity
   const auto arity = cudf::ast::detail::ast_operator_arity(op);
   if (arity != static_cast<int>(inputCudfDataTypes.size())) {
@@ -478,6 +485,43 @@ cudf::ast::expression const& AstContext::pushExprToTree(
   auto len = expr->inputs().size();
   auto& type = expr->type();
 
+  // Helper: check if any input expression produces a variable-width type
+  // (e.g., STRING). cudf::compute_column / Jitify cannot handle these in
+  // AST operations, so they must be evaluated as precompute instructions.
+  auto hasVariableWidthInput = [&]() {
+    for (const auto& input : expr->inputs()) {
+      try {
+        if (!cudf::is_fixed_width(veloxToCudfDataType(input->type()))) {
+          return true;
+        }
+      } catch (...) {
+      }
+    }
+    return false;
+  };
+
+  // Route a sub-expression with variable-width inputs to precompute
+  // via FunctionExpression, bypassing the JIT/AST compute_column path.
+  auto precomputeVarWidthOp =
+      [&]() -> const cudf::ast::expression* {
+    if (allowPureAstOnly || !hasVariableWidthInput()) {
+      return nullptr;
+    }
+    try {
+      int sideIdx = findExpressionSide(expr);
+      if (sideIdx < 0) {
+        sideIdx = 0;
+      }
+      auto node = createCudfExpression(
+          expr, inputRowSchema[sideIdx], kAstEvaluatorName);
+      if (node) {
+        return &addPrecomputeInstructionOnSide(sideIdx, 0, name, "", node);
+      }
+    } catch (...) {
+    }
+    return nullptr;
+  };
+
   if (name == "literal") {
     auto c = dynamic_cast<ConstantExpr*>(expr.get());
     VELOX_CHECK_NOT_NULL(c, "literal expression should be ConstantExpr");
@@ -503,6 +547,11 @@ cudf::ast::expression const& AstContext::pushExprToTree(
 
     return tree.push(createLiteral(value, scalars));
   } else if (binaryOps.find(name) != binaryOps.end()) {
+    if (name != "and" && name != "or") {
+      if (auto* result = precomputeVarWidthOp()) {
+        return *result;
+      }
+    }
     if (name == "and" or name == "or") {
       return multipleInputsToPairWise(expr);
     }
@@ -520,6 +569,9 @@ cudf::ast::expression const& AstContext::pushExprToTree(
     auto const& nullOp = tree.push(Operation{Op::IS_NULL, op1});
     return tree.push(Operation{Op::NOT, nullOp});
   } else if (name == "between") {
+    if (auto* result = precomputeVarWidthOp()) {
+      return *result;
+    }
     VELOX_CHECK_EQ(len, 3);
     auto const& value = pushExprToTree(expr->inputs()[0]);
     auto const& lower = pushExprToTree(expr->inputs()[1]);
@@ -529,6 +581,9 @@ cudf::ast::expression const& AstContext::pushExprToTree(
     auto const& leUpper = tree.push(Operation{Op::LESS_EQUAL, value, upper});
     return tree.push(Operation{Op::NULL_LOGICAL_AND, geLower, leUpper});
   } else if (name == "in") {
+    if (auto* result = precomputeVarWidthOp()) {
+      return *result;
+    }
     // number of inputs is variable. >=2
     VELOX_CHECK_EQ(len, 2);
     // actually len is 2, second input is ARRAY
