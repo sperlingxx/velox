@@ -37,6 +37,7 @@
 #include <cudf/hashing.hpp>
 #include <cudf/lists/count_elements.hpp>
 #include <cudf/reduction.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/replace.hpp>
 #include <cudf/round.hpp>
 #include <cudf/scalar/scalar.hpp>
@@ -1075,6 +1076,49 @@ class MightContainFunction : public CudfFunction {
     auto trueScalar = cudf::numeric_scalar<bool>(true, true, stream, mr);
     return cudf::make_column_from_scalar(trueScalar, probeCol.size(), stream, mr);
   }
+};
+
+class IsNullFunction : public CudfFunction {
+ public:
+  IsNullFunction(bool negate) : negate_(negate) {}
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    VELOX_CHECK_EQ(inputColumns.size(), 1, "isnull/isnotnull expects 1 input");
+    auto col = asView(inputColumns[0]);
+    auto n = col.size();
+
+    if (!col.nullable() || col.null_count() == 0) {
+      auto scalar = cudf::numeric_scalar<bool>(negate_, true, stream, mr);
+      return cudf::make_column_from_scalar(scalar, n, stream, mr);
+    }
+
+    if (col.null_count() == n) {
+      auto scalar = cudf::numeric_scalar<bool>(!negate_, true, stream, mr);
+      return cudf::make_column_from_scalar(scalar, n, stream, mr);
+    }
+
+    // Build isnotnull: all-true column with input's null mask, then replace
+    // nulls with false. This yields true for valid rows, false for null rows.
+    auto trueScalar = cudf::numeric_scalar<bool>(true, true, stream, mr);
+    auto allTrue = cudf::make_column_from_scalar(trueScalar, n, stream, mr);
+    auto maskBuf = cudf::copy_bitmask(col, stream, mr);
+    allTrue->set_null_mask(std::move(maskBuf), col.null_count());
+
+    auto falseScalar = cudf::numeric_scalar<bool>(false, true, stream, mr);
+    auto isnotnull = cudf::replace_nulls(allTrue->view(), falseScalar, stream, mr);
+
+    if (negate_) {
+      return isnotnull;
+    }
+    return cudf::unary_operation(
+        isnotnull->view(), cudf::unary_operator::NOT, stream, mr);
+  }
+
+ private:
+  bool negate_; // false = isnull, true = isnotnull
 };
 
 class GreatestLeastFunction : public CudfFunction {
@@ -2528,6 +2572,15 @@ std::shared_ptr<FunctionExpression> FunctionExpression::create(
             createCudfExpression(input, inputRowSchema));
       }
     }
+  } else if (name == "isnull" || name == "isnotnull") {
+    node->function_ =
+        std::make_shared<IsNullFunction>(name == "isnotnull");
+    for (const auto& input : expr->inputs()) {
+      if (input->name() != "literal") {
+        node->subexpressions_.push_back(
+            createCudfExpression(input, inputRowSchema));
+      }
+    }
   } else {
     node->function_ = createCudfFunction(name, expr);
     if (node->function_) {
@@ -2627,6 +2680,10 @@ bool FunctionExpression::canEvaluate(std::shared_ptr<velox::exec::Expr> expr) {
 
   if (opName == "might_contain") {
     return expr->inputs().size() >= 2;
+  }
+
+  if (opName == "isnull" || opName == "isnotnull") {
+    return expr->inputs().size() == 1;
   }
 
   auto& registry = getCudfFunctionRegistry();
