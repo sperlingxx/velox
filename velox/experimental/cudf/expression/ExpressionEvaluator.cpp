@@ -2331,9 +2331,11 @@ bool registerBuiltinFunctions(const std::string& prefix) {
   };
 
   registerComparisonOp(
-      {prefix + "equal", prefix + "eq"}, cudf::binary_operator::EQUAL);
+      {prefix + "equal", prefix + "eq", prefix + "equalto"},
+      cudf::binary_operator::EQUAL);
   registerComparisonOp(
-      {prefix + "notequal", prefix + "neq"}, cudf::binary_operator::NOT_EQUAL);
+      {prefix + "notequal", prefix + "neq", prefix + "notequalto"},
+      cudf::binary_operator::NOT_EQUAL);
   registerComparisonOp(
       {prefix + "greaterthanorequal", prefix + "gte"},
       cudf::binary_operator::GREATER_EQUAL);
