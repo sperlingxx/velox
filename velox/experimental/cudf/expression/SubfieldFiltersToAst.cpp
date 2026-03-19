@@ -497,14 +497,13 @@ cudf::ast::expression const& createAstFromSubfieldFilter(
           int128_t>(filter, tree, columnRef, scalars, columnType);
     }
 
-    case common::FilterKind::kBytesValues: {
-      return buildInListExpr<common::BytesValues, cudf::string_scalar>(
-          filter, tree, columnRef, scalars, false, stream, mr);
-    }
-
+    case common::FilterKind::kBytesValues:
     case common::FilterKind::kNegatedBytesValues: {
-      return buildInListExpr<common::NegatedBytesValues, cudf::string_scalar>(
-          filter, tree, columnRef, scalars, true, stream, mr);
+      // STRING comparisons are not supported by cudf AST / Jitify.
+      VELOX_NYI(
+          "STRING/Bytes subfield filters not supported in AST evaluator "
+          "(filter kind {})",
+          static_cast<int>(filter.kind()));
     }
 
     case common::FilterKind::kDoubleRange: {
@@ -518,7 +517,12 @@ cudf::ast::expression const& createAstFromSubfieldFilter(
     }
 
     case common::FilterKind::kBytesRange: {
-      return createBytesRangeExpr(filter, tree, scalars, columnRef, stream, mr);
+      // STRING comparisons are not supported by cudf AST / Jitify.
+      // Fall through to VELOX_NYI so the caller can skip this filter.
+      VELOX_NYI(
+          "STRING/Bytes subfield filters not supported in AST evaluator "
+          "(filter kind {})",
+          static_cast<int>(filter.kind()));
     }
 
     case common::FilterKind::kBoolValue: {
@@ -562,17 +566,29 @@ cudf::ast::expression const& createAstFromSubfieldFilters(
 
   std::vector<const cudf::ast::expression*> exprRefs;
 
-  // Build individual filter expressions.
+  // Build individual filter expressions, skipping unsupported ones
+  // (e.g. STRING/Bytes filters that can't be evaluated by AST/Jitify).
   for (const auto& [subfield, filterPtr] : subfieldFilters) {
     if (!filterPtr) {
       continue;
     }
-    auto const& expr = createAstFromSubfieldFilter(
-        subfield, *filterPtr, tree, scalars, inputRowSchema);
-    exprRefs.push_back(&expr);
+    try {
+      auto const& expr = createAstFromSubfieldFilter(
+          subfield, *filterPtr, tree, scalars, inputRowSchema);
+      exprRefs.push_back(&expr);
+    } catch (const VeloxException& e) {
+      LOG(WARNING) << "Skipping subfield filter for '"
+                   << subfield.toString()
+                   << "': " << e.message();
+    }
   }
 
-  VELOX_CHECK_GT(exprRefs.size(), 0, "No subfield filters provided");
+  if (exprRefs.empty()) {
+    VELOX_FAIL(
+        "No subfield filters could be converted to AST; "
+        "all {} filters were skipped",
+        subfieldFilters.size());
+  }
 
   if (exprRefs.size() == 1) {
     return *exprRefs[0];
