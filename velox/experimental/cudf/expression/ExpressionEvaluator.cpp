@@ -44,6 +44,7 @@
 #include <cudf/strings/attributes.hpp>
 #include <cudf/strings/case.hpp>
 #include <cudf/strings/contains.hpp>
+#include <cudf/strings/convert/convert_datetime.hpp>
 #include <cudf/strings/find.hpp>
 #include <cudf/strings/combine.hpp>
 #include <cudf/strings/slice.hpp>
@@ -261,11 +262,17 @@ class CastFunction : public CudfFunction {
     targetCudfType_ = cudf_velox::veloxToCudfDataType(expr->type());
     auto sourceType =
         cudf_velox::veloxToCudfDataType(expr->inputs()[0]->type());
-    VELOX_CHECK(
-        cudf::is_supported_cast(sourceType, targetCudfType_),
-        "Cast from {} to {} is not supported",
-        expr->inputs()[0]->type()->toString(),
-        expr->type()->toString());
+
+    if (sourceType.id() == cudf::type_id::TIMESTAMP_DAYS &&
+        targetCudfType_.id() == cudf::type_id::STRING) {
+      dateToString_ = true;
+    } else {
+      VELOX_CHECK(
+          cudf::is_supported_cast(sourceType, targetCudfType_),
+          "Cast from {} to {} is not supported",
+          expr->inputs()[0]->type()->toString(),
+          expr->type()->toString());
+    }
   }
 
   ColumnOrView eval(
@@ -273,11 +280,18 @@ class CastFunction : public CudfFunction {
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr) const override {
     auto inputCol = asView(inputColumns[0]);
+    if (dateToString_) {
+      return cudf::strings::from_timestamps(inputCol, "%Y-%m-%d",
+          cudf::strings_column_view(cudf::column_view{
+              cudf::data_type{cudf::type_id::STRING}, 0, nullptr, nullptr, 0}),
+          stream, mr);
+    }
     return cudf::cast(inputCol, targetCudfType_, stream, mr);
   }
 
  private:
   cudf::data_type targetCudfType_;
+  bool dateToString_{false};
 };
 
 // Spark date_add function implementation.
@@ -906,7 +920,10 @@ class BetweenFunction : public CudfFunction {
 
 class InFunction : public CudfFunction {
  public:
-  InFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
+  InFunction(
+      const std::shared_ptr<velox::exec::Expr>& expr,
+      bool skipCast)
+      : skipCast_(skipCast) {
     VELOX_CHECK_EQ(expr->inputs().size(), 2, "in expects exactly 2 inputs");
     auto constExpr = std::dynamic_pointer_cast<velox::exec::ConstantExpr>(
         expr->inputs()[1]);
@@ -914,7 +931,13 @@ class InFunction : public CudfFunction {
         constExpr, "in second argument must be a constant array");
     auto value = constExpr->value();
     VELOX_CHECK_NOT_NULL(value, "ConstantExpr value is null");
-    buildHaystackColumn(value);
+
+    cudf::data_type targetType{cudf::type_id::EMPTY};
+    if (skipCast_) {
+      auto srcType = expr->inputs()[0]->inputs()[0]->type();
+      targetType = cudf_velox::veloxToCudfDataType(srcType);
+    }
+    buildHaystackColumn(value, targetType);
   }
 
   ColumnOrView eval(
@@ -943,6 +966,20 @@ class InFunction : public CudfFunction {
     return cudf::contains(haystackView, needles, stream, mr);
   }
 
+  static bool shouldSkipCast(const std::shared_ptr<velox::exec::Expr>& expr) {
+    auto& valueExpr = expr->inputs()[0];
+    if (valueExpr->name() != "cast" && valueExpr->name() != "try_cast") {
+      return false;
+    }
+    if (valueExpr->inputs().empty()) {
+      return false;
+    }
+    auto srcCudf =
+        cudf_velox::veloxToCudfDataType(valueExpr->inputs()[0]->type());
+    auto dstCudf = cudf_velox::veloxToCudfDataType(valueExpr->type());
+    return !cudf::is_supported_cast(srcCudf, dstCudf);
+  }
+
  private:
   template <TypeKind Kind>
   static std::unique_ptr<cudf::scalar> scalarFromElement(
@@ -954,7 +991,9 @@ class InFunction : public CudfFunction {
     return makeScalarFromValue<T>(type, val, false);
   }
 
-  void buildHaystackColumn(const VectorPtr& vector) {
+  void buildHaystackColumn(
+      const VectorPtr& vector,
+      cudf::data_type castTarget) {
     auto stream = cudf::get_default_stream();
     auto mr = cudf::get_current_device_resource_ref();
 
@@ -984,7 +1023,11 @@ class InFunction : public CudfFunction {
         continue;
       }
       auto scalar = VELOX_DYNAMIC_SCALAR_TYPE_DISPATCH(
-          scalarFromElement, elements->typeKind(), elements, elements->type(), i);
+          scalarFromElement,
+          elements->typeKind(),
+          elements,
+          elements->type(),
+          i);
       columns.push_back(cudf::make_column_from_scalar(*scalar, 1, stream, mr));
     }
 
@@ -1000,9 +1043,38 @@ class InFunction : public CudfFunction {
       }
       haystack_ = cudf::concatenate(views, stream, mr);
     }
+
+    if (castTarget.id() != cudf::type_id::EMPTY &&
+        haystack_->view().type() != castTarget) {
+      haystack_ = cudf::cast(haystack_->view(), castTarget, stream, mr);
+    }
   }
 
+  bool skipCast_;
   std::unique_ptr<cudf::column> haystack_;
+};
+
+// Bloom filter probe: might_contain(bloom_filter, value).
+// Bloom filter is a probabilistic data structure used by Spark for runtime
+// filtering. Returning all-true is always correct (false positives allowed).
+// TODO: implement actual GPU bloom filter probe for better performance.
+class MightContainFunction : public CudfFunction {
+ public:
+  MightContainFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
+    VELOX_CHECK_GE(
+        expr->inputs().size(), 2, "might_contain expects at least 2 inputs");
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    VELOX_CHECK_GE(
+        inputColumns.size(), 1, "might_contain needs at least 1 input column");
+    auto probeCol = asView(inputColumns.back());
+    auto trueScalar = cudf::numeric_scalar<bool>(true, true, stream, mr);
+    return cudf::make_column_from_scalar(trueScalar, probeCol.size(), stream, mr);
+  }
 };
 
 class GreatestLeastFunction : public CudfFunction {
@@ -2433,16 +2505,37 @@ std::shared_ptr<FunctionExpression> FunctionExpression::create(
 
   auto name = expr->name();
   if (name == "in") {
-    node->function_ = std::make_shared<InFunction>(expr);
-  } else {
-    node->function_ = createCudfFunction(name, expr);
-  }
-
-  if (node->function_) {
+    bool skipCast = InFunction::shouldSkipCast(expr);
+    node->function_ = std::make_shared<InFunction>(expr, skipCast);
+    if (skipCast) {
+      auto& innerExpr = expr->inputs()[0]->inputs()[0];
+      if (innerExpr->name() != "literal") {
+        node->subexpressions_.push_back(
+            createCudfExpression(innerExpr, inputRowSchema));
+      }
+    } else {
+      auto& valueExpr = expr->inputs()[0];
+      if (valueExpr->name() != "literal") {
+        node->subexpressions_.push_back(
+            createCudfExpression(valueExpr, inputRowSchema));
+      }
+    }
+  } else if (name == "might_contain") {
+    node->function_ = std::make_shared<MightContainFunction>(expr);
     for (const auto& input : expr->inputs()) {
       if (input->name() != "literal") {
         node->subexpressions_.push_back(
             createCudfExpression(input, inputRowSchema));
+      }
+    }
+  } else {
+    node->function_ = createCudfFunction(name, expr);
+    if (node->function_) {
+      for (const auto& input : expr->inputs()) {
+        if (input->name() != "literal") {
+          node->subexpressions_.push_back(
+              createCudfExpression(input, inputRowSchema));
+        }
       }
     }
   }
@@ -2508,6 +2601,10 @@ bool FunctionExpression::canEvaluate(std::shared_ptr<velox::exec::Expr> expr) {
     }
     auto src = cudf_velox::veloxToCudfDataType(srcType);
     auto dst = cudf_velox::veloxToCudfDataType(dstType);
+    if (src.id() == cudf::type_id::TIMESTAMP_DAYS &&
+        dst.id() == cudf::type_id::STRING) {
+      return true;
+    }
     return cudf::is_supported_cast(src, dst);
   }
   // row_constructor variants always accepted: the return type is a
@@ -2526,6 +2623,10 @@ bool FunctionExpression::canEvaluate(std::shared_ptr<velox::exec::Expr> expr) {
     }
     return std::dynamic_pointer_cast<velox::exec::ConstantExpr>(
                expr->inputs()[1]) != nullptr;
+  }
+
+  if (opName == "might_contain") {
+    return expr->inputs().size() >= 2;
   }
 
   auto& registry = getCudfFunctionRegistry();
