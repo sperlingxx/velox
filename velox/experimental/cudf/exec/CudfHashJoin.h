@@ -212,6 +212,7 @@ class CudfHashJoinProbe : public exec::Operator, public NvtxHelper {
   /** @brief Output column positions for right table columns */
   std::vector<size_t> rightColumnOutputIndices_;
   bool finished_{false};
+  bool useAstFilter_{true};
 
   // For LeftSemiProject: output index of the boolean "match" column.
   // -1 when the join is not a LeftSemiProject.
