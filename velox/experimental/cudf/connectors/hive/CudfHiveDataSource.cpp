@@ -173,14 +173,39 @@ CudfHiveDataSource::CudfHiveDataSource(
       }
     }();
 
-    try {
-      subfieldFilterExpr_ = &createAstFromSubfieldFilters(
-          subfieldFilters_, subfieldTree_, subfieldScalars_, readerFilterType);
-    } catch (const VeloxException& e) {
-      LOG(WARNING) << "Could not build AST for subfield filters: "
-                   << e.message()
-                   << ". Skipping GPU subfield filtering.";
+    bool hasStringColumns = false;
+    for (const auto& [subfield, filterPtr] : subfieldFilters_) {
+      if (!filterPtr || subfield.path().empty()) {
+        continue;
+      }
+      auto* nestedField =
+          dynamic_cast<const common::Subfield::NestedField*>(
+              subfield.path()[0].get());
+      if (nestedField && readerFilterType->containsChild(nestedField->name())) {
+        auto colType =
+            readerFilterType->findChild(nestedField->name());
+        if (colType->isVarchar() || colType->isVarbinary()) {
+          hasStringColumns = true;
+          break;
+        }
+      }
+    }
+
+    if (hasStringColumns) {
+      LOG(WARNING)
+          << "Subfield filters involve STRING/VARBINARY columns; "
+          << "skipping GPU subfield filtering to avoid Jitify errors.";
       subfieldFilterExpr_ = nullptr;
+    } else {
+      try {
+        subfieldFilterExpr_ = &createAstFromSubfieldFilters(
+            subfieldFilters_, subfieldTree_, subfieldScalars_, readerFilterType);
+      } catch (const VeloxException& e) {
+        LOG(WARNING) << "Could not build AST for subfield filters: "
+                     << e.message()
+                     << ". Skipping GPU subfield filtering.";
+        subfieldFilterExpr_ = nullptr;
+      }
     }
   }
 
@@ -1234,7 +1259,7 @@ std::unique_ptr<cudf::table> CudfHiveDataSource::readNextExperimentalBatch(
       LOG(WARNING)
           << "Subfield filter compute_column failed (possibly Jitify): "
           << e.what() << ". Returning unfiltered data for this chunk.";
-      return std::move(table);
+      return table;
     }
   }
   return std::move(tableWithMetadata.tbl);
