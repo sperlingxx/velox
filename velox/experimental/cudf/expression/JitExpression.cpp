@@ -67,6 +67,13 @@ ColumnOrView JitExpression::eval(
       if (CudfConfig::getInstance().debugEnabled) {
         LOG(WARNING) << "JitExpr: compute_column_jit path";
       }
+      std::vector<cudf::column_view> allColumnViews(inputColumnViews);
+      allColumnViews.reserve(
+          inputColumnViews.size() + precomputedColumns.size());
+      for (auto& precomputedCol : precomputedColumns) {
+        allColumnViews.push_back(asView(precomputedCol));
+      }
+      cudf::table_view astInputTableView(allColumnViews);
       return cudf::compute_column_jit(
           astInputTableView, expr_.cudfTree_.back(), stream, mr);
     }

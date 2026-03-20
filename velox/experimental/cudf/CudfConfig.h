@@ -83,7 +83,7 @@ struct CudfConfig {
   bool astExpressionEnabled{true};
 
   /// Enable JIT in expression evaluation
-  bool jitExpressionEnabled{true};
+  bool jitExpressionEnabled{false};
 
   /// Priority of AST expression. Expression with higher priority is chosen for
   /// a given root expression.

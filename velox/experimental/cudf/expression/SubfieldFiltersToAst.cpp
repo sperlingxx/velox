@@ -208,7 +208,7 @@ std::reference_wrapper<const cudf::ast::expression> buildHugeintRangeExpr(
   auto addLiteral = [&](int128_t value) -> const cudf::ast::expression& {
     variant veloxVariant = value;
     const auto& literal = makeScalarAndLiteral<TypeKind::HUGEINT>(
-        columnTypePtr, veloxVariant, scalars);
+        columnTypePtr, veloxVariant, /*isNull=*/false, scalars);
     return tree.push(literal);
   };
 
@@ -265,7 +265,7 @@ const cudf::ast::expression& buildHashInListExpr(
   for (const auto& value : values) {
     variant veloxVariant = static_cast<ValueT>(value);
     auto const& literal = tree.push(
-        makeScalarAndLiteral<Kind>(columnTypePtr, veloxVariant, scalars));
+        makeScalarAndLiteral<Kind>(columnTypePtr, veloxVariant, /*isNull=*/false, scalars));
     auto const& equalExpr = tree.push(
         Operation{isNegated ? Op::NOT_EQUAL : Op::EQUAL, columnRef, literal});
     exprVec.push_back(&equalExpr);
