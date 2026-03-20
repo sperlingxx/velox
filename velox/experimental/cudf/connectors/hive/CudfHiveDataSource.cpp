@@ -1222,13 +1222,20 @@ std::unique_ptr<cudf::table> CudfHiveDataSource::readNextExperimentalBatch(
 
   if (readerOptions_.get_filter().has_value()) {
     std::unique_ptr<cudf::table> table = std::move(tableWithMetadata.tbl);
-    auto filterMask = cudf::compute_column(
-        *table, readerOptions_.get_filter().value(), stream_);
-    return cudf::apply_boolean_mask(
-        table->view(),
-        filterMask->view(),
-        stream_,
-        cudf::get_current_device_resource_ref());
+    try {
+      auto filterMask = cudf::compute_column(
+          *table, readerOptions_.get_filter().value(), stream_);
+      return cudf::apply_boolean_mask(
+          table->view(),
+          filterMask->view(),
+          stream_,
+          cudf::get_current_device_resource_ref());
+    } catch (const std::exception& e) {
+      LOG(WARNING)
+          << "Subfield filter compute_column failed (possibly Jitify): "
+          << e.what() << ". Returning unfiltered data for this chunk.";
+      return std::move(table);
+    }
   }
   return std::move(tableWithMetadata.tbl);
 }
