@@ -869,15 +869,27 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::innerJoin(
   // Precompute left (probe) table columns if needed (once, outside loop)
   std::vector<ColumnOrView> leftPrecomputed;
   cudf::table_view extendedLeftView = leftTableView;
-  if (joinNode_->filter() && !leftPrecomputeInstructions_.empty()) {
-    auto leftColumnViews = tableViewToColumnViews(leftTableView);
-    leftPrecomputed = precomputeSubexpressions(
-        leftColumnViews,
-        leftPrecomputeInstructions_,
-        scalars_,
-        probeType_,
-        stream);
-    extendedLeftView = createExtendedTableView(leftTableView, leftPrecomputed);
+  if (joinNode_->filter() && useAstFilter_ &&
+      !leftPrecomputeInstructions_.empty()) {
+    try {
+      auto leftColumnViews = tableViewToColumnViews(leftTableView);
+      leftPrecomputed = precomputeSubexpressions(
+          leftColumnViews,
+          leftPrecomputeInstructions_,
+          scalars_,
+          probeType_,
+          stream);
+      extendedLeftView =
+          createExtendedTableView(leftTableView, leftPrecomputed);
+    } catch (const VeloxException& e) {
+      LOG(WARNING)
+          << "CudfHashJoinProbe::innerJoin: left precompute failed, "
+          << "disabling AST filter for planNode " << joinNode_->id()
+          << ": " << e.what();
+      useAstFilter_ = false;
+      leftPrecomputed.clear();
+      extendedLeftView = leftTableView;
+    }
   }
 
   for (auto i = 0; i < rightTables.size(); i++) {
@@ -886,7 +898,8 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::innerJoin(
 
     // Use cached precomputed columns for right (build) table
     cudf::table_view extendedRightView =
-        (joinNode_->filter() && !rightPrecomputeInstructions_.empty())
+        (joinNode_->filter() && useAstFilter_ &&
+         !rightPrecomputeInstructions_.empty())
         ? cachedExtendedRightViews_[i]
         : rightTableView;
 
@@ -906,6 +919,8 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::innerJoin(
           leftTableView.select(leftKeyIndices_),
           std::nullopt,
           buildStream_.has_value() ? buildStream_.value() : stream);
+    } catch (const std::bad_alloc&) {
+      throw;
     } catch (const std::exception& e) {
       VELOX_FAIL(
           "GPU inner_join failed (probe={} rows, build={} rows, "
@@ -983,6 +998,8 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::innerJoin(
             rightIndicesCol,
             stream));
       }
+    } catch (const std::bad_alloc&) {
+      throw;
     } catch (const std::exception& e) {
       VELOX_FAIL(
           "GPU join gather/filter failed (joinOutput={} rows, "
@@ -1008,15 +1025,27 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::leftJoin(
   // Precompute left (probe) table columns if needed (once, outside loop)
   std::vector<ColumnOrView> leftPrecomputed;
   cudf::table_view extendedLeftView = leftTableView;
-  if (joinNode_->filter() && !leftPrecomputeInstructions_.empty()) {
-    auto leftColumnViews = tableViewToColumnViews(leftTableView);
-    leftPrecomputed = precomputeSubexpressions(
-        leftColumnViews,
-        leftPrecomputeInstructions_,
-        scalars_,
-        probeType_,
-        stream);
-    extendedLeftView = createExtendedTableView(leftTableView, leftPrecomputed);
+  if (joinNode_->filter() && useAstFilter_ &&
+      !leftPrecomputeInstructions_.empty()) {
+    try {
+      auto leftColumnViews = tableViewToColumnViews(leftTableView);
+      leftPrecomputed = precomputeSubexpressions(
+          leftColumnViews,
+          leftPrecomputeInstructions_,
+          scalars_,
+          probeType_,
+          stream);
+      extendedLeftView =
+          createExtendedTableView(leftTableView, leftPrecomputed);
+    } catch (const VeloxException& e) {
+      LOG(WARNING)
+          << "CudfHashJoinProbe::leftJoin: left precompute failed, "
+          << "disabling AST filter for planNode " << joinNode_->id()
+          << ": " << e.what();
+      useAstFilter_ = false;
+      leftPrecomputed.clear();
+      extendedLeftView = leftTableView;
+    }
   }
 
   for (auto i = 0; i < rightTables.size(); i++) {
@@ -1025,7 +1054,8 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::leftJoin(
 
     // Use cached precomputed columns for right (build) table
     cudf::table_view extendedRightView =
-        (joinNode_->filter() && !rightPrecomputeInstructions_.empty())
+        (joinNode_->filter() && useAstFilter_ &&
+         !rightPrecomputeInstructions_.empty())
         ? cachedExtendedRightViews_[i]
         : rightTableView;
 
@@ -2181,34 +2211,69 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
     }
   }
 
+  auto executeJoin = [&](cudf::table_view probeView)
+      -> std::vector<std::unique_ptr<cudf::table>> {
+    switch (joinNode_->joinType()) {
+      case core::JoinType::kInner:
+        return innerJoin(probeView, stream);
+      case core::JoinType::kLeft:
+        return leftJoin(probeView, stream);
+      case core::JoinType::kRight:
+        return rightJoin(probeView, stream);
+      case core::JoinType::kLeftSemiFilter:
+        return leftSemiFilterJoin(probeView, stream);
+      case core::JoinType::kLeftSemiProject:
+        return leftSemiProjectJoin(probeView, stream);
+      case core::JoinType::kRightSemiFilter:
+        return rightSemiFilterJoin(probeView, stream);
+      case core::JoinType::kAnti:
+        return antiJoin(probeView, stream);
+      case core::JoinType::kFull:
+        return fullJoin(probeView, stream);
+      default:
+        VELOX_FAIL("Unsupported join type: ", joinNode_->joinType());
+    }
+  };
+
+  bool const canSplitProbe =
+      joinNode_->isInnerJoin() || joinNode_->isLeftJoin() ||
+      joinNode_->isLeftSemiFilterJoin() ||
+      joinNode_->isLeftSemiProjectJoin() || joinNode_->isAntiJoin();
+  static constexpr cudf::size_type kMinSplitRows = 1024;
+
   std::vector<std::unique_ptr<cudf::table>> cudfOutputs;
-  switch (joinNode_->joinType()) {
-    case core::JoinType::kInner:
-      cudfOutputs = innerJoin(leftTableView, stream);
-      break;
-    case core::JoinType::kLeft:
-      cudfOutputs = leftJoin(leftTableView, stream);
-      break;
-    case core::JoinType::kRight:
-      cudfOutputs = rightJoin(leftTableView, stream);
-      break;
-    case core::JoinType::kLeftSemiFilter:
-      cudfOutputs = leftSemiFilterJoin(leftTableView, stream);
-      break;
-    case core::JoinType::kLeftSemiProject:
-      cudfOutputs = leftSemiProjectJoin(leftTableView, stream);
-      break;
-    case core::JoinType::kRightSemiFilter:
-      cudfOutputs = rightSemiFilterJoin(leftTableView, stream);
-      break;
-    case core::JoinType::kAnti:
-      cudfOutputs = antiJoin(leftTableView, stream);
-      break;
-    case core::JoinType::kFull:
-      cudfOutputs = fullJoin(leftTableView, stream);
-      break;
-    default:
-      VELOX_FAIL("Unsupported join type: ", joinNode_->joinType());
+  std::vector<cudf::table_view> probeSlices = {leftTableView};
+
+  while (!probeSlices.empty()) {
+    auto slice = probeSlices.back();
+    probeSlices.pop_back();
+
+    try {
+      auto results = executeJoin(slice);
+      for (auto& r : results) {
+        cudfOutputs.push_back(std::move(r));
+      }
+    } catch (const std::bad_alloc& e) {
+      if (!canSplitProbe || slice.num_rows() <= kMinSplitRows) {
+        VELOX_FAIL(
+            "GPU join OOM: failed to allocate memory for {} "
+            "(probe={} rows, planNode={}). "
+            "Consider increasing spark.sql.shuffle.partitions "
+            "to reduce per-partition join size: {}",
+            joinNode_->joinType(),
+            slice.num_rows(),
+            joinNode_->id(),
+            e.what());
+      }
+      LOG(WARNING)
+          << "GPU join OOM with " << slice.num_rows()
+          << " probe rows for planNode " << joinNode_->id()
+          << ". Splitting probe in half and retrying.";
+      auto half = static_cast<cudf::size_type>(slice.num_rows() / 2);
+      auto splits = cudf::split(slice, {half}, stream);
+      probeSlices.push_back(splits[1]);
+      probeSlices.push_back(splits[0]);
+    }
   }
 
   // Release input CudfVector to free GPU memory before creating output.
@@ -2312,34 +2377,45 @@ exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
   }
 
   // Precompute right table columns if filter exists (once when build is done)
-  if (joinNode_->filter() && !rightPrecomputeInstructions_.empty()) {
-    auto& rightTablesInit = hashObject_.value().first;
-    cachedRightPrecomputed_.clear();
-    cachedExtendedRightViews_.clear();
-    cachedRightPrecomputed_.reserve(rightTablesInit.size());
-    cachedExtendedRightViews_.reserve(rightTablesInit.size());
+  if (joinNode_->filter() && useAstFilter_ &&
+      !rightPrecomputeInstructions_.empty()) {
+    try {
+      auto& rightTablesInit = hashObject_.value().first;
+      cachedRightPrecomputed_.clear();
+      cachedExtendedRightViews_.clear();
+      cachedRightPrecomputed_.reserve(rightTablesInit.size());
+      cachedExtendedRightViews_.reserve(rightTablesInit.size());
 
-    auto initStream = cudfGlobalStreamPool().get_stream();
-    for (auto& rt : rightTablesInit) {
-      auto rightTableView = rt->view();
-      if (rightTableView.num_rows() == 0) {
-        cachedRightPrecomputed_.emplace_back();
-        cachedExtendedRightViews_.push_back(rightTableView);
-        continue;
+      auto initStream = cudfGlobalStreamPool().get_stream();
+      for (auto& rt : rightTablesInit) {
+        auto rightTableView = rt->view();
+        if (rightTableView.num_rows() == 0) {
+          cachedRightPrecomputed_.emplace_back();
+          cachedExtendedRightViews_.push_back(rightTableView);
+          continue;
+        }
+        auto rightColumnViews = tableViewToColumnViews(rightTableView);
+        auto rightPrecomputed = precomputeSubexpressions(
+            rightColumnViews,
+            rightPrecomputeInstructions_,
+            scalars_,
+            buildType_,
+            initStream);
+        auto extendedView =
+            createExtendedTableView(rightTableView, rightPrecomputed);
+        cachedRightPrecomputed_.push_back(std::move(rightPrecomputed));
+        cachedExtendedRightViews_.push_back(extendedView);
       }
-      auto rightColumnViews = tableViewToColumnViews(rightTableView);
-      auto rightPrecomputed = precomputeSubexpressions(
-          rightColumnViews,
-          rightPrecomputeInstructions_,
-          scalars_,
-          buildType_,
-          initStream);
-      auto extendedView =
-          createExtendedTableView(rightTableView, rightPrecomputed);
-      cachedRightPrecomputed_.push_back(std::move(rightPrecomputed));
-      cachedExtendedRightViews_.push_back(extendedView);
+      initStream.synchronize();
+    } catch (const VeloxException& e) {
+      LOG(WARNING)
+          << "CudfHashJoinProbe: right-side precompute failed, "
+          << "disabling AST filter for planNode " << joinNode_->id()
+          << ": " << e.what();
+      useAstFilter_ = false;
+      cachedRightPrecomputed_.clear();
+      cachedExtendedRightViews_.clear();
     }
-    initStream.synchronize();
   }
 
   auto& rightTables = hashObject_.value().first;
