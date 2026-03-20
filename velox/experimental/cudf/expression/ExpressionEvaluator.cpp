@@ -978,6 +978,12 @@ class InFunction : public CudfFunction {
     auto srcCudf =
         cudf_velox::veloxToCudfDataType(valueExpr->inputs()[0]->type());
     auto dstCudf = cudf_velox::veloxToCudfDataType(valueExpr->type());
+    // CastFunction handles DATE→STRING via cudf::strings::from_timestamps,
+    // so don't skip the cast even though cudf::cast doesn't support it.
+    if (srcCudf.id() == cudf::type_id::TIMESTAMP_DAYS &&
+        dstCudf.id() == cudf::type_id::STRING) {
+      return false;
+    }
     return !cudf::is_supported_cast(srcCudf, dstCudf);
   }
 
@@ -1047,7 +1053,17 @@ class InFunction : public CudfFunction {
 
     if (castTarget.id() != cudf::type_id::EMPTY &&
         haystack_->view().type() != castTarget) {
-      haystack_ = cudf::cast(haystack_->view(), castTarget, stream, mr);
+      if (haystack_->view().type().id() == cudf::type_id::STRING &&
+          cudf::is_timestamp(castTarget)) {
+        haystack_ = cudf::strings::to_timestamps(
+            cudf::strings_column_view(haystack_->view()),
+            castTarget,
+            "%Y-%m-%d",
+            stream,
+            mr);
+      } else {
+        haystack_ = cudf::cast(haystack_->view(), castTarget, stream, mr);
+      }
     }
   }
 
