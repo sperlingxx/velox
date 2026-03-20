@@ -244,6 +244,10 @@ class CudfHashJoinProbe : public exec::Operator, public NvtxHelper {
   /// Cached extended views for right tables (original + precomputed columns)
   std::vector<cudf::table_view> cachedExtendedRightViews_;
 
+  /// Pending join outputs from OOM probe splitting (returned one per
+  /// getOutput() call to avoid peak memory from concatenation).
+  std::vector<std::unique_ptr<cudf::table>> pendingJoinOutputs_;
+
   // For Right joins, only one driver collects the unmatched rows mask and
   // emits. This value is set true only for that driver. See noMoreInput
   bool isLastDriver_{false};
