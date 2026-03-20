@@ -47,7 +47,6 @@
 #include <cudf/table/table.hpp>
 #include <cudf/unary.hpp>
 
-#include <cuda_runtime_api.h>
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_uvector.hpp>
 #include <rmm/exec_policy.hpp>
@@ -2039,22 +2038,6 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
     return nullptr;
   }
 
-  if (!pendingJoinOutputs_.empty()) {
-    auto tbl = std::move(pendingJoinOutputs_.back());
-    pendingJoinOutputs_.pop_back();
-    auto stream = cudfGlobalStreamPool().get_stream();
-    if (pendingJoinOutputs_.empty()) {
-      finished_ = noMoreInput_ && !joinNode_->isRightJoin() &&
-          !joinNode_->isFullJoin();
-    }
-    auto const size = tbl->num_rows();
-    if (tbl->num_columns() == 0 || size == 0) {
-      return nullptr;
-    }
-    return std::make_shared<CudfVector>(
-        pool(), outputType_, size, std::move(tbl), stream);
-  }
-
   // Materialize accumulated probe inputs into input_ when the byte/row
   // threshold is reached or no more input is expected. This coalesces many
   // small GPU batches into one large batch, dramatically reducing
@@ -2271,13 +2254,6 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
         cudfOutputs.push_back(std::move(r));
       }
     } catch (const std::bad_alloc& e) {
-      // After a CUDA OOM the async memory pool may enter an error state
-      // where ALL subsequent allocations fail (cudaErrorIllegalAddress).
-      // Synchronize the stream and clear the sticky CUDA error so that
-      // the split-and-retry path below has a chance of succeeding.
-      stream.synchronize_no_throw();
-      cudaGetLastError();
-
       if (!canSplitProbe || slice.num_rows() <= kMinSplitRows) {
         VELOX_FAIL(
             "GPU join OOM: failed to allocate memory for {} "
@@ -2306,48 +2282,20 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
   // the refcount while cudfInput still holds a reference.
   cudfInput.reset();
   input_.reset();
+  finished_ =
+      noMoreInput_ && !joinNode_->isRightJoin() && !joinNode_->isFullJoin();
 
-  // Remove empty tables before deciding how to return.
-  cudfOutputs.erase(
-      std::remove_if(
-          cudfOutputs.begin(),
-          cudfOutputs.end(),
-          [](const std::unique_ptr<cudf::table>& t) {
-            return !t || t->num_rows() == 0 || t->num_columns() == 0;
-          }),
-      cudfOutputs.end());
-
-  if (cudfOutputs.empty()) {
-    finished_ =
-        noMoreInput_ && !joinNode_->isRightJoin() && !joinNode_->isFullJoin();
+  auto cudfOutput = concatenateTables(std::move(cudfOutputs), stream);
+  auto const size = cudfOutput->num_rows();
+  if (cudfOutput->num_columns() == 0 or size == 0) {
     return nullptr;
   }
-
-  if (cudfOutputs.size() == 1) {
-    // Single result — return directly without concatenation.
-    finished_ =
-        noMoreInput_ && !joinNode_->isRightJoin() && !joinNode_->isFullJoin();
-    auto tbl = std::move(cudfOutputs[0]);
-    return std::make_shared<CudfVector>(
-        pool(), outputType_, tbl->num_rows(), std::move(tbl), stream);
-  }
-
-  // Multiple split results (from OOM probe splitting).
-  // Instead of concatenating (which doubles peak GPU memory), store them
-  // and return one per getOutput() call — analogous to Spark RAPIDS
-  // JoinGatherer batched output pattern.
-  pendingJoinOutputs_ = std::move(cudfOutputs);
-  // Reverse so that pop_back returns results in order.
-  std::reverse(pendingJoinOutputs_.begin(), pendingJoinOutputs_.end());
-
-  auto tbl = std::move(pendingJoinOutputs_.back());
-  pendingJoinOutputs_.pop_back();
-  if (pendingJoinOutputs_.empty()) {
-    finished_ =
-        noMoreInput_ && !joinNode_->isRightJoin() && !joinNode_->isFullJoin();
-  }
   return std::make_shared<CudfVector>(
-      pool(), outputType_, tbl->num_rows(), std::move(tbl), stream);
+      pool(),
+      outputType_,
+      cudfOutput->num_rows(),
+      std::move(cudfOutput),
+      stream);
 }
 
 bool CudfHashJoinProbe::skipProbeOnEmptyBuild() const {
