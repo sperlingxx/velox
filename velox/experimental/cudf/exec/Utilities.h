@@ -24,10 +24,30 @@
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/mr/device_memory_resource.hpp>
 
+#include <cuda_runtime.h>
+
 #include <memory>
 #include <string_view>
 
 namespace facebook::velox::cudf_velox {
+
+/// Synchronize the given CUDA stream and check for any pending CUDA errors.
+/// If an asynchronous CUDA error is detected (e.g. illegal memory access from
+/// a prior kernel), this converts it into a VeloxRuntimeError so that Velox's
+/// error propagation / CPU fallback can handle it instead of letting the error
+/// cascade into a SIGSEGV.
+///
+/// @param stream   The CUDA stream to synchronize.
+/// @param context  Human-readable label for error messages (e.g. operator name).
+void checkCudaOperationError(
+    rmm::cuda_stream_view stream,
+    const char* context);
+
+/// Install a SIGSEGV/SIGABRT signal handler that writes a native backtrace
+/// to stderr before the process terminates.  Safe to call from JNI: the
+/// previous handler is saved and re-invoked after the backtrace is printed.
+/// No-op on second and subsequent calls.
+void installFatalSignalHandler();
 
 /**
  * @brief Creates a memory resource based on the given mode.

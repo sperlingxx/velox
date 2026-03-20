@@ -42,11 +42,105 @@
 #include <common/base/Exceptions.h>
 
 #include <cstdlib>
+#include <csignal>
+#include <cstring>
+#include <execinfo.h>
 #include <limits>
 #include <memory>
 #include <string_view>
+#include <unistd.h>
 
 namespace facebook::velox::cudf_velox {
+
+void checkCudaOperationError(
+    rmm::cuda_stream_view stream,
+    const char* context) {
+  auto peekErr = cudaPeekAtLastError();
+  if (peekErr != cudaSuccess) {
+    auto errStr = cudaGetErrorString(peekErr);
+    cudaGetLastError(); // clear the sticky error
+    VELOX_FAIL(
+        "CUDA error detected before {} : {} (code {}). "
+        "A prior GPU operation produced an asynchronous error.",
+        context,
+        errStr,
+        static_cast<int>(peekErr));
+  }
+  auto syncErr = cudaStreamSynchronize(stream.value());
+  if (syncErr != cudaSuccess) {
+    auto errStr = cudaGetErrorString(syncErr);
+    cudaGetLastError();
+    VELOX_FAIL(
+        "CUDA stream sync error at {} : {} (code {}). "
+        "A GPU kernel launched on this stream failed.",
+        context,
+        errStr,
+        static_cast<int>(syncErr));
+  }
+}
+
+namespace {
+
+struct OldSignalHandlers {
+  struct sigaction oldSigsegv;
+  struct sigaction oldSigabrt;
+  struct sigaction oldSigbus;
+};
+
+static OldSignalHandlers oldHandlers;
+
+void fatalSignalHandler(int sig, siginfo_t* info, void* ucontext) {
+  const char* sigName = "UNKNOWN";
+  if (sig == SIGSEGV) sigName = "SIGSEGV";
+  else if (sig == SIGABRT) sigName = "SIGABRT";
+  else if (sig == SIGBUS) sigName = "SIGBUS";
+
+  char buf[256];
+  int len = snprintf(
+      buf, sizeof(buf),
+      "\n=== Fatal signal %s (%d) in Velox/cuDF native code ===\n"
+      "Fault address: %p\n",
+      sigName, sig, info ? info->si_addr : nullptr);
+  write(STDERR_FILENO, buf, len);
+
+  void* frames[128];
+  int nframes = backtrace(frames, 128);
+  backtrace_symbols_fd(frames, nframes, STDERR_FILENO);
+
+  const char* footer = "=== End fatal signal trace ===\n";
+  write(STDERR_FILENO, footer, strlen(footer));
+
+  // Restore original handler and re-raise so the JVM / default handler runs.
+  struct sigaction* old = nullptr;
+  if (sig == SIGSEGV) old = &oldHandlers.oldSigsegv;
+  else if (sig == SIGABRT) old = &oldHandlers.oldSigabrt;
+  else if (sig == SIGBUS) old = &oldHandlers.oldSigbus;
+
+  if (old) {
+    sigaction(sig, old, nullptr);
+  } else {
+    signal(sig, SIG_DFL);
+  }
+  raise(sig);
+}
+
+} // anonymous namespace
+
+void installFatalSignalHandler() {
+  static bool installed = false;
+  if (installed) return;
+  installed = true;
+
+  struct sigaction sa;
+  memset(&sa, 0, sizeof(sa));
+  sa.sa_sigaction = fatalSignalHandler;
+  sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+  sigemptyset(&sa.sa_mask);
+
+  sigaction(SIGSEGV, &sa, &oldHandlers.oldSigsegv);
+  sigaction(SIGABRT, &sa, &oldHandlers.oldSigabrt);
+  sigaction(SIGBUS, &sa, &oldHandlers.oldSigbus);
+}
 
 namespace {
 /// \brief Makes a cuda resource

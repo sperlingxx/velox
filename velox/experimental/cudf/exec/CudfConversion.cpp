@@ -303,6 +303,9 @@ RowVectorPtr CudfToVelox::getOutput() {
   const auto targetBatchSize = outputBatchRows(averageRowSize());
   auto stream = inputs_.front()->stream();
 
+  facebook::velox::cudf_velox::checkCudaOperationError(
+      stream, "CudfToVelox::getOutput");
+
   // Process single input directly in these cases:
   // 1. In passthrough mode
   // 2. If we only have one input and it's smaller than or equal to the target
