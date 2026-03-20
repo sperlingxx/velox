@@ -259,9 +259,6 @@ void CudfHashJoinBuild::noMoreInput() {
   }
 
   auto stream = cudfGlobalStreamPool().get_stream();
-
-  checkCudaOperationError(stream, "CudfHashJoinBuild::noMoreInput");
-
   auto tbls = getConcatenatedTableBatched(
       inputs_, joinNode_->sources()[1]->outputType(), stream);
   inputs_.clear();
@@ -2168,9 +2165,6 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
   auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input_);
   VELOX_CHECK_NOT_NULL(cudfInput);
   auto stream = cudfInput->stream();
-
-  checkCudaOperationError(stream, "CudfHashJoinProbe::getOutput");
-
   // Use getTableView() to avoid expensive materialization for packed_table.
   // cudfInput is staying alive until the table view is no longer needed.
   auto leftTableView = cudfInput->getTableView();

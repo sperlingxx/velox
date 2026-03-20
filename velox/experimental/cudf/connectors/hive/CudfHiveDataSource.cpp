@@ -1234,7 +1234,7 @@ std::unique_ptr<cudf::table> CudfHiveDataSource::readNextExperimentalBatch(
       LOG(WARNING)
           << "Subfield filter compute_column failed (possibly Jitify): "
           << e.what() << ". Returning unfiltered data for this chunk.";
-      return table;
+      return std::move(table);
     }
   }
   return std::move(tableWithMetadata.tbl);

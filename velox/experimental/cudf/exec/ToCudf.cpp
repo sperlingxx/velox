@@ -331,8 +331,6 @@ void registerCudf() {
     return;
   }
 
-  installFatalSignalHandler();
-
   // Register operator adapters
   registerAllOperatorAdapters();
 

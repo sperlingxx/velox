@@ -1577,8 +1577,6 @@ RowVectorPtr CudfHashAggregation::getOutput() {
 
   auto stream = cudfGlobalStreamPool().get_stream();
 
-  checkCudaOperationError(stream, "CudfHashAggregation::getOutput");
-
   auto tbl = getConcatenatedTable(inputs_, inputType_, stream);
   inputs_.clear();
 
