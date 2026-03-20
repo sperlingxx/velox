@@ -199,6 +199,15 @@ bool isOpAndInputsSupported(
       return false;
     }
   }
+  // cuDF AST expression parser requires all operands to have identical
+  // cudf::data_type (including decimal scale). Reject early if mismatched.
+  if (inputCudfDataTypes.size() >= 2 &&
+      std::adjacent_find(
+          inputCudfDataTypes.cbegin(),
+          inputCudfDataTypes.cend(),
+          std::not_equal_to<>()) != inputCudfDataTypes.cend()) {
+    return false;
+  }
   // check arity
   const auto arity = cudf::ast::detail::ast_operator_arity(op);
   if (arity != static_cast<int>(inputCudfDataTypes.size())) {
@@ -558,6 +567,43 @@ cudf::ast::expression const& AstContext::pushExprToTree(
       if (auto* result = precomputeVarWidthOp()) {
         return *result;
       }
+      // cuDF AST requires identical operand types for binary ops.
+      // If types mismatch, route through FunctionExpression precompute.
+      if (len == 2 && !allowPureAstOnly) {
+        bool mismatch = false;
+        try {
+          auto t0 = veloxToCudfDataType(expr->inputs()[0]->type());
+          auto t1 = veloxToCudfDataType(expr->inputs()[1]->type());
+          mismatch = (t0 != t1);
+        } catch (...) {
+        }
+        if (mismatch) {
+          try {
+            int sideIdx = findExpressionSide(expr);
+            if (sideIdx >= 0) {
+              bool fieldsOk = true;
+              for (const auto* field : expr->distinctFields()) {
+                if (!inputRowSchema[sideIdx].get()->containsChild(
+                        field->field())) {
+                  fieldsOk = false;
+                  break;
+                }
+              }
+              if (fieldsOk) {
+                auto node = createCudfExpression(
+                    expr, inputRowSchema[sideIdx], kAstEvaluatorName);
+                if (node) {
+                  return addPrecomputeInstructionOnSide(
+                      sideIdx, 0, name, "", node);
+                }
+              }
+            }
+          } catch (...) {
+          }
+          VELOX_FAIL(
+              "AST non-matching operand types for binary op '{}'", name);
+        }
+      }
     }
     if (name == "and" or name == "or") {
       return multipleInputsToPairWise(expr);
@@ -580,10 +626,46 @@ cudf::ast::expression const& AstContext::pushExprToTree(
       return *result;
     }
     VELOX_CHECK_EQ(len, 3);
+    // cuDF AST requires matching operand types for gte/lte operations.
+    if (!allowPureAstOnly) {
+      bool mismatch = false;
+      try {
+        auto tVal = veloxToCudfDataType(expr->inputs()[0]->type());
+        auto tLo = veloxToCudfDataType(expr->inputs()[1]->type());
+        auto tHi = veloxToCudfDataType(expr->inputs()[2]->type());
+        mismatch = (tVal != tLo || tVal != tHi);
+      } catch (...) {
+      }
+      if (mismatch) {
+        try {
+          int sideIdx = findExpressionSide(expr);
+          if (sideIdx >= 0) {
+            bool fieldsOk = true;
+            for (const auto* field : expr->distinctFields()) {
+              if (!inputRowSchema[sideIdx].get()->containsChild(
+                      field->field())) {
+                fieldsOk = false;
+                break;
+              }
+            }
+            if (fieldsOk) {
+              auto node = createCudfExpression(
+                  expr, inputRowSchema[sideIdx], kAstEvaluatorName);
+              if (node) {
+                return addPrecomputeInstructionOnSide(
+                    sideIdx, 0, name, "", node);
+              }
+            }
+          }
+        } catch (...) {
+        }
+        VELOX_FAIL(
+            "AST non-matching operand types for between expression");
+      }
+    }
     auto const& value = pushExprToTree(expr->inputs()[0]);
     auto const& lower = pushExprToTree(expr->inputs()[1]);
     auto const& upper = pushExprToTree(expr->inputs()[2]);
-    // construct between(op2, op3) using >= and <=
     auto const& geLower = tree.push(Operation{Op::GREATER_EQUAL, value, lower});
     auto const& leUpper = tree.push(Operation{Op::LESS_EQUAL, value, upper});
     return tree.push(Operation{Op::NULL_LOGICAL_AND, geLower, leUpper});

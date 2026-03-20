@@ -126,8 +126,14 @@ ColumnOrView ASTExpression::eval(
         LOG(WARNING) << "AstExpr: table_schema="
             << cudf::table_schema_to_string(astInputTableView);
       }
-      return cudf::compute_column(
-          astInputTableView, cudfTree_.back(), stream, mr);
+      try {
+        return cudf::compute_column(
+            astInputTableView, cudfTree_.back(), stream, mr);
+      } catch (const std::exception& e) {
+        VELOX_FAIL(
+            "cudf::compute_column failed (possible operand type mismatch): {}",
+            e.what());
+      }
     }
   }();
   if (finalize) {
