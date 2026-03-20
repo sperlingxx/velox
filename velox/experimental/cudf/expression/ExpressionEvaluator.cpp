@@ -2170,26 +2170,12 @@ bool registerBuiltinFunctions(const std::string& prefix) {
           .argumentType("double")
           .build()};
 
-  registerCudfFunctions(
-      {prefix + "greaterthan", prefix + "gt"},
-      [](const std::string&,
-         const std::shared_ptr<velox::exec::Expr>& expr) {
-        return std::make_shared<BinaryFunction>(
-            expr, cudf::binary_operator::GREATER);
-      },
-      cmpSigs);
-
-  registerCudfFunction(
-      prefix + "divide",
-      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
-        return std::make_shared<BinaryFunction>(
-            expr, cudf::binary_operator::DIV);
-      },
-      {FunctionSignatureBuilder()
-           .returnType("double")
-           .argumentType("double")
-           .argumentType("double")
-           .build()});
+  // NOTE: "greaterthan"/"gt" and "divide" are NOT registered here.
+  // They are registered below via registerComparisonOp / registerBinaryOp
+  // which include both double AND decimal signatures.  Registering them
+  // here with only the double signature would shadow the decimal-capable
+  // registration (overwrite=false), breaking decimal comparisons and
+  // decimal division (e.g. TPC-DS Q18 AVG on decimals).
 
   auto intShiftSigs = std::vector<exec::FunctionSignaturePtr>{
       FunctionSignatureBuilder()
