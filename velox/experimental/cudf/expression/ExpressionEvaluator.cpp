@@ -2445,21 +2445,28 @@ bool registerBuiltinFunctions(const std::string& prefix) {
   };
 
   registerComparisonOp(
-      {prefix + "equal", prefix + "eq", prefix + "equalto"},
+      {prefix + "equal", prefix + "eq", prefix + "equalto",
+       prefix + "decimal_equalto"},
       cudf::binary_operator::EQUAL);
   registerComparisonOp(
       {prefix + "notequal", prefix + "neq", prefix + "notequalto"},
       cudf::binary_operator::NOT_EQUAL);
   registerComparisonOp(
-      {prefix + "greaterthanorequal", prefix + "gte"},
+      {prefix + "greaterthanorequal", prefix + "gte",
+       prefix + "decimal_greaterthanorequal"},
       cudf::binary_operator::GREATER_EQUAL);
   registerComparisonOp(
-      {prefix + "lessthanorequal", prefix + "lte"},
+      {prefix + "lessthanorequal", prefix + "lte",
+       prefix + "decimal_lessthanorequal"},
       cudf::binary_operator::LESS_EQUAL);
   registerComparisonOp(
-      {prefix + "greaterthan", prefix + "gt"}, cudf::binary_operator::GREATER);
+      {prefix + "greaterthan", prefix + "gt",
+       prefix + "decimal_greaterthan"},
+      cudf::binary_operator::GREATER);
   registerComparisonOp(
-      {prefix + "lessthan", prefix + "lt"}, cudf::binary_operator::LESS);
+      {prefix + "lessthan", prefix + "lt",
+       prefix + "decimal_lessthan"},
+      cudf::binary_operator::LESS);
 
   //
   // regular unary operators
@@ -2736,8 +2743,19 @@ ColumnOrView FunctionExpression::eval(
           parentType->isRow(),
           "Expected ROW type for struct dereference, got {}",
           parentType->toString());
+      auto& parentView = inputColumnViews[parentIdx];
+      VELOX_CHECK(
+          parentView.type().id() == cudf::type_id::STRUCT,
+          "Struct dereference requires cudf STRUCT column, got type_id {}",
+          static_cast<int>(parentView.type().id()));
       auto childIdx = parentType->asRow().getChildIdx(fieldExpr->name());
-      return inputColumnViews[parentIdx].child(childIdx);
+      VELOX_CHECK_LT(
+          childIdx,
+          parentView.num_children(),
+          "Child index {} out of range for STRUCT column with {} children",
+          childIdx,
+          parentView.num_children());
+      return parentView.child(childIdx);
     }
   }
 

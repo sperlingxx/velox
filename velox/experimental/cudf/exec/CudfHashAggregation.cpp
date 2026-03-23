@@ -218,8 +218,24 @@ struct DecimalSumOrAvgAggregator : cudf_velox::CudfHashAggregation::Aggregator {
         count =
             cudf::cast(*count, cudf::data_type{cudf::type_id::INT64}, stream, cudf::get_current_device_resource_ref());
       }
-      return cudf_velox::serializeDecimalSumState(
-          col->view(), count->view(), stream, cudf::get_current_device_resource_ref());
+      auto const& outputType = asRowType(resultType);
+      auto const cudfSumType =
+          cudf_velox::veloxToCudfDataType(outputType->childAt(0));
+      if (col->type() != cudfSumType) {
+        col = cudf::cast(*col, cudfSumType, stream,
+                         cudf::get_current_device_resource_ref());
+      }
+      auto size = col->size();
+      std::vector<std::unique_ptr<cudf::column>> children;
+      children.push_back(std::move(col));
+      children.push_back(std::move(count));
+      return std::make_unique<cudf::column>(
+          cudf::data_type(cudf::type_id::STRUCT),
+          size,
+          rmm::device_buffer{},
+          rmm::device_buffer{},
+          0,
+          std::move(children));
     }
     if (step == core::AggregationNode::Step::kIntermediate) {
       auto count = std::move(results[countIdx_].results[0]);
@@ -227,8 +243,24 @@ struct DecimalSumOrAvgAggregator : cudf_velox::CudfHashAggregation::Aggregator {
         count =
             cudf::cast(*count, cudf::data_type{cudf::type_id::INT64}, stream, cudf::get_current_device_resource_ref());
       }
-      return cudf_velox::serializeDecimalSumState(
-          col->view(), count->view(), stream, cudf::get_current_device_resource_ref());
+      auto const& outputType = asRowType(resultType);
+      auto const cudfSumType =
+          cudf_velox::veloxToCudfDataType(outputType->childAt(0));
+      if (col->type() != cudfSumType) {
+        col = cudf::cast(*col, cudfSumType, stream,
+                         cudf::get_current_device_resource_ref());
+      }
+      auto size = col->size();
+      std::vector<std::unique_ptr<cudf::column>> children;
+      children.push_back(std::move(col));
+      children.push_back(std::move(count));
+      return std::make_unique<cudf::column>(
+          cudf::data_type(cudf::type_id::STRUCT),
+          size,
+          rmm::device_buffer{},
+          rmm::device_buffer{},
+          0,
+          std::move(children));
     }
     if (isAvg_ && step == core::AggregationNode::Step::kFinal) {
       auto count = std::move(results[countIdx_].results[0]);
@@ -270,8 +302,22 @@ struct DecimalSumOrAvgAggregator : cudf_velox::CudfHashAggregation::Aggregator {
           inputCol, *countAgg, cudf::data_type{cudf::type_id::INT64}, stream, cudf::get_current_device_resource_ref());
       auto sumCol = cudf::make_column_from_scalar(*sumScalar, 1, stream, cudf::get_current_device_resource_ref());
       auto countCol = cudf::make_column_from_scalar(*countScalar, 1, stream, cudf::get_current_device_resource_ref());
-      return cudf_velox::serializeDecimalSumState(
-          sumCol->view(), countCol->view(), stream, cudf::get_current_device_resource_ref());
+      auto const cudfSumType = cudf_velox::veloxToCudfDataType(
+          asRowType(outputType)->childAt(0));
+      if (sumCol->type() != cudfSumType) {
+        sumCol = cudf::cast(*sumCol, cudfSumType, stream,
+                            cudf::get_current_device_resource_ref());
+      }
+      std::vector<std::unique_ptr<cudf::column>> children;
+      children.push_back(std::move(sumCol));
+      children.push_back(std::move(countCol));
+      return std::make_unique<cudf::column>(
+          cudf::data_type(cudf::type_id::STRUCT),
+          1,
+          rmm::device_buffer{},
+          rmm::device_buffer{},
+          0,
+          std::move(children));
     }
     if (step == core::AggregationNode::Step::kIntermediate &&
         inputCol.type().id() == cudf::type_id::STRING) {
@@ -289,8 +335,22 @@ struct DecimalSumOrAvgAggregator : cudf_velox::CudfHashAggregation::Aggregator {
           stream, cudf::get_current_device_resource_ref());
       auto sumCol = cudf::make_column_from_scalar(*sumScalar, 1, stream, cudf::get_current_device_resource_ref());
       auto countCol = cudf::make_column_from_scalar(*countScalar, 1, stream, cudf::get_current_device_resource_ref());
-      return cudf_velox::serializeDecimalSumState(
-          sumCol->view(), countCol->view(), stream, cudf::get_current_device_resource_ref());
+      auto const cudfSumType = cudf_velox::veloxToCudfDataType(
+          asRowType(outputType)->childAt(0));
+      if (sumCol->type() != cudfSumType) {
+        sumCol = cudf::cast(*sumCol, cudfSumType, stream,
+                            cudf::get_current_device_resource_ref());
+      }
+      std::vector<std::unique_ptr<cudf::column>> children;
+      children.push_back(std::move(sumCol));
+      children.push_back(std::move(countCol));
+      return std::make_unique<cudf::column>(
+          cudf::data_type(cudf::type_id::STRUCT),
+          1,
+          rmm::device_buffer{},
+          rmm::device_buffer{},
+          0,
+          std::move(children));
     }
     if (step == core::AggregationNode::Step::kFinal &&
         inputCol.type().id() == cudf::type_id::STRING) {
