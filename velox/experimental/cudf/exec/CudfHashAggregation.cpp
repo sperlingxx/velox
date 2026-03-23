@@ -47,6 +47,7 @@
 namespace {
 
 using namespace facebook::velox;
+using namespace facebook::velox::cudf_velox;
 
 #define DEFINE_SIMPLE_AGGREGATOR(Name, name, KIND)                            \
   struct Name##Aggregator : cudf_velox::CudfHashAggregation::Aggregator {     \

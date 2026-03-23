@@ -100,3 +100,4 @@ endif()
 target_compile_definitions(velox_cudf_exec PRIVATE NANOARROW_NAMESPACE=cudf)
 
 target_compile_options(velox_cudf_exec PRIVATE -Wno-missing-field-initializers)
+target_compile_options(velox_cudf_exec PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>)
