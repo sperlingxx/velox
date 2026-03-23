@@ -57,8 +57,11 @@
 #include <cudf/utilities/pinned_memory.hpp>
 
 #include <cuda.h>
+#include <cuda_runtime.h>
 
+#include <chrono>
 #include <iostream>
+#include <thread>
 
 static const std::string kCudfAdapterName = "cuDF";
 
@@ -341,9 +344,30 @@ void registerCudf() {
   CUDF_FUNC_RANGE();
   cudaFree(nullptr); // Initialize CUDA context at startup
 
+  // GPU memory resource creation can fail if a previous query's process
+  // hasn't fully released GPU memory (e.g. after CUDA OOM crash).
+  // Retry with cudaDeviceReset to clear stale device state.
   const std::string mrMode = CudfConfig::getInstance().memoryResource;
-  auto mr = cudf_velox::createMemoryResource(
-      mrMode, CudfConfig::getInstance().memoryPercent);
+  std::shared_ptr<rmm::mr::device_memory_resource> mr;
+  static constexpr int kMaxInitRetries = 3;
+  for (int attempt = 0;; ++attempt) {
+    try {
+      mr = cudf_velox::createMemoryResource(
+          mrMode, CudfConfig::getInstance().memoryPercent);
+      break;
+    } catch (const std::exception& e) {
+      if (attempt >= kMaxInitRetries) {
+        throw;
+      }
+      LOG(ERROR) << "GPU memory resource init failed (attempt "
+                 << (attempt + 1) << "/" << kMaxInitRetries
+                 << "): " << e.what()
+                 << ". Resetting CUDA device and retrying...";
+      cudaDeviceReset();
+      std::this_thread::sleep_for(std::chrono::seconds(2));
+      cudaFree(nullptr); // Re-initialize context after reset
+    }
+  }
   cudf::set_current_device_resource(mr.get());
   mr_ = mr;
 

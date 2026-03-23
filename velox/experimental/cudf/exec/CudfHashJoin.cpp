@@ -71,6 +71,17 @@ void recoverGpuMemory() {
   cudaGetLastError();
 }
 
+void trimGpuMemoryPool() {
+  cudaMemPool_t pool = nullptr;
+  int device = 0;
+  if (cudaGetDevice(&device) == cudaSuccess &&
+      cudaDeviceGetDefaultMemPool(&pool, device) == cudaSuccess &&
+      pool != nullptr) {
+    cudaMemPoolTrimTo(pool, 0);
+  }
+  cudaGetLastError();
+}
+
 bool isCudaRelatedError(const std::exception& e) {
   if (dynamic_cast<const std::bad_alloc*>(&e) != nullptr) {
     return true;
@@ -296,6 +307,7 @@ void CudfHashJoinBuild::noMoreInput() {
       break;
     } catch (const std::bad_alloc& e) {
       if (attempt >= kOomMaxRetries) {
+        trimGpuMemoryPool();
         throw;
       }
       LOG(WARNING)
@@ -2279,6 +2291,7 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
             break;
           } catch (const std::bad_alloc& e) {
             if (attempt >= kOomMaxRetries) {
+              trimGpuMemoryPool();
               throw;
             }
             LOG(WARNING)
@@ -2414,6 +2427,7 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
           }
         }
         if (!retried) {
+          trimGpuMemoryPool();
           VELOX_FAIL(
               "GPU join error: {} (probe={} rows, planNode={}). "
               "Consider reducing "
