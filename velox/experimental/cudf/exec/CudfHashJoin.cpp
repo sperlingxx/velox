@@ -50,8 +50,10 @@
 #include <cuda_runtime_api.h>
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_uvector.hpp>
+#include <rmm/error.hpp>
 #include <rmm/exec_policy.hpp>
 
+#include <algorithm>
 #include <limits>
 
 #include <nvtx3/nvtx3.hpp>
@@ -59,6 +61,19 @@
 namespace facebook::velox::cudf_velox {
 
 namespace {
+
+bool isCudaRelatedError(const std::exception& e) {
+  if (dynamic_cast<const std::bad_alloc*>(&e) != nullptr) {
+    return true;
+  }
+  if (dynamic_cast<const rmm::cuda_error*>(&e) != nullptr) {
+    return true;
+  }
+  std::string what = e.what();
+  return what.find("cudaError") != std::string::npos ||
+      what.find("CUDA error") != std::string::npos ||
+      what.find("out_of_memory") != std::string::npos;
+}
 
 /// Creates extended table view by appending precomputed columns
 cudf::table_view createExtendedTableView(
@@ -923,6 +938,9 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::innerJoin(
     } catch (const std::bad_alloc&) {
       throw;
     } catch (const std::exception& e) {
+      if (isCudaRelatedError(e)) {
+        throw;
+      }
       VELOX_FAIL(
           "GPU inner_join failed (probe={} rows, build={} rows, "
           "planNode={}): {}",
@@ -1002,6 +1020,9 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::innerJoin(
     } catch (const std::bad_alloc&) {
       throw;
     } catch (const std::exception& e) {
+      if (isCudaRelatedError(e)) {
+        throw;
+      }
       VELOX_FAIL(
           "GPU join gather/filter failed (joinOutput={} rows, "
           "probe={} rows, build={} rows, planNode={}): {}",
@@ -2259,7 +2280,46 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
   static constexpr cudf::size_type kMinSplitRows = 1024;
 
   std::vector<std::unique_ptr<cudf::table>> cudfOutputs;
-  std::vector<cudf::table_view> probeSlices = {leftTableView};
+  std::vector<cudf::table_view> probeSlices;
+
+  // Proactive probe splitting: when GPU memory is under pressure from
+  // concurrent tasks, pre-split large probes to bound peak per-join
+  // allocation and prevent cudaErrorIllegalAddress from memory corruption.
+  if (canSplitProbe && leftTableView.num_rows() > kMinSplitRows) {
+    size_t freeMem = 0, totalMem = 0;
+    if (cudaMemGetInfo(&freeMem, &totalMem) == cudaSuccess && totalMem > 0) {
+      size_t outputRowBytes =
+          std::max(size_t(16), static_cast<size_t>(outputType_->size()) * 8);
+      // Conservative: assume 20x amplification per probe row (joins can be
+      // many-to-many). Each output row costs indices (8B) + data.
+      size_t costPerProbeRow = (8 + outputRowBytes) * 20;
+      // Allow each join call to use at most 25% of free GPU memory.
+      size_t maxAlloc = freeMem / 4;
+      auto maxRows = static_cast<cudf::size_type>(std::min(
+          static_cast<size_t>(leftTableView.num_rows()),
+          std::max(
+              static_cast<size_t>(kMinSplitRows),
+              maxAlloc / std::max(costPerProbeRow, size_t(1)))));
+      if (maxRows < leftTableView.num_rows()) {
+        LOG(INFO) << "Proactive probe split for planNode " << joinNode_->id()
+                  << ": " << leftTableView.num_rows() << " rows -> chunks of "
+                  << maxRows << " (freeMem=" << (freeMem >> 20) << "MB"
+                  << ", totalMem=" << (totalMem >> 20) << "MB)";
+        std::vector<cudf::size_type> splitIndices;
+        for (cudf::size_type i = maxRows; i < leftTableView.num_rows();
+             i += maxRows) {
+          splitIndices.push_back(i);
+        }
+        auto chunks = cudf::split(leftTableView, splitIndices, stream);
+        for (int j = static_cast<int>(chunks.size()) - 1; j >= 0; --j) {
+          probeSlices.push_back(chunks[j]);
+        }
+      }
+    }
+  }
+  if (probeSlices.empty()) {
+    probeSlices.push_back(leftTableView);
+  }
 
   while (!probeSlices.empty()) {
     auto slice = probeSlices.back();
@@ -2270,33 +2330,48 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
       for (auto& r : results) {
         cudfOutputs.push_back(std::move(r));
       }
-    } catch (const std::bad_alloc& e) {
-      // After a CUDA OOM the async memory pool may enter an error state
-      // where ALL subsequent allocations fail (cudaErrorIllegalAddress).
-      // Synchronize the stream and clear the sticky CUDA error so that
-      // the split-and-retry path below has a chance of succeeding.
+    } catch (const std::exception& e) {
+      if (!isCudaRelatedError(e)) {
+        throw;
+      }
+
+      // After a CUDA error the device may be in an unrecoverable state.
+      // Clear the per-thread error so that split (which may run CUDA
+      // kernels for null-count) has a chance of succeeding.
       stream.synchronize_no_throw();
       cudaGetLastError();
 
       if (!canSplitProbe || slice.num_rows() <= kMinSplitRows) {
         VELOX_FAIL(
-            "GPU join OOM: failed to allocate memory for {} "
-            "(probe={} rows, planNode={}). "
-            "Consider increasing spark.sql.shuffle.partitions "
-            "to reduce per-partition join size: {}",
+            "GPU join error: {} (probe={} rows, planNode={}). "
+            "Consider reducing "
+            "spark.gluten.sql.columnar.backend.velox.cudf.concurrentGpuTasks "
+            "or increasing spark.sql.shuffle.partitions: {}",
             joinNode_->joinType(),
             slice.num_rows(),
             joinNode_->id(),
             e.what());
       }
+
       LOG(WARNING)
-          << "GPU join OOM with " << slice.num_rows()
+          << "GPU join CUDA error with " << slice.num_rows()
           << " probe rows for planNode " << joinNode_->id()
+          << ": " << e.what()
           << ". Splitting probe in half and retrying.";
-      auto half = static_cast<cudf::size_type>(slice.num_rows() / 2);
-      auto splits = cudf::split(slice, {half}, stream);
-      probeSlices.push_back(splits[1]);
-      probeSlices.push_back(splits[0]);
+
+      try {
+        auto half = static_cast<cudf::size_type>(slice.num_rows() / 2);
+        auto splits = cudf::split(slice, {half}, stream);
+        probeSlices.push_back(splits[1]);
+        probeSlices.push_back(splits[0]);
+      } catch (const std::exception& splitErr) {
+        VELOX_FAIL(
+            "GPU join error (device likely corrupted, split also failed): "
+            "original: {}. split: {}. planNode={}",
+            e.what(),
+            splitErr.what(),
+            joinNode_->id());
+      }
     }
   }
 
