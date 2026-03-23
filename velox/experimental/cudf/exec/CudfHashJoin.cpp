@@ -54,13 +54,22 @@
 #include <rmm/exec_policy.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <limits>
+#include <thread>
 
 #include <nvtx3/nvtx3.hpp>
 
 namespace facebook::velox::cudf_velox {
 
 namespace {
+
+static constexpr int kOomMaxRetries = 3;
+
+void recoverGpuMemory() {
+  cudaDeviceSynchronize();
+  cudaGetLastError();
+}
 
 bool isCudaRelatedError(const std::exception& e) {
   if (dynamic_cast<const std::bad_alloc*>(&e) != nullptr) {
@@ -275,8 +284,29 @@ void CudfHashJoinBuild::noMoreInput() {
   }
 
   auto stream = cudfGlobalStreamPool().get_stream();
-  auto tbls = getConcatenatedTableBatched(
-      inputs_, joinNode_->sources()[1]->outputType(), stream);
+
+  // OOM retry for build-side concatenation: when many tasks share a GPU,
+  // deferred frees may not have completed. cudaDeviceSynchronize forces
+  // all pending frees, making memory available for this allocation.
+  std::vector<std::unique_ptr<cudf::table>> tbls;
+  for (int attempt = 0;; ++attempt) {
+    try {
+      tbls = getConcatenatedTableBatched(
+          inputs_, joinNode_->sources()[1]->outputType(), stream);
+      break;
+    } catch (const std::bad_alloc& e) {
+      if (attempt >= kOomMaxRetries) {
+        throw;
+      }
+      LOG(WARNING)
+          << "CudfHashJoinBuild OOM during concatenation for planNode "
+          << planNodeId() << " (attempt " << (attempt + 1)
+          << "): " << e.what() << ". Recovering GPU memory and retrying.";
+      recoverGpuMemory();
+      std::this_thread::sleep_for(
+          std::chrono::milliseconds(100 * (1 << attempt)));
+    }
+  }
   inputs_.clear();
 
   for (auto const& tbl : tbls) {
@@ -326,14 +356,34 @@ void CudfHashJoinBuild::noMoreInput() {
       (joinNode_->isInnerJoin() || joinNode_->isLeftJoin() ||
        joinNode_->isRightJoin() || joinNode_->isFullJoin());
 
+  // OOM retry for hash table construction.
   std::vector<std::shared_ptr<cudf::hash_join>> hashObjects;
   for (auto i = 0; i < tbls.size(); i++) {
-    hashObjects.push_back(
-        (buildHashJoin) ? std::make_shared<cudf::hash_join>(
-                              tbls[i]->view().select(buildKeyIndices),
-                              cudf::null_equality::UNEQUAL,
-                              stream)
-                        : nullptr);
+    std::shared_ptr<cudf::hash_join> hj;
+    if (buildHashJoin) {
+      for (int attempt = 0;; ++attempt) {
+        try {
+          hj = std::make_shared<cudf::hash_join>(
+              tbls[i]->view().select(buildKeyIndices),
+              cudf::null_equality::UNEQUAL,
+              stream);
+          break;
+        } catch (const std::bad_alloc& e) {
+          if (attempt >= kOomMaxRetries) {
+            throw;
+          }
+          LOG(WARNING)
+              << "CudfHashJoinBuild OOM building hash table for planNode "
+              << planNodeId() << " batch " << i << " (attempt "
+              << (attempt + 1) << "): " << e.what()
+              << ". Recovering GPU memory and retrying.";
+          recoverGpuMemory();
+          std::this_thread::sleep_for(
+              std::chrono::milliseconds(100 * (1 << attempt)));
+        }
+      }
+    }
+    hashObjects.push_back(std::move(hj));
     if (buildHashJoin) {
       VELOX_CHECK_NOT_NULL(hashObjects.back());
     }
@@ -2335,22 +2385,50 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
         throw;
       }
 
-      // After a CUDA error the device may be in an unrecoverable state.
-      // Clear the per-thread error so that split (which may run CUDA
-      // kernels for null-count) has a chance of succeeding.
-      stream.synchronize_no_throw();
-      cudaGetLastError();
+      // Force all pending GPU frees across all streams to complete.
+      // With many concurrent tasks, cudaFreeAsync defers actual deallocation;
+      // cudaDeviceSynchronize forces those frees, recovering memory.
+      recoverGpuMemory();
 
+      // If we can't split further, retry with backoff (other tasks may
+      // complete and free memory during the wait).
       if (!canSplitProbe || slice.num_rows() <= kMinSplitRows) {
-        VELOX_FAIL(
-            "GPU join error: {} (probe={} rows, planNode={}). "
-            "Consider reducing "
-            "spark.gluten.sql.columnar.backend.velox.cudf.concurrentGpuTasks "
-            "or increasing spark.sql.shuffle.partitions: {}",
-            joinNode_->joinType(),
-            slice.num_rows(),
-            joinNode_->id(),
-            e.what());
+        bool retried = false;
+        for (int attempt = 0; attempt < kOomMaxRetries; ++attempt) {
+          LOG(WARNING)
+              << "GPU join OOM with " << slice.num_rows()
+              << " probe rows for planNode " << joinNode_->id()
+              << " (retry " << (attempt + 1) << "/" << kOomMaxRetries
+              << "): " << e.what();
+          std::this_thread::sleep_for(
+              std::chrono::milliseconds(100 * (1 << attempt)));
+          recoverGpuMemory();
+          try {
+            auto results = executeJoin(slice);
+            for (auto& r : results) {
+              cudfOutputs.push_back(std::move(r));
+            }
+            retried = true;
+            break;
+          } catch (const std::exception& retryErr) {
+            if (!isCudaRelatedError(retryErr)) {
+              throw;
+            }
+            recoverGpuMemory();
+          }
+        }
+        if (!retried) {
+          VELOX_FAIL(
+              "GPU join error: {} (probe={} rows, planNode={}). "
+              "Consider reducing "
+              "spark.gluten.sql.columnar.backend.velox.cudf.concurrentGpuTasks "
+              "or increasing spark.sql.shuffle.partitions: {}",
+              joinNode_->joinType(),
+              slice.num_rows(),
+              joinNode_->id(),
+              e.what());
+        }
+        continue;
       }
 
       LOG(WARNING)
