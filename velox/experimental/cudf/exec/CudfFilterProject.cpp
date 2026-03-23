@@ -286,19 +286,43 @@ RowVectorPtr CudfFilterProject::getOutput() {
   auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input_);
   VELOX_CHECK_NOT_NULL(cudfInput);
   auto stream = cudfInput->stream();
-  auto inputTableColumns = cudfInput->release()->release();
 
-  if (hasFilter_) {
-    filter(inputTableColumns, stream);
-    if (!inputTableColumns.empty() && inputTableColumns[0]->size() == 0) {
-      input_.reset();
-      if (!accumulatedOutputs_.empty() && noMoreInput_) {
-        return flushAccumulatedOutputs();
-      }
-      return nullptr;
-    }
+  std::vector<std::unique_ptr<cudf::column>> inputTableColumns;
+  try {
+    inputTableColumns = cudfInput->release()->release();
+  } catch (const std::bad_alloc& e) {
+    input_.reset();
+    VELOX_FAIL(
+        "CudfFilterProject[{}]: GPU OOM releasing input columns: {}",
+        planNodeId(),
+        e.what());
   }
-  auto outputColumns = project(inputTableColumns, stream);
+
+  try {
+    if (hasFilter_) {
+      filter(inputTableColumns, stream);
+      if (!inputTableColumns.empty() && inputTableColumns[0]->size() == 0) {
+        input_.reset();
+        if (!accumulatedOutputs_.empty() && noMoreInput_) {
+          return flushAccumulatedOutputs();
+        }
+        return nullptr;
+      }
+    }
+  } catch (const std::bad_alloc& e) {
+    input_.reset();
+    VELOX_FAIL(
+        "CudfFilterProject[{}]: GPU OOM in filter: {}", planNodeId(), e.what());
+  }
+
+  std::vector<std::unique_ptr<cudf::column>> outputColumns;
+  try {
+    outputColumns = project(inputTableColumns, stream);
+  } catch (const std::bad_alloc& e) {
+    input_.reset();
+    VELOX_FAIL(
+        "CudfFilterProject[{}]: GPU OOM in project: {}", planNodeId(), e.what());
+  }
 
   // Validate all output columns have consistent row counts.
   // A mismatch indicates a project evaluator returned a column with the

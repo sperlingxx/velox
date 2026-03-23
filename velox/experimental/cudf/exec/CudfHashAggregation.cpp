@@ -1415,6 +1415,10 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
     std::vector<column_index_t> const& groupByKeys,
     std::vector<std::unique_ptr<Aggregator>>& aggregators,
     rmm::cuda_stream_view stream) {
+  if (tableView.num_rows() == 0) {
+    return nullptr;
+  }
+
   auto groupbyKeyView =
       tableView.select(groupByKeys.begin(), groupByKeys.end());
 
@@ -1575,9 +1579,27 @@ RowVectorPtr CudfHashAggregation::getOutput() {
     return nullptr;
   }
 
+  if (inputs_.empty() && noMoreInput_) {
+    finished_ = true;
+    if (isGlobal_) {
+      auto stream = cudfGlobalStreamPool().get_stream();
+      auto tbl = getConcatenatedTable(inputs_, inputType_, stream);
+      return doGlobalAggregation(tbl->view(), stream);
+    }
+    return nullptr;
+  }
+
   auto stream = cudfGlobalStreamPool().get_stream();
 
-  auto tbl = getConcatenatedTable(inputs_, inputType_, stream);
+  std::unique_ptr<cudf::table> tbl;
+  try {
+    tbl = getConcatenatedTable(inputs_, inputType_, stream);
+  } catch (const std::bad_alloc& e) {
+    VELOX_FAIL(
+        "CudfHashAggregation[{}]: GPU OOM concatenating inputs: {}",
+        planNodeId(),
+        e.what());
+  }
   inputs_.clear();
 
   if (noMoreInput_) {
@@ -1586,15 +1608,24 @@ RowVectorPtr CudfHashAggregation::getOutput() {
 
   VELOX_CHECK_NOT_NULL(tbl);
 
-  // Use tbl->view() instead of moving the table.
-  // tbl stays alive until the end of this function, keeping the view valid.
-  if (isDistinct_) {
-    return getDistinctKeys(tbl->view(), groupingKeyInputChannels_, stream);
-  } else if (isGlobal_) {
-    return doGlobalAggregation(tbl->view(), stream);
-  } else {
-    return doGroupByAggregation(
-        tbl->view(), groupingKeyInputChannels_, aggregators_, stream);
+  if (tbl->num_rows() == 0 && !isGlobal_) {
+    return nullptr;
+  }
+
+  try {
+    if (isDistinct_) {
+      return getDistinctKeys(tbl->view(), groupingKeyInputChannels_, stream);
+    } else if (isGlobal_) {
+      return doGlobalAggregation(tbl->view(), stream);
+    } else {
+      return doGroupByAggregation(
+          tbl->view(), groupingKeyInputChannels_, aggregators_, stream);
+    }
+  } catch (const std::bad_alloc& e) {
+    VELOX_FAIL(
+        "CudfHashAggregation[{}]: GPU OOM in aggregation: {}",
+        planNodeId(),
+        e.what());
   }
 }
 

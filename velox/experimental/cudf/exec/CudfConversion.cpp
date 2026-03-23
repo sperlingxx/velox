@@ -34,7 +34,28 @@
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/default_stream.hpp>
 
+#include <cuda_runtime.h>
+#include <thread>
+
 namespace {
+
+static constexpr int kOomMaxRetries = 3;
+
+void recoverGpuMemory() {
+  cudaDeviceSynchronize();
+  cudaGetLastError();
+}
+
+void trimGpuMemoryPool() {
+  cudaMemPool_t pool = nullptr;
+  int device = 0;
+  if (cudaGetDevice(&device) == cudaSuccess &&
+      cudaDeviceGetDefaultMemPool(&pool, device) == cudaSuccess &&
+      pool != nullptr) {
+    cudaMemPoolTrimTo(pool, 0);
+  }
+  cudaGetLastError();
+}
 
 // cuDF has no VARBINARY type — all string-like columns come back as VARCHAR.
 // kindEquals(VARCHAR, VARBINARY) returns false, so setType() crashes even
@@ -226,10 +247,54 @@ RowVectorPtr CudfFromVelox::getOutput() {
         stream);
   }
 
-  // Batched HtoD: issues N async from_arrow calls, ONE sync, then GPU concat.
-  // Avoids the CPU-side mergeRowVectors copy and N separate sync round-trips.
-  auto tbl =
-      with_arrow::toCudfTableBatched(selectedInputs, selectedInputs[0]->pool(), stream);
+  // Batched HtoD with OOM resilience: if GPU memory is exhausted, reduce the
+  // batch size and put excess inputs back for the next getOutput() call.
+  // This prevents std::bad_alloc from crashing the process (SIGABRT) when
+  // multiple concurrent tasks saturate GPU memory (e.g. Q18 Stage 35).
+  std::unique_ptr<cudf::table> tbl;
+  for (int attempt = 0;; ++attempt) {
+    try {
+      tbl = with_arrow::toCudfTableBatched(
+          selectedInputs, selectedInputs[0]->pool(), stream);
+      break;
+    } catch (const std::bad_alloc& e) {
+      if (selectedInputs.size() > 1) {
+        // Reduce batch: put the second half back into inputs_ for next call.
+        auto half = selectedInputs.size() / 2;
+        LOG(WARNING) << "CudfFromVelox[" << planNodeId() << "]: GPU OOM "
+                     << "with " << selectedInputs.size() << " batches, "
+                     << "reducing to " << half << " (attempt "
+                     << (attempt + 1) << ")";
+        for (size_t i = selectedInputs.size(); i > half; --i) {
+          auto& v = selectedInputs[i - 1];
+          currentOutputSize_ += v->size();
+          currentOutputBytes_ += v->estimateFlatSize();
+          inputs_.insert(inputs_.begin(), std::move(v));
+        }
+        selectedInputs.resize(half);
+        recoverGpuMemory();
+        continue;
+      }
+      if (attempt >= kOomMaxRetries) {
+        trimGpuMemoryPool();
+        VELOX_FAIL(
+            "CudfFromVelox[{}]: GPU OOM after {} retries with a single "
+            "batch ({} rows, {} bytes): {}",
+            planNodeId(),
+            kOomMaxRetries,
+            selectedInputs[0]->size(),
+            selectedInputs[0]->estimateFlatSize(),
+            e.what());
+      }
+      LOG(WARNING) << "CudfFromVelox[" << planNodeId() << "]: GPU OOM "
+                   << "with single batch (" << selectedInputs[0]->size()
+                   << " rows), retrying (attempt " << (attempt + 1)
+                   << "/" << kOomMaxRetries << ")";
+      recoverGpuMemory();
+      std::this_thread::sleep_for(
+          std::chrono::milliseconds(100 * (1 << attempt)));
+    }
+  }
 
   VELOX_CHECK_NOT_NULL(tbl);
 

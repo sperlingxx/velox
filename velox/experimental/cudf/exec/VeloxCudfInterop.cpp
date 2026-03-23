@@ -278,6 +278,15 @@ struct AsyncHtoD {
     o.arrowSchema.release = nullptr;
   }
 
+  // Prevent double-exception crash: if bad_alloc is in flight and a
+  // destructor here throws (e.g. CUDA error freeing device memory),
+  // std::terminate would be called.  Swallow secondary exceptions.
+  ~AsyncHtoD() noexcept {
+    try { releaseArrow(); } catch (...) {}
+    try { pinnedBufs.clear(); } catch (...) {}
+    try { table.reset(); } catch (...) {}
+  }
+
   void releaseArrow() {
     pinnedBufs.clear();
     if (arrowArray.release) {
