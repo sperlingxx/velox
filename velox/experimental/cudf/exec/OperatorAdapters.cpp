@@ -182,10 +182,12 @@ class FilterProjectAdapter : public OperatorAdapter {
     auto filterNode = filterProjectOp->filterNode();
 
     if (projectPlanNode) {
-      if (projectPlanNode->sources()[0]->outputType()->size() == 0 ||
-          projectPlanNode->outputType()->size() == 0) {
+      if (projectPlanNode->sources()[0]->outputType()->size() == 0) {
         return false;
       }
+      // outputType()->size() == 0 is allowed: empty-expression Project that
+      // drops all columns (e.g., before count_partial(1)). Handled as a
+      // no-op passthrough in CudfFilterProject::getOutput().
     }
 
     // Check filter separately

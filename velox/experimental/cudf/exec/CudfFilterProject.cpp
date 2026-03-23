@@ -287,6 +287,21 @@ RowVectorPtr CudfFilterProject::getOutput() {
   VELOX_CHECK_NOT_NULL(cudfInput);
   auto stream = cudfInput->stream();
 
+  if (outputType_->size() == 0) {
+    auto rowCount = static_cast<vector_size_t>(cudfInput->size());
+    auto pool = input_->pool();
+    input_.reset();
+    if (rowCount == 0) {
+      return nullptr;
+    }
+    return std::make_shared<CudfVector>(
+        pool,
+        outputType_,
+        rowCount,
+        std::make_unique<cudf::table>(),
+        stream);
+  }
+
   std::vector<std::unique_ptr<cudf::column>> inputTableColumns;
   try {
     inputTableColumns = cudfInput->release()->release();
