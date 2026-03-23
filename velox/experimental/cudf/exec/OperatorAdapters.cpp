@@ -54,6 +54,32 @@ namespace facebook::velox::cudf_velox {
 
 namespace {
 
+// Returns true if the Velox type is a complex/nested type that cudf's
+// type_dispatcher cannot handle in expression evaluation (e.g. STRUCT
+// columns produced by partial AVG aggregation).
+bool hasUnsupportedComplexType(const TypePtr& type) {
+  switch (type->kind()) {
+    case TypeKind::ROW:
+    case TypeKind::ARRAY:
+    case TypeKind::MAP:
+    case TypeKind::UNKNOWN:
+      return true;
+    default:
+      return false;
+  }
+}
+
+// Returns true if any column in the row type is a complex type unsupported
+// by cudf expression evaluation.
+bool hasUnsupportedColumnTypes(const RowTypePtr& rowType) {
+  for (auto i = 0; i < rowType->size(); ++i) {
+    if (hasUnsupportedComplexType(rowType->childAt(i))) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // Recursively check that all FieldAccessTypedExpr references in the
 // expression tree can be found in the given inputType.  Returns false
 // if any top-level field reference is missing from inputType.
@@ -184,6 +210,17 @@ class FilterProjectAdapter : public OperatorAdapter {
           projectPlanNode->outputType()->size() == 0) {
         return false;
       }
+      // cudf's type_dispatcher cannot handle complex types (ROW/STRUCT,
+      // ARRAY/LIST, MAP) in expression evaluation.  Partial aggregation
+      // for AVG produces STRUCT columns; if those flow into this operator,
+      // the expression engine will throw "Invalid type_id".
+      const auto& inputType = projectPlanNode->sources()[0]->outputType();
+      if (hasUnsupportedColumnTypes(inputType)) {
+        LOG(WARNING)
+            << "CudfFilterProject: input contains complex column types "
+            << "(ROW/ARRAY/MAP), falling back to CPU";
+        return false;
+      }
     }
 
     // Check filter separately
@@ -212,6 +249,12 @@ class FilterProjectAdapter : public OperatorAdapter {
     }
     if (filterNode) {
       const auto& inputType = filterNode->sources()[0]->outputType();
+      if (hasUnsupportedColumnTypes(inputType)) {
+        LOG(WARNING)
+            << "CudfFilterProject: filter input contains complex column "
+            << "types (ROW/ARRAY/MAP), falling back to CPU";
+        return false;
+      }
       if (!allFieldsResolvable(filterNode->filter(), inputType)) {
         LOG(WARNING)
             << "CudfFilterProject: unresolvable field reference in filter, "
