@@ -2329,6 +2329,21 @@ bool registerBuiltinFunctions(const std::string& prefix) {
              .returnType("boolean")
              .argumentType("decimal(a_precision, a_scale)")
              .argumentType("decimal(b_precision, b_scale)")
+             .build(),
+         FunctionSignatureBuilder()
+             .returnType("boolean")
+             .argumentType("varchar")
+             .argumentType("varchar")
+             .build(),
+         FunctionSignatureBuilder()
+             .returnType("boolean")
+             .argumentType("date")
+             .argumentType("date")
+             .build(),
+         FunctionSignatureBuilder()
+             .returnType("boolean")
+             .argumentType("boolean")
+             .argumentType("boolean")
              .build()});
   };
 
