@@ -611,6 +611,28 @@ cudf::ast::expression const& AstContext::pushExprToTree(
     VELOX_CHECK_EQ(len, 2);
     auto const& op1 = pushExprToTree(expr->inputs()[0]);
     auto const& op2 = pushExprToTree(expr->inputs()[1]);
+    // cuDF AST uses C++ arithmetic rules: INT8/INT16 operands are
+    // promoted to INT32 by the hardware. When the promoted intermediate
+    // is later used in a parent binary op alongside a non-promoted
+    // operand, cuDF rejects the type mismatch. Widen narrow integer
+    // operands to INT64 so all intermediates have consistent types.
+    auto k0 = expr->inputs()[0]->type()->kind();
+    auto k1 = expr->inputs()[1]->type()->kind();
+    bool hasNarrow =
+        k0 == TypeKind::TINYINT || k0 == TypeKind::SMALLINT ||
+        k1 == TypeKind::TINYINT || k1 == TypeKind::SMALLINT;
+    if (hasNarrow) {
+      auto widen = [&](auto const& op, TypeKind k)
+          -> cudf::ast::expression const& {
+        if (k == TypeKind::TINYINT || k == TypeKind::SMALLINT ||
+            k == TypeKind::INTEGER) {
+          return tree.push(Operation{Op::CAST_TO_INT64, op});
+        }
+        return op;
+      };
+      return tree.push(Operation{
+          binaryOps.at(name), widen(op1, k0), widen(op2, k1)});
+    }
     return tree.push(Operation{binaryOps.at(name), op1, op2});
   } else if (unaryOps.find(name) != unaryOps.end()) {
     VELOX_CHECK_EQ(len, 1);

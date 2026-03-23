@@ -29,6 +29,7 @@ add_library(
   CudfShufflePartition.cpp
   CudfTopN.cpp
   CudfTopNRowNumber.cpp
+  CudfWindow.cpp
   DebugUtil.cpp
   OperatorAdapters.cpp
   PinnedArrowInterop.cpp
