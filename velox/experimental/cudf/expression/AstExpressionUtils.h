@@ -199,6 +199,14 @@ bool isOpAndInputsSupported(
       return false;
     }
   }
+  // cudf's AST decimal DIV uses result_scale = lhs_scale - rhs_scale, which
+  // gives scale 0 (integer division) when both operands share the same scale.
+  // The FunctionExpression path has a custom decimalDivide kernel with proper
+  // rescaling that preserves fractional precision.
+  if (op == cudf::ast::ast_operator::DIV && !inputCudfDataTypes.empty() &&
+      cudf::is_fixed_point(inputCudfDataTypes[0])) {
+    return false;
+  }
   // cuDF AST expression parser requires all operands to have identical
   // cudf::data_type (including decimal scale). Reject early if mismatched.
   if (inputCudfDataTypes.size() >= 2 &&
