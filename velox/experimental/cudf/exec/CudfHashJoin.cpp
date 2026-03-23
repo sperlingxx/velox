@@ -349,53 +349,13 @@ void CudfHashJoinBuild::noMoreInput() {
     lockedStats->numNullKeys += totalNullKeyRows;
   }
 
-  // Only need to construct hash_join object if it's an inner join, left join,
-  // right join, or full join.
-  // All other cases use a standalone function in cudf
-  bool buildHashJoin =
-      (joinNode_->isInnerJoin() || joinNode_->isLeftJoin() ||
-       joinNode_->isRightJoin() || joinNode_->isFullJoin());
-
-  // OOM retry for hash table construction.
-  std::vector<std::shared_ptr<cudf::hash_join>> hashObjects;
-  for (auto i = 0; i < tbls.size(); i++) {
-    std::shared_ptr<cudf::hash_join> hj;
-    if (buildHashJoin) {
-      for (int attempt = 0;; ++attempt) {
-        try {
-          hj = std::make_shared<cudf::hash_join>(
-              tbls[i]->view().select(buildKeyIndices),
-              cudf::null_equality::UNEQUAL,
-              stream);
-          break;
-        } catch (const std::bad_alloc& e) {
-          if (attempt >= kOomMaxRetries) {
-            throw;
-          }
-          LOG(WARNING)
-              << "CudfHashJoinBuild OOM building hash table for planNode "
-              << planNodeId() << " batch " << i << " (attempt "
-              << (attempt + 1) << "): " << e.what()
-              << ". Recovering GPU memory and retrying.";
-          recoverGpuMemory();
-          std::this_thread::sleep_for(
-              std::chrono::milliseconds(100 * (1 << attempt)));
-        }
-      }
-    }
-    hashObjects.push_back(std::move(hj));
-    if (buildHashJoin) {
-      VELOX_CHECK_NOT_NULL(hashObjects.back());
-    }
-    if (CudfConfig::getInstance().debugEnabled) {
-      if (hashObjects.back() != nullptr) {
-        VLOG(2) << "hashObject " << i << " is not nullptr "
-                << hashObjects.back().get() << "\n";
-      } else {
-        VLOG(2) << "hashObject " << i << " is *** nullptr\n";
-      }
-    }
-  }
+  // Hash table construction is deferred to the probe side (getOutput).
+  // With N concurrent tasks, building hash tables here causes all N sets
+  // to persist in GPU memory simultaneously (GpuGuard only limits
+  // concurrent execution, not memory residency). Deferring to probe
+  // ensures at most GpuGuard-max hash table sets exist at any time.
+  std::vector<std::shared_ptr<cudf::hash_join>> hashObjects(
+      tbls.size(), nullptr);
 
   std::vector<std::shared_ptr<cudf::table>> shared_tbls;
   for (auto& tbl : tbls) {
@@ -2299,6 +2259,42 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
     }
   }
 
+  // Build hash tables on-demand (transient). Construction is deferred from
+  // the build phase to here so that at most GpuGuard-max hash table sets
+  // exist at any instant, rather than one per Spark task.
+  bool const needHashJoin =
+      joinNode_->isInnerJoin() || joinNode_->isLeftJoin() ||
+      joinNode_->isRightJoin() || joinNode_->isFullJoin();
+  if (needHashJoin) {
+    auto& rightTables = hashObject_.value().first;
+    auto& hbs = hashObject_.value().second;
+    for (size_t i = 0; i < rightTables.size(); ++i) {
+      if (!hbs[i]) {
+        for (int attempt = 0;; ++attempt) {
+          try {
+            hbs[i] = std::make_shared<cudf::hash_join>(
+                rightTables[i]->view().select(rightKeyIndices_),
+                cudf::null_equality::UNEQUAL,
+                stream);
+            break;
+          } catch (const std::bad_alloc& e) {
+            if (attempt >= kOomMaxRetries) {
+              throw;
+            }
+            LOG(WARNING)
+                << "CudfHashJoinProbe OOM building hash table for planNode "
+                << joinNode_->id() << " batch " << i << " (attempt "
+                << (attempt + 1) << "): " << e.what()
+                << ". Recovering GPU memory and retrying.";
+            recoverGpuMemory();
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(100 * (1 << attempt)));
+          }
+        }
+      }
+    }
+  }
+
   auto executeJoin = [&](cudf::table_view probeView)
       -> std::vector<std::unique_ptr<cudf::table>> {
     switch (joinNode_->joinType()) {
@@ -2450,6 +2446,15 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
             splitErr.what(),
             joinNode_->id());
       }
+    }
+  }
+
+  // Release transient hash tables immediately after probing to free GPU
+  // memory for other tasks. They'll be rebuilt on the next getOutput() call.
+  if (needHashJoin) {
+    auto& hbs = hashObject_.value().second;
+    for (auto& hb : hbs) {
+      hb.reset();
     }
   }
 
