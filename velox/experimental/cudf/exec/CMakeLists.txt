@@ -14,6 +14,7 @@
 
 add_library(
   velox_cudf_exec
+  BloomFilterKernels.cu
   CudfAssignUniqueId.cpp
   CudfConversion.cpp
   CudfExpand.cpp

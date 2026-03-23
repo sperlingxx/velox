@@ -13,6 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "velox/experimental/cudf/exec/BloomFilterKernels.h"
 #include "velox/experimental/cudf/exec/Validation.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/expression/AstUtils.h"
@@ -1072,14 +1073,48 @@ class InFunction : public CudfFunction {
 };
 
 // Bloom filter probe: might_contain(bloom_filter, value).
-// Bloom filter is a probabilistic data structure used by Spark for runtime
-// filtering. Returning all-true is always correct (false positives allowed).
-// TODO: implement actual GPU bloom filter probe for better performance.
+// If the bloom filter is in Spark format (from GPU bloom_filter_agg), performs
+// real GPU probe using spark-rapids-jni-compatible MurmurHash3 kernels.
+// Falls back to all-true if the bloom filter is unavailable or in Velox CPU
+// format (different hash function — false positives are always safe).
 class MightContainFunction : public CudfFunction {
  public:
   MightContainFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
     VELOX_CHECK_GE(
         expr->inputs().size(), 2, "might_contain expects at least 2 inputs");
+
+    // Try to extract bloom filter bytes from the constant (literal) input.
+    for (const auto& input : expr->inputs()) {
+      if (!input->isConstant()) {
+        continue;
+      }
+      auto* constExpr =
+          dynamic_cast<const velox::exec::ConstantExpr*>(input.get());
+      if (!constExpr) {
+        continue;
+      }
+      auto vec = constExpr->value();
+      if (!vec || vec->size() == 0 || vec->isNullAt(0)) {
+        continue;
+      }
+      if (vec->typeKind() != TypeKind::VARBINARY &&
+          vec->typeKind() != TypeKind::VARCHAR) {
+        continue;
+      }
+      auto flatVec = vec->as<SimpleVector<StringView>>();
+      if (!flatVec) {
+        continue;
+      }
+      auto sv = flatVec->valueAt(0);
+      if (sv.size() < static_cast<size_t>(kSparkBloomFilterHeaderSize)) {
+        continue;
+      }
+      // Detect Spark format: big-endian int32 version=1 → first byte is 0x00
+      if (static_cast<uint8_t>(sv.data()[0]) == kSparkBloomFormatMarker) {
+        bloomFilterBytes_.assign(sv.data(), sv.data() + sv.size());
+      }
+      break;
+    }
   }
 
   ColumnOrView eval(
@@ -1089,9 +1124,43 @@ class MightContainFunction : public CudfFunction {
     VELOX_CHECK_GE(
         inputColumns.size(), 1, "might_contain needs at least 1 input column");
     auto probeCol = asView(inputColumns.back());
+
+    if (!bloomFilterBytes_.empty()) {
+      return doGpuProbe(probeCol, stream, mr);
+    }
+
+    // Fallback: all-true (safe — bloom filters allow false positives)
     auto trueScalar = cudf::numeric_scalar<bool>(true, true, stream, mr);
-    return cudf::make_column_from_scalar(trueScalar, probeCol.size(), stream, mr);
+    return cudf::make_column_from_scalar(
+        trueScalar, probeCol.size(), stream, mr);
   }
+
+ private:
+  ColumnOrView doGpuProbe(
+      cudf::column_view const& probeCol,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const {
+    // Lazy-initialize GPU bloom filter buffer on first call.
+    if (!gpuBloomFilter_) {
+      gpuBloomFilter_ = std::make_unique<rmm::device_buffer>(
+          bloomFilterBytes_.size(), stream, mr);
+      CUDF_CUDA_TRY(cudaMemcpyAsync(
+          gpuBloomFilter_->data(),
+          bloomFilterBytes_.data(),
+          bloomFilterBytes_.size(),
+          cudaMemcpyHostToDevice,
+          stream.value()));
+      stream.synchronize();
+    }
+
+    cudf::device_span<uint8_t const> bloomSpan{
+        static_cast<uint8_t const*>(gpuBloomFilter_->data()),
+        gpuBloomFilter_->size()};
+    return bloomFilterProbe(probeCol, bloomSpan, stream, mr);
+  }
+
+  std::vector<char> bloomFilterBytes_;
+  mutable std::unique_ptr<rmm::device_buffer> gpuBloomFilter_;
 };
 
 class IsNullFunction : public CudfFunction {

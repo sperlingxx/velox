@@ -18,6 +18,7 @@
 #include "velox/experimental/cudf/exec/CudfFilterProject.h"
 #include "velox/experimental/cudf/exec/CudfHashAggregation.h"
 #include "velox/experimental/cudf/exec/GpuGuard.h"
+#include "velox/experimental/cudf/exec/BloomFilterKernels.h"
 #include "velox/experimental/cudf/exec/DecimalAggregationKernels.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
@@ -918,6 +919,87 @@ struct ApproxDistinctAggregator : cudf_velox::CudfHashAggregation::Aggregator {
   std::int32_t precision_;
 };
 
+struct BloomFilterAggregator : cudf_velox::CudfHashAggregation::Aggregator {
+  BloomFilterAggregator(
+      core::AggregationNode::Step step,
+      uint32_t inputIndex,
+      VectorPtr constant,
+      bool isGlobal,
+      const TypePtr& resultType,
+      int64_t expectedNumItems,
+      int64_t numBits)
+      : Aggregator{
+            step,
+            cudf::aggregation::INVALID,
+            inputIndex,
+            constant,
+            isGlobal,
+            resultType},
+        expectedNumItems_(expectedNumItems),
+        numBits_(numBits) {}
+
+  void addGroupbyRequest(
+      cudf::table_view const& tbl,
+      std::vector<cudf::groupby::aggregation_request>& requests,
+      rmm::cuda_stream_view stream) override {
+    VELOX_UNSUPPORTED(
+        "bloom_filter_agg is not supported as a grouped aggregation");
+  }
+
+  std::unique_ptr<cudf::column> makeOutputColumn(
+      std::vector<cudf::groupby::aggregation_result>& results,
+      rmm::cuda_stream_view stream) override {
+    VELOX_UNSUPPORTED(
+        "bloom_filter_agg is not supported as a grouped aggregation");
+  }
+
+  std::unique_ptr<cudf::column> doReduce(
+      cudf::table_view const& input,
+      TypePtr const& outputType,
+      rmm::cuda_stream_view stream) override {
+    auto mr = rmm::mr::get_current_device_resource_ref();
+    if (exec::isRawInput(step)) {
+      return doPartialReduce(input, stream, mr);
+    } else {
+      return doMergeReduce(input, stream, mr);
+    }
+  }
+
+ private:
+  std::unique_ptr<cudf::column> doPartialReduce(
+      cudf::table_view const& input,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) {
+    auto const numLongs =
+        static_cast<int>(std::max<int64_t>(1, numBits_ / 64));
+    auto const numHashes = computeNumHashes(expectedNumItems_, numBits_);
+
+    auto bloomBuf = bloomFilterCreate(numHashes, numLongs, stream, mr);
+    auto const inputCol = input.column(inputIndex);
+    bloomFilterPut(*bloomBuf, inputCol, stream);
+
+    return bloomFilterToStringsColumn(*bloomBuf, stream, mr);
+  }
+
+  std::unique_ptr<cudf::column> doMergeReduce(
+      cudf::table_view const& input,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) {
+    auto const bloomCol = input.column(inputIndex);
+    if (bloomCol.size() == 0) {
+      auto emptyScalar =
+          cudf::string_scalar(std::string_view{}, false, stream, mr);
+      return cudf::make_column_from_scalar(emptyScalar, 1, stream, mr);
+    }
+
+    auto mergedBuf = bloomFilterMerge(bloomCol, stream, mr);
+    return bloomFilterToStringsColumn(*mergedBuf, stream, mr);
+  }
+
+  int64_t expectedNumItems_;
+  int64_t numBits_;
+};
+
 std::unique_ptr<cudf_velox::CudfHashAggregation::Aggregator> createAggregator(
     core::AggregationNode::Step step,
     std::string const& kind,
@@ -957,6 +1039,9 @@ std::unique_ptr<cudf_velox::CudfHashAggregation::Aggregator> createAggregator(
   } else if (kind.rfind(prefix + "approx_distinct", 0) == 0) {
     return std::make_unique<ApproxDistinctAggregator>(
         step, inputIndex, constant, isGlobal, resultType);
+  } else if (kind.rfind(prefix + "bloom_filter_agg", 0) == 0) {
+    VELOX_UNREACHABLE(
+        "bloom_filter_agg uses dedicated path in toAggregators");
   } else {
     VELOX_NYI("Aggregation not yet supported, kind: {}", kind);
   }
@@ -1042,25 +1127,74 @@ auto toAggregators(
         VELOX_NYI("Constants and lambdas not yet supported");
       }
     }
-    // The loop on aggregate.call->inputs() is taken from
-    // AggregateInfo.cpp::toAggregateInfo(). It seems to suggest that there can
-    // be multiple inputs to an aggregate.
-    // We're postponing properly supporting this for now because the currently
-    // supported aggregation functions in cudf_velox don't use it.
-    VELOX_CHECK(aggInputs.size() <= 1);
-    if (aggInputs.empty()) {
-      aggInputs.push_back(0);
-    }
-
     if (aggregate.distinct) {
       VELOX_NYI("De-dup before aggregation is not yet supported");
     }
 
     auto const kind = aggregate.call->name();
-    auto const inputIndex = aggInputs[0];
-    auto const constant = aggConstants.empty() ? nullptr : aggConstants[0];
     auto const companionStep = getCompanionStep(kind, step);
     const auto originalName = getOriginalName(kind);
+    auto prefix = cudf_velox::CudfConfig::getInstance().functionNamePrefix;
+
+    // bloom_filter_agg has 1-3 args: value [, estimatedNumItems [, numBits]].
+    // Handle separately to extract constant parameters.
+    if (originalName == prefix + "bloom_filter_agg") {
+      uint32_t bloomInputIndex = 0;
+      for (size_t j = 0; j < aggInputs.size(); j++) {
+        if (aggInputs[j] != kConstantChannel) {
+          bloomInputIndex = aggInputs[j];
+          break;
+        }
+      }
+
+      int64_t expectedNumItems = 1000000; // Spark default
+      int64_t numBits = 8388608; // Spark default (expectedNumItems * 8)
+      if (aggConstants.size() >= 1) {
+        auto* flatVec =
+            aggConstants[0]->as<ConstantVector<int64_t>>();
+        if (flatVec) {
+          expectedNumItems = flatVec->valueAt(0);
+        }
+      }
+      if (aggConstants.size() >= 2) {
+        auto* flatVec =
+            aggConstants[1]->as<ConstantVector<int64_t>>();
+        if (flatVec) {
+          numBits = flatVec->valueAt(0);
+        }
+      } else {
+        numBits = expectedNumItems * 8;
+      }
+
+      TypePtr resultType;
+      if (exec::isPartialOutput(companionStep)) {
+        resultType =
+            exec::resolveIntermediateType(originalName, aggregate.rawInputTypes);
+      } else {
+        resultType = outputType->childAt(numKeys + i);
+      }
+
+      aggregators.push_back(std::make_unique<BloomFilterAggregator>(
+          companionStep,
+          bloomInputIndex,
+          nullptr,
+          isGlobal,
+          resultType,
+          expectedNumItems,
+          numBits));
+      continue;
+    }
+
+    VELOX_CHECK(
+        aggInputs.size() <= 1,
+        "Multi-input aggregations not yet supported for {}",
+        kind);
+    if (aggInputs.empty()) {
+      aggInputs.push_back(0);
+    }
+
+    auto const inputIndex = aggInputs[0];
+    auto const constant = aggConstants.empty() ? nullptr : aggConstants[0];
     TypePtr resultType;
     if (exec::isPartialOutput(companionStep)) {
       // For merge steps the raw input is already the intermediate ROW type,
@@ -1107,6 +1241,7 @@ auto toIntermediateAggregators(
     auto const constant = nullptr;
     const auto originalName = getOriginalName(kind);
     auto const companionStep = getCompanionStep(kind, step);
+    auto prefix = cudf_velox::CudfConfig::getInstance().functionNamePrefix;
     if (exec::isPartialOutput(companionStep)) {
       TypePtr resultType;
       if (!exec::isRawInput(companionStep) &&
@@ -1117,14 +1252,25 @@ auto toIntermediateAggregators(
         resultType = exec::resolveIntermediateType(
             originalName, aggregate.rawInputTypes);
       }
-      aggregators.push_back(createAggregator(
-          step,
-          kind,
-          inputIndex,
-          constant,
-          isGlobal,
-          resultType,
-          aggregate.rawInputTypes));
+      if (originalName == prefix + "bloom_filter_agg") {
+        aggregators.push_back(std::make_unique<BloomFilterAggregator>(
+            companionStep,
+            inputIndex,
+            nullptr,
+            isGlobal,
+            resultType,
+            1000000,
+            8388608));
+      } else {
+        aggregators.push_back(createAggregator(
+            step,
+            kind,
+            inputIndex,
+            constant,
+            isGlobal,
+            resultType,
+            aggregate.rawInputTypes));
+      }
     } else {
       // Final step aggregator will not use the intermediate aggregator.
       aggregators.push_back(nullptr);
@@ -2159,6 +2305,46 @@ bool registerStepAwareBuiltinAggregationFunctions(const std::string& prefix) {
       prefix + "approx_distinct",
       core::AggregationNode::Step::kFinal,
       approxDistinctFinalSignatures);
+
+  // Register bloom_filter_agg (3-arg, 2-arg, and 1-arg variants)
+  auto bloomPartialSignatures = std::vector<exec::FunctionSignaturePtr>{
+      FunctionSignatureBuilder()
+          .returnType("varbinary")
+          .argumentType("bigint")
+          .constantArgumentType("bigint")
+          .constantArgumentType("bigint")
+          .build(),
+      FunctionSignatureBuilder()
+          .returnType("varbinary")
+          .argumentType("bigint")
+          .constantArgumentType("bigint")
+          .build(),
+      FunctionSignatureBuilder()
+          .returnType("varbinary")
+          .argumentType("bigint")
+          .build()};
+  registerAggregationFunctionForStep(
+      prefix + "bloom_filter_agg",
+      core::AggregationNode::Step::kPartial,
+      bloomPartialSignatures);
+  registerAggregationFunctionForStep(
+      prefix + "bloom_filter_agg",
+      core::AggregationNode::Step::kSingle,
+      bloomPartialSignatures);
+
+  auto bloomMergeSignatures =
+      std::vector<exec::FunctionSignaturePtr>{FunctionSignatureBuilder()
+                                                  .returnType("varbinary")
+                                                  .argumentType("varbinary")
+                                                  .build()};
+  registerAggregationFunctionForStep(
+      prefix + "bloom_filter_agg",
+      core::AggregationNode::Step::kIntermediate,
+      bloomMergeSignatures);
+  registerAggregationFunctionForStep(
+      prefix + "bloom_filter_agg",
+      core::AggregationNode::Step::kFinal,
+      bloomMergeSignatures);
 
   return true;
 }
