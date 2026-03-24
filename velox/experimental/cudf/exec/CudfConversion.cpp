@@ -380,15 +380,6 @@ RowVectorPtr CudfToVelox::getOutput() {
     inputs_.pop_front();
 
     auto tableView = cudfVector->getTableView();
-    if (tableView.num_columns() == 0) {
-      auto rowCount = cudfVector->size();
-      finished_ = noMoreInput_ && inputs_.empty();
-      if (rowCount == 0) {
-        return nullptr;
-      }
-      return std::make_shared<RowVector>(
-          pool(), outputType_, nullptr, rowCount, std::vector<VectorPtr>());
-    }
     if (tableView.num_rows() == 0) {
       finished_ = noMoreInput_ && inputs_.empty();
       return nullptr;
@@ -416,20 +407,6 @@ RowVectorPtr CudfToVelox::getOutput() {
           std::move(children));
     }
     return output;
-  }
-
-  if (outputType_->size() == 0) {
-    vector_size_t totalSize = 0;
-    while (!inputs_.empty() && totalSize < targetBatchSize) {
-      totalSize += inputs_.front()->size();
-      inputs_.pop_front();
-    }
-    finished_ = noMoreInput_ && inputs_.empty();
-    if (totalSize == 0) {
-      return nullptr;
-    }
-    return std::make_shared<RowVector>(
-        pool(), outputType_, nullptr, totalSize, std::vector<VectorPtr>());
   }
 
   // Calculate how many tables we need to concatenate to reach the target batch
