@@ -298,6 +298,43 @@ struct AsyncHtoD {
   }
 };
 
+/// Reconcile a RowVector's declared RowType with its actual children's types.
+/// After shuffle deserialization, a RowVector may have children whose physical
+/// types differ from the declared type (e.g. decimal BIGINT vs HUGEINT when
+/// the GPU produced DECIMAL128 but the Spark schema expects smaller precision).
+/// BaseVector::create + copy requires matching typeKinds, so we reconstruct
+/// the RowType from the actual children when a mismatch is detected.
+facebook::velox::TypePtr reconcileRowType(
+    const facebook::velox::RowVectorPtr& rv) {
+  auto declaredType = rv->type();
+  if (declaredType->kind() != facebook::velox::TypeKind::ROW) {
+    return declaredType;
+  }
+  auto rowType =
+      std::dynamic_pointer_cast<const facebook::velox::RowType>(declaredType);
+  bool needsFix = false;
+  for (size_t i = 0; i < rowType->size(); ++i) {
+    auto child = rv->childAt(i);
+    if (child && child->typeKind() != rowType->childAt(i)->kind()) {
+      needsFix = true;
+      break;
+    }
+  }
+  if (!needsFix) {
+    return declaredType;
+  }
+  std::vector<std::string> names;
+  std::vector<facebook::velox::TypePtr> types;
+  names.reserve(rowType->size());
+  types.reserve(rowType->size());
+  for (size_t i = 0; i < rowType->size(); ++i) {
+    names.push_back(rowType->nameOf(i));
+    auto child = rv->childAt(i);
+    types.push_back(child ? child->type() : rowType->childAt(i));
+  }
+  return facebook::velox::ROW(std::move(names), std::move(types));
+}
+
 /// Issues the from_arrow transfer on `stream` but does NOT synchronize.
 /// The returned AsyncHtoD keeps pinned buffers alive; caller must sync
 /// the stream before destroying it.
@@ -307,8 +344,11 @@ AsyncHtoD toCudfTableNoSync(
     rmm::cuda_stream_view stream) {
   // Flatten nested encodings (e.g. dictionary-of-dictionary) that the Arrow
   // bridge cannot export.  BaseVector::copy always produces flat output.
+  // Use reconciled type so that the target matches actual children's physical
+  // types (handles decimal BIGINT/HUGEINT mismatches from shuffle).
+  auto targetType = reconcileRowType(veloxTable);
   auto flat = facebook::velox::BaseVector::create<facebook::velox::RowVector>(
-      veloxTable->type(), veloxTable->size(), pool);
+      targetType, veloxTable->size(), pool);
   flat->copy(veloxTable.get(), 0, 0, veloxTable->size());
 
   AsyncHtoD result;
