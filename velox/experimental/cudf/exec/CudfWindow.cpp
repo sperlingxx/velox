@@ -422,6 +422,9 @@ RowVectorPtr CudfWindow::getOutput() {
     return nullptr;
   }
   finished_ = true;
+  if (!output_ || output_->size() == 0) {
+    return nullptr;
+  }
   return output_;
 }
 
