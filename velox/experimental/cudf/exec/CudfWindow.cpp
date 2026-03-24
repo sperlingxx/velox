@@ -237,21 +237,8 @@ bool isSupportedCudfWindowNode(
   }
 
   // Rank-like functions require at least one sort key.
-  // rank/dense_rank require exactly one sort key (for the
-  // values column in cudf groupby scan).
-  if (hasRankLike) {
-    if (node->sortingKeys().empty()) {
-      return false;
-    }
-    for (auto const& func : functions) {
-      auto kind = parseWindowFunctionKind(
-          func.functionCall->name());
-      if (kind.has_value() && CudfWindow::isRankLike(*kind) &&
-          *kind != WindowFunctionKind::kRowNumber &&
-          node->sortingKeys().size() != 1) {
-        return false;
-      }
-    }
+  if (hasRankLike && node->sortingKeys().empty()) {
+    return false;
   }
 
   for (auto const& key : node->sortingKeys()) {
@@ -501,6 +488,29 @@ CudfWindow::toWindowBounds(
   return {preceding, following};
 }
 
+cudf::column_view CudfWindow::multiSortKeyStructView(
+    cudf::table_view const& sortedInput) const {
+  VELOX_CHECK_GE(
+      sortKeyChannels_.size(),
+      2,
+      "multiSortKeyStructView requires >= 2 sort keys");
+  sortKeyStructChildren_.clear();
+  sortKeyStructChildren_.reserve(sortKeyChannels_.size());
+  for (auto ch : sortKeyChannels_) {
+    sortKeyStructChildren_.push_back(sortedInput.column(ch));
+  }
+  // Zero-copy struct column_view: cudf's row comparator treats children
+  // as a composite key, comparing element-wise for equality.
+  return cudf::column_view(
+      cudf::data_type{cudf::type_id::STRUCT},
+      sortedInput.num_rows(),
+      nullptr,
+      nullptr,
+      0,
+      0,
+      sortKeyStructChildren_);
+}
+
 std::unique_ptr<cudf::column> CudfWindow::computeRankColumn(
     cudf::table_view const& sortedInput,
     WindowFunctionKind kind,
@@ -508,10 +518,26 @@ std::unique_ptr<cudf::column> CudfWindow::computeRankColumn(
   auto mr = cudf::get_current_device_resource_ref();
   auto method = toRankMethod(kind);
 
-  // For rank/dense_rank, use the first sort key as values.
-  // For row_number, any column works (FIRST ignores ties).
-  cudf::size_type valuesChannel =
-      sortKeyChannels_.empty() ? 0 : sortKeyChannels_[0];
+  // Build the "values" column for rank tie detection.
+  // - row_number (FIRST): ties don't matter, use any single column.
+  // - rank/dense_rank with 1 sort key: use that key directly.
+  // - rank/dense_rank with N sort keys: build a zero-copy struct
+  //   column_view over all sort keys so cudf's row equality comparator
+  //   detects ties across the full composite key.
+  cudf::column_view valuesCol = [&]() -> cudf::column_view {
+    if (sortKeyChannels_.empty()) {
+      return sortedInput.column(0);
+    }
+    if (sortKeyChannels_.size() == 1 ||
+        kind == WindowFunctionKind::kRowNumber) {
+      return sortedInput.column(sortKeyChannels_[0]);
+    }
+    // Multi-key struct: cudf's rank_scan and group_rank_scan both use
+    // row::equality::self_comparator which handles STRUCT via nested
+    // column comparison (see rank_scan.cu and group_rank_scan.cu).
+    return multiSortKeyStructView(sortedInput);
+  }();
+
   auto colOrder = sortKeyChannels_.empty()
       ? cudf::order::ASCENDING
       : sortOrders_[0];
@@ -527,7 +553,7 @@ std::unique_ptr<cudf::column> CudfWindow::computeRankColumn(
         cudf::null_policy::INCLUDE,
         nullOrd);
     return cudf::scan(
-        sortedInput.column(valuesChannel),
+        valuesCol,
         *agg,
         cudf::scan_type::INCLUSIVE,
         cudf::null_policy::INCLUDE,
@@ -538,8 +564,7 @@ std::unique_ptr<cudf::column> CudfWindow::computeRankColumn(
   auto partCols =
       selectColumns(sortedInput, partitionKeyChannels_);
   std::vector<cudf::groupby::scan_request> requests(1);
-  requests[0].values =
-      sortedInput.column(valuesChannel);
+  requests[0].values = valuesCol;
   requests[0].aggregations.push_back(
       cudf::make_rank_aggregation<
           cudf::groupby_scan_aggregation>(

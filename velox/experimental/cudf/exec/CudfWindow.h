@@ -92,6 +92,9 @@ class CudfWindow : public exec::Operator, public NvtxHelper {
   std::pair<cudf::window_bounds, cudf::window_bounds>
   toWindowBounds(const core::WindowNode::Frame& frame) const;
 
+  cudf::column_view multiSortKeyStructView(
+      cudf::table_view const& sortedInput) const;
+
   std::unique_ptr<cudf::column> computeRankColumn(
       cudf::table_view const& sortedInput,
       WindowFunctionKind kind,
@@ -117,6 +120,10 @@ class CudfWindow : public exec::Operator, public NvtxHelper {
   std::vector<cudf::order> sortOrders_;
   std::vector<cudf::null_order> sortNullOrders_;
   std::vector<WindowFunctionSpec> functionSpecs_;
+
+  // Scratch storage for the struct column_view children returned by
+  // multiSortKeyStructView. Mutable because computeRankColumn is const.
+  mutable std::vector<cudf::column_view> sortKeyStructChildren_;
 };
 
 } // namespace facebook::velox::cudf_velox
