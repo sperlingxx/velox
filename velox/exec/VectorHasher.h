@@ -172,11 +172,26 @@ class VectorHasher {
   // computeValueIds(). The decoded vector can be accessed via decodedVector()
   // getter.
   void decode(const BaseVector& vector, const SelectivityVector& rows) {
-    VELOX_CHECK(
-        type_->kindEquals(vector.type()),
-        "Type mismatch: {} vs. {}",
-        type_->toString(),
-        vector.type()->toString());
+    if (!type_->kindEquals(vector.type())) {
+      // Allow decimal precision widening: short decimal (BIGINT storage)
+      // may be widened to long decimal (HUGEINT storage) after
+      // expression evaluation. Accept the wider type and adapt.
+      if (type_->isShortDecimal() && vector.type()->isLongDecimal()) {
+        type_ = vector.type();
+        typeKind_ = type_->kind();
+        typeProvidesCustomComparison_ = type_->providesCustomComparison();
+        // HUGEINT doesn't support value IDs; force hash-only mode.
+        if (!typeSupportsValueIds()) {
+          setRangeOverflow();
+          setDistinctOverflow();
+        }
+      } else {
+        VELOX_FAIL(
+            "Type mismatch: {} vs. {}",
+            type_->toString(),
+            vector.type()->toString());
+      }
+    }
     decoded_.decode(vector, rows);
   }
 
@@ -591,9 +606,9 @@ class VectorHasher {
   void hashValues(const SelectivityVector& rows, bool mix, uint64_t* result);
 
   const column_index_t channel_;
-  const TypePtr type_;
-  const TypeKind typeKind_;
-  const bool typeProvidesCustomComparison_;
+  TypePtr type_;
+  TypeKind typeKind_;
+  bool typeProvidesCustomComparison_;
 
   DecodedVector decoded_;
   raw_vector<uint64_t> cachedHashes_;

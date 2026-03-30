@@ -351,7 +351,9 @@ bool VectorHasher::makeValueIdsDecoded<bool, false>(
 bool VectorHasher::computeValueIds(
     const SelectivityVector& rows,
     raw_vector<uint64_t>& result) {
-  checkTypeSupportsValueIds();
+  if (!typeSupportsValueIds()) {
+    return false;
+  }
 
   return VALUE_ID_TYPE_DISPATCH(makeValueIds, typeKind_, rows, result.data());
 }
@@ -363,7 +365,9 @@ bool VectorHasher::computeValueIdsForRows(
     int32_t nullByte,
     uint8_t nullMask,
     raw_vector<uint64_t>& result) {
-  checkTypeSupportsValueIds();
+  if (!typeSupportsValueIds()) {
+    return false;
+  }
 
   return VALUE_ID_TYPE_DISPATCH(
       makeValueIdsForRows,
@@ -537,7 +541,10 @@ void VectorHasher::lookupValueIds(
     SelectivityVector& rows,
     ScratchMemory& scratchMemory,
     raw_vector<uint64_t>& result) const {
-  checkTypeSupportsValueIds();
+  if (!typeSupportsValueIds()) {
+    rows.clearAll();
+    return;
+  }
 
   scratchMemory.decoded.decode(values, rows);
   VALUE_ID_TYPE_DISPATCH(
@@ -602,7 +609,9 @@ void VectorHasher::analyze(
     int32_t offset,
     int32_t nullByte,
     uint8_t nullMask) {
-  checkTypeSupportsValueIds();
+  if (!typeSupportsValueIds()) {
+    return;
+  }
 
   VALUE_ID_TYPE_DISPATCH(
       analyzeTyped, typeKind_, groups, numGroups, offset, nullByte, nullMask);

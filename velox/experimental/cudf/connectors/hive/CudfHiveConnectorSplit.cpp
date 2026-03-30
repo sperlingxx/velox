@@ -57,13 +57,15 @@ CudfHiveConnectorSplit::CudfHiveConnectorSplit(
     uint64_t _length,
     int64_t _splitWeight,
     const std::unordered_map<std::string, std::string>& _infoColumns,
-    std::vector<CoalescedFileRange> _coalescedFiles)
+    std::vector<CoalescedFileRange> _coalescedFiles,
+    std::unordered_map<std::string, std::optional<std::string>> _partitionKeys)
     : facebook::velox::connector::ConnectorSplit(connectorId, _splitWeight),
       filePath(stripFilePrefix(_filePath)),
       start(_start),
       length(_length),
       cudfSourceInfo(std::make_unique<cudf::io::source_info>(filePath)),
       infoColumns(_infoColumns),
+      partitionKeys(std::move(_partitionKeys)),
       coalescedFiles(std::move(_coalescedFiles)) {}
 
 // static
@@ -94,6 +96,17 @@ std::shared_ptr<CudfHiveConnectorSplit> CudfHiveConnectorSplit::create(
     }
   }
 
+  std::unordered_map<std::string, std::optional<std::string>> partKeys;
+  if (obj.count("partitionKeys")) {
+    for (const auto& [key, value] : obj["partitionKeys"].items()) {
+      if (value.isNull()) {
+        partKeys[key.asString()] = std::nullopt;
+      } else {
+        partKeys[key.asString()] = value.asString();
+      }
+    }
+  }
+
   return std::make_shared<CudfHiveConnectorSplit>(
       connectorId,
       filePath,
@@ -101,7 +114,8 @@ std::shared_ptr<CudfHiveConnectorSplit> CudfHiveConnectorSplit::create(
       length,
       splitWeight,
       infoColumns,
-      std::move(coalescedFiles));
+      std::move(coalescedFiles),
+      std::move(partKeys));
 }
 
 folly::dynamic CudfHiveConnectorSplit::serialize() const {
@@ -132,6 +146,16 @@ folly::dynamic CudfHiveConnectorSplit::serialize() const {
     coalescedArr.push_back(cfObj);
   }
   obj["coalescedFiles"] = coalescedArr;
+
+  folly::dynamic partKeysObj = folly::dynamic::object;
+  for (const auto& [key, value] : partitionKeys) {
+    if (value.has_value()) {
+      partKeysObj[key] = *value;
+    } else {
+      partKeysObj[key] = nullptr;
+    }
+  }
+  obj["partitionKeys"] = partKeysObj;
 
   return obj;
 }

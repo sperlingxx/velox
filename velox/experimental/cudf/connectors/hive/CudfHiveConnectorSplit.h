@@ -26,6 +26,7 @@ struct source_info;
 } // namespace cudf
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -53,6 +54,11 @@ struct CudfHiveConnectorSplit
   /// associated with the CudfHiveConnectorSplit.
   std::unordered_map<std::string, std::string> infoColumns = {};
 
+  /// Hive partition key values for this split, keyed by column name.
+  /// Partition columns are not stored inside the Parquet file; the DataSource
+  /// must materialise them as constant columns in the output.
+  std::unordered_map<std::string, std::optional<std::string>> partitionKeys;
+
   /// Additional file ranges coalesced into this split.
   /// When non-empty, the DataSource should process all files sequentially
   /// and accumulate data until the target batch byte size is reached.
@@ -65,7 +71,9 @@ struct CudfHiveConnectorSplit
       uint64_t _length = std::numeric_limits<uint64_t>::max(),
       int64_t _splitWeight = 0,
       const std::unordered_map<std::string, std::string>& _infoColumns = {},
-      std::vector<CoalescedFileRange> _coalescedFiles = {});
+      std::vector<CoalescedFileRange> _coalescedFiles = {},
+      std::unordered_map<std::string, std::optional<std::string>>
+          _partitionKeys = {});
 
   std::string toString() const override;
   std::string getFileName() const;
@@ -124,6 +132,19 @@ class CudfHiveConnectorSplitBuilder {
     return *this;
   }
 
+  CudfHiveConnectorSplitBuilder& partitionKey(
+      const std::string& name,
+      const std::optional<std::string>& value) {
+    partitionKeys_[name] = value;
+    return *this;
+  }
+
+  CudfHiveConnectorSplitBuilder& partitionKeys(
+      std::unordered_map<std::string, std::optional<std::string>> keys) {
+    partitionKeys_ = std::move(keys);
+    return *this;
+  }
+
   std::shared_ptr<CudfHiveConnectorSplit> build() const {
     return std::make_shared<CudfHiveConnectorSplit>(
         connectorId_,
@@ -132,7 +153,8 @@ class CudfHiveConnectorSplitBuilder {
         length_,
         splitWeight_,
         infoColumns_,
-        coalescedFiles_);
+        coalescedFiles_,
+        partitionKeys_);
   }
 
  private:
@@ -143,6 +165,8 @@ class CudfHiveConnectorSplitBuilder {
   int64_t splitWeight_{0};
   std::unordered_map<std::string, std::string> infoColumns_ = {};
   std::vector<CoalescedFileRange> coalescedFiles_;
+  std::unordered_map<std::string, std::optional<std::string>>
+      partitionKeys_;
 };
 
 } // namespace facebook::velox::cudf_velox::connector::hive

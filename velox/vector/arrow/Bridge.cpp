@@ -1272,7 +1272,7 @@ void exportToArrowImpl(
 
 // Parses the velox decimal format from the given arrow format.
 // The input format string should be in the form "d:precision,scale<,bitWidth>".
-// bitWidth is not required and must be 128 if provided.
+// bitWidth is optional and ignored; Velox always uses 128-bit decimals.
 TypePtr parseDecimalFormat(const char* format) {
   std::string invalidFormatMsg =
       "Unable to convert '{}' ArrowSchema decimal format to Velox decimal";
@@ -1293,14 +1293,11 @@ TypePtr parseDecimalFormat(const char* format) {
     // Parse "d:".
     int precision = std::stoi(&format[2], &sz);
     int scale = std::stoi(&format[firstCommaIdx + 1], &sz);
-    // If bitwidth is provided, check if it is equal to 128.
+    // Arrow/cuDF may specify 32, 64, 128, or 256-bit decimal widths.
+    // Velox represents all decimals as 128-bit internally, so we accept
+    // any valid bitwidth and let the data import layer handle conversion.
     if (secondCommaIdx != std::string::npos) {
-      int bitWidth = std::stoi(&format[secondCommaIdx + 1], &sz);
-      VELOX_USER_CHECK_EQ(
-          bitWidth,
-          128,
-          "Conversion failed for '{}'. Velox decimal does not support custom bitwidth.",
-          format);
+      std::stoi(&format[secondCommaIdx + 1], &sz);
     }
     return DECIMAL(precision, scale);
   } catch (std::invalid_argument&) {

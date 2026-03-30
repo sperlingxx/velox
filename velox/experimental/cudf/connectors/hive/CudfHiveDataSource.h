@@ -142,8 +142,19 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
   // remaining filter.
   RowTypePtr readerOutputType_;
 
-  // Columns to read.
+  // Columns to read from the Parquet file (excludes partition key columns).
   std::vector<std::string> readColumnNames_;
+
+  // Partition key columns that must be materialised as constants from the
+  // split metadata.  Each entry records the output column index, column name,
+  // and Velox type so we can inject the right constant vector after the cuDF
+  // read.
+  struct PartitionColumnInfo {
+    size_t outputIndex;
+    std::string name;
+    TypePtr type;
+  };
+  std::vector<PartitionColumnInfo> partitionColumns_;
 
   std::shared_ptr<io::IoStatistics> ioStatistics_;
   std::shared_ptr<velox::IoStats> ioStats_;
@@ -155,6 +166,10 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
 
   // The row type for the data source output, not including filter-only columns
   const RowTypePtr outputType_;
+
+  // outputType_ minus partition-key columns; used for the cudf reader/converter
+  // which only sees columns actually stored in the Parquet file.
+  RowTypePtr dataOutputType_;
 
   // Expression evaluator for remaining filter.
   core::ExpressionEvaluator* const expressionEvaluator_;
@@ -233,6 +248,12 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
   bool advanceToNextCoalescedFile();
   // Flush accumulated tables into one CudfVector output.
   RowVectorPtr flushAccumulated();
+
+  // Wrap a data-only RowVector into the full outputType_ by inserting constant
+  // partition-key columns at the positions recorded in partitionColumns_.
+  RowVectorPtr injectPartitionColumns(
+      RowVectorPtr dataVector,
+      vector_size_t nRows);
 
   // --- Chunked experimental reader state ---
   void initExperimentalReaderMetadata();

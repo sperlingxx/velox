@@ -17,10 +17,14 @@
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 
+#include <glog/logging.h>
+
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>
 #include <cudf/concatenate.hpp>
+#include <cudf/copying.hpp>
+#include <cudf/unary.hpp>
 #include <cudf/utilities/bit.hpp>
 #include <cudf/utilities/traits.hpp>
 #include <cudf/detail/utilities/stream_pool.hpp>
@@ -40,6 +44,8 @@
 #include <rmm/mr/prefetch_resource_adaptor.hpp>
 
 #include <common/base/Exceptions.h>
+
+#include <cuda_runtime_api.h>
 
 #include <cstdlib>
 #include <limits>
@@ -179,10 +185,16 @@ uint64_t estimateTableBytes(std::unique_ptr<cudf::table>& table) {
   return totalBytes;
 }
 
+namespace {
+void alignDecimalColumnsForConcat(
+    std::vector<cudf::table_view>& tableViews,
+    std::vector<std::unique_ptr<cudf::table>>& castStorage,
+    rmm::cuda_stream_view stream);
+} // namespace
+
 std::unique_ptr<cudf::table> concatenateTables(
     std::vector<std::unique_ptr<cudf::table>> tables,
     rmm::cuda_stream_view stream) {
-  // Check for empty vector
   VELOX_CHECK_GT(tables.size(), 0);
 
   if (tables.size() == 1) {
@@ -195,6 +207,10 @@ std::unique_ptr<cudf::table> concatenateTables(
       tables.end(),
       std::back_inserter(tableViews),
       [&](const auto& tbl) { return tbl->view(); });
+
+  std::vector<std::unique_ptr<cudf::table>> castStorage;
+  alignDecimalColumnsForConcat(tableViews, castStorage, stream);
+
   return cudf::concatenate(
       tableViews, stream, cudf::get_current_device_resource_ref());
 }
@@ -222,12 +238,77 @@ std::unique_ptr<cudf::table> makeEmptyTable(TypePtr const& inputType) {
   return std::make_unique<cudf::table>(std::move(emptyColumns));
 }
 
+namespace {
+
+// Align decimal column types across tables so cudf::concatenate succeeds.
+// When batches have mismatched decimal types (e.g., DECIMAL64 vs DECIMAL128
+// for the same column), cast all to the widest type. Stores cast columns
+// in 'castStorage' to keep them alive, and updates 'tableViews' in place.
+void alignDecimalColumnsForConcat(
+    std::vector<cudf::table_view>& tableViews,
+    std::vector<std::unique_ptr<cudf::table>>& castStorage,
+    rmm::cuda_stream_view stream) {
+  if (tableViews.size() <= 1) return;
+  auto numCols = tableViews[0].num_columns();
+  if (numCols == 0) return;
+
+  // For each column, find the widest fixed_point type across all tables.
+  std::vector<cudf::data_type> targetTypes(numCols);
+  bool needsCast = false;
+  for (cudf::size_type c = 0; c < numCols; ++c) {
+    targetTypes[c] = tableViews[0].column(c).type();
+    for (size_t t = 1; t < tableViews.size(); ++t) {
+      auto colType = tableViews[t].column(c).type();
+      if (colType == targetTypes[c]) continue;
+      if (!cudf::is_fixed_point(colType) ||
+          !cudf::is_fixed_point(targetTypes[c])) continue;
+      needsCast = true;
+      // Pick wider type_id (DECIMAL128 > DECIMAL64 > DECIMAL32) and
+      // finer scale (more negative = more fractional digits).
+      auto widerId = std::max(targetTypes[c].id(), colType.id());
+      auto finerScale = std::min(targetTypes[c].scale(), colType.scale());
+      targetTypes[c] = cudf::data_type{widerId, finerScale};
+    }
+  }
+  if (!needsCast) return;
+
+  auto mr = cudf::get_current_device_resource_ref();
+  for (size_t t = 0; t < tableViews.size(); ++t) {
+    bool tableNeedsCast = false;
+    for (cudf::size_type c = 0; c < numCols; ++c) {
+      if (cudf::is_fixed_point(tableViews[t].column(c).type()) &&
+          tableViews[t].column(c).type() != targetTypes[c]) {
+        tableNeedsCast = true;
+        break;
+      }
+    }
+    if (!tableNeedsCast) continue;
+
+    std::vector<std::unique_ptr<cudf::column>> cols;
+    cols.reserve(numCols);
+    for (cudf::size_type c = 0; c < numCols; ++c) {
+      auto colView = tableViews[t].column(c);
+      if (cudf::is_fixed_point(colView.type()) &&
+          colView.type() != targetTypes[c]) {
+        cols.push_back(cudf::cast(colView, targetTypes[c], stream, mr));
+      } else {
+        cols.push_back(std::make_unique<cudf::column>(colView, stream, mr));
+      }
+    }
+    auto newTable = std::make_unique<cudf::table>(std::move(cols));
+    tableViews[t] = newTable->view();
+    castStorage.push_back(std::move(newTable));
+  }
+}
+
+} // namespace
+
 std::unique_ptr<cudf::table> getConcatenatedTable(
     std::vector<CudfVectorPtr>& tables,
     const TypePtr& tableType,
     rmm::cuda_stream_view stream) {
-  // Check for empty vector
   if (tables.size() == 0) {
+    LOG(INFO) << "[DIAG] getConcatenatedTable: 0 tables, returning empty";
     return makeEmptyTable(tableType);
   }
 
@@ -237,25 +318,26 @@ std::unique_ptr<cudf::table> getConcatenatedTable(
   inputStreams.reserve(tables.size());
   tableViews.reserve(tables.size());
 
+  size_t totalRows = 0;
   for (const auto& table : tables) {
     VELOX_CHECK_NOT_NULL(table);
     tableViews.push_back(table->getTableView());
     inputStreams.push_back(table->stream());
+    totalRows += table->size();
   }
+  LOG(INFO) << "[DIAG] getConcatenatedTable: nTables=" << tables.size()
+            << " totalRows=" << totalRows
+            << " cols=" << (tableViews.empty() ? 0 : tableViews[0].num_columns());
 
   cudf::detail::join_streams(inputStreams, stream);
 
   if (tables.size() == 1 && inputStreams[0] == stream) {
-    // Zero-copy: safe because buffers are on `stream`, so any later
-    // cudaFreeAsync is ordered with work on the same stream.
     return tables[0]->release();
   }
 
-  // For multiple tables, or a single table whose buffers live on a different
-  // stream, materialize on `stream`.  This ensures the returned table's
-  // device_buffers are allocated (and later freed) on `stream`, avoiding
-  // cross-stream free-vs-read races when the caller uses the table on
-  // `stream` and the buffers would otherwise be freed on the original stream.
+  std::vector<std::unique_ptr<cudf::table>> castStorage;
+  alignDecimalColumnsForConcat(tableViews, castStorage, stream);
+
   auto output = cudf::concatenate(
       tableViews, stream, cudf::get_current_device_resource_ref());
   stream.synchronize();
@@ -288,9 +370,37 @@ std::vector<std::unique_ptr<cudf::table>> getConcatenatedTableBatched(
   cudf::detail::join_streams(inputStreams, stream);
 
   if (tables.size() == 1 && inputStreams[0] == stream) {
-    // Zero-copy: safe because buffers are on `stream`.
     concatTables.push_back(tables[0]->release());
     return concatTables;
+  }
+
+  std::vector<std::unique_ptr<cudf::table>> castStorage;
+  alignDecimalColumnsForConcat(tableViews, castStorage, stream);
+
+  // Estimate bytes per row from the first table's schema.
+  size_t bytesPerRow = 0;
+  {
+    auto tv0 = tableViews[0];
+    for (cudf::size_type c = 0; c < tv0.num_columns(); ++c) {
+      auto dt = tv0.column(c).type();
+      if (cudf::is_fixed_width(dt)) {
+        bytesPerRow += cudf::size_of(dt);
+      } else {
+        bytesPerRow += 32; // estimate for variable-width types
+      }
+    }
+    bytesPerRow = std::max(bytesPerRow, size_t(1));
+  }
+
+  // Limit batches by both row count and byte size. Query free GPU memory
+  // and cap each batch to ~40% of free memory to avoid oversized allocations
+  // that trigger cudaErrorInvalidValue.
+  size_t maxBatchBytes = std::numeric_limits<size_t>::max();
+  {
+    size_t freeMem = 0, totalMem = 0;
+    if (cudaMemGetInfo(&freeMem, &totalMem) == cudaSuccess && freeMem > 0) {
+      maxBatchBytes = freeMem * 40 / 100;
+    }
   }
 
   std::vector<std::unique_ptr<cudf::table>> outputTables;
@@ -298,11 +408,15 @@ std::vector<std::unique_ptr<cudf::table>> getConcatenatedTableBatched(
       static_cast<size_t>(std::numeric_limits<cudf::size_type>::max());
   size_t startpos = 0;
   size_t runningRows = 0;
+  size_t runningBytes = 0;
   for (size_t i = 0; i < tableViews.size(); ++i) {
     auto const numRows = static_cast<size_t>(tableViews[i].num_rows());
-    // If adding this table would exceed the limit, flush current batch
+    auto const numBytes = numRows * bytesPerRow;
+    // If adding this table would exceed either limit, flush current batch
     // [startpos, i).
-    if (runningRows > 0 && runningRows + numRows > maxRows) {
+    if (runningRows > 0 &&
+        (runningRows + numRows > maxRows ||
+         runningBytes + numBytes > maxBatchBytes)) {
       outputTables.push_back(
           cudf::concatenate(
               std::vector<cudf::table_view>(
@@ -311,8 +425,10 @@ std::vector<std::unique_ptr<cudf::table>> getConcatenatedTableBatched(
               cudf::get_current_device_resource_ref()));
       startpos = i;
       runningRows = 0;
+      runningBytes = 0;
     }
     runningRows += numRows;
+    runningBytes += numBytes;
   }
   // Flush the final batch [startpos, end).
   if (startpos < tableViews.size()) {

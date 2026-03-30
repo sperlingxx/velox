@@ -88,6 +88,11 @@ getConcatenatedTableBatched(
     const TypePtr& tableType,
     rmm::cuda_stream_view stream);
 
+/// Creates an empty cudf::table (0 rows) whose column types match the
+/// given Velox row type.
+[[nodiscard]] std::unique_ptr<cudf::table> makeEmptyTable(
+    TypePtr const& inputType);
+
 /// Estimates the total memory size of a cudf table by summing per-column
 /// data + null-mask buffer sizes.  This is a fast host-side estimate that
 /// does not require releasing or copying the table.  It may slightly

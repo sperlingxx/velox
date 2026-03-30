@@ -237,6 +237,48 @@ class CastFunction : public CudfFunction {
   bool dateToString_{false};
 };
 
+// GPU implementation of Spark's make_decimal special form.
+// Takes an INT64 (unscaled value) and reinterprets it as a DECIMAL column
+// with the target precision and scale. Unlike cudf::cast (which applies
+// decimal rescaling), this preserves the raw integer as the unscaled
+// representation.
+class MakeDecimalCudfFunction : public CudfFunction {
+ public:
+  MakeDecimalCudfFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
+    VELOX_CHECK(
+        expr->type()->isDecimal(),
+        "make_decimal result type must be decimal, got {}",
+        expr->type()->toString());
+    targetCudfType_ = cudf_velox::veloxToCudfDataType(expr->type());
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    auto inputCol = asView(inputColumns[0]);
+    // Reinterpret the INT64 data as DECIMAL64 with the target scale.
+    // Both INT64 and DECIMAL64 are 64-bit, so the memory layout is identical.
+    cudf::data_type dec64Type(
+        cudf::type_id::DECIMAL64, targetCudfType_.scale());
+    cudf::column_view dec64View(
+        dec64Type,
+        inputCol.size(),
+        inputCol.head(),
+        inputCol.null_mask(),
+        inputCol.null_count());
+    if (targetCudfType_.id() == cudf::type_id::DECIMAL64) {
+      return std::make_unique<cudf::column>(dec64View, stream, mr);
+    }
+    // DECIMAL128: widen from DECIMAL64. Same scale so cudf::cast preserves
+    // the unscaled value and only widens int64 → __int128.
+    return cudf::cast(dec64View, targetCudfType_, stream, mr);
+  }
+
+ private:
+  cudf::data_type targetCudfType_;
+};
+
 // Spark date_add function implementation.
 // For the presto date_add, the first value is unit string,
 // may need to get the function with prefix, if the prefix is "", it is Spark
@@ -434,6 +476,19 @@ class BinaryFunction : public CudfFunction {
       }
       auto lhsView = asView(inputColumns[0]);
       auto rhsView = asView(inputColumns[1]);
+      std::unique_ptr<cudf::column> lhsD32, rhsD32;
+      if (lhsView.type().id() == cudf::type_id::DECIMAL32) {
+        lhsD32 = cudf::cast(lhsView,
+            cudf::data_type{cudf::type_id::DECIMAL64, lhsView.type().scale()},
+            stream, mr);
+        lhsView = lhsD32->view();
+      }
+      if (rhsView.type().id() == cudf::type_id::DECIMAL32) {
+        rhsD32 = cudf::cast(rhsView,
+            cudf::data_type{cudf::type_id::DECIMAL64, rhsView.type().scale()},
+            stream, mr);
+        rhsView = rhsD32->view();
+      }
       if (isComparisonOp(op_) && cudf::is_fixed_point(lhsView.type()) &&
           cudf::is_fixed_point(rhsView.type())) {
         auto lhsScale = -lhsView.type().scale();
@@ -491,6 +546,26 @@ class BinaryFunction : public CudfFunction {
               lhsView, rhsView, op_, type_, stream, mr);
         }
       }
+      if (cudf::is_fixed_point(lhsView.type()) ||
+          cudf::is_fixed_point(rhsView.type())) {
+        auto f64 = cudf::data_type{cudf::type_id::FLOAT64};
+        std::unique_ptr<cudf::column> lhsConv, rhsConv;
+        if (cudf::is_fixed_point(lhsView.type())) {
+          lhsConv = cudf::cast(lhsView, f64, stream, mr);
+          lhsView = lhsConv->view();
+        }
+        if (cudf::is_fixed_point(rhsView.type())) {
+          rhsConv = cudf::cast(rhsView, f64, stream, mr);
+          rhsView = rhsConv->view();
+        }
+        auto outType = cudf::is_fixed_point(type_) ? f64 : type_;
+        auto result =
+            cudf::binary_operation(lhsView, rhsView, op_, outType, stream, mr);
+        if (cudf::is_fixed_point(type_)) {
+          return cudf::cast(result->view(), type_, stream, mr);
+        }
+        return result;
+      }
       return cudf::binary_operation(lhsView, rhsView, op_, type_, stream, mr);
     } else if (left_ == nullptr) {
       if (op_ == cudf::binary_operator::DIV && cudf::is_fixed_point(type_)) {
@@ -531,6 +606,13 @@ class BinaryFunction : public CudfFunction {
         return decimalDivide(lhsView, rhsView, type_, aRescale, stream);
       }
       auto lhsView = asView(inputColumns[0]);
+      std::unique_ptr<cudf::column> lhsD32b;
+      if (lhsView.type().id() == cudf::type_id::DECIMAL32) {
+        lhsD32b = cudf::cast(lhsView,
+            cudf::data_type{cudf::type_id::DECIMAL64, lhsView.type().scale()},
+            stream, mr);
+        lhsView = lhsD32b->view();
+      }
       if (isComparisonOp(op_) && cudf::is_fixed_point(lhsView.type()) &&
           cudf::is_fixed_point(right_->type())) {
         auto rhsCol =
@@ -594,8 +676,31 @@ class BinaryFunction : public CudfFunction {
               lhsView, rhsView, op_, type_, stream, mr);
         }
       }
-      return cudf::binary_operation(
-          asView(inputColumns[0]), *right_, op_, type_, stream, mr);
+      if (cudf::is_fixed_point(lhsView.type()) ||
+          cudf::is_fixed_point(right_->type())) {
+        auto f64 = cudf::data_type{cudf::type_id::FLOAT64};
+        std::unique_ptr<cudf::column> lhsConv;
+        if (cudf::is_fixed_point(lhsView.type())) {
+          lhsConv = cudf::cast(lhsView, f64, stream, mr);
+          lhsView = lhsConv->view();
+        }
+        auto rhsCol =
+            cudf::make_column_from_scalar(*right_, lhsView.size(), stream, mr);
+        std::unique_ptr<cudf::column> rhsConv;
+        cudf::column_view rhsView2 = rhsCol->view();
+        if (cudf::is_fixed_point(right_->type())) {
+          rhsConv = cudf::cast(rhsView2, f64, stream, mr);
+          rhsView2 = rhsConv->view();
+        }
+        auto outType = cudf::is_fixed_point(type_) ? f64 : type_;
+        auto result =
+            cudf::binary_operation(lhsView, rhsView2, op_, outType, stream, mr);
+        if (cudf::is_fixed_point(type_)) {
+          return cudf::cast(result->view(), type_, stream, mr);
+        }
+        return result;
+      }
+      return cudf::binary_operation(lhsView, *right_, op_, type_, stream, mr);
     }
     if (op_ == cudf::binary_operator::DIV && cudf::is_fixed_point(type_)) {
       auto rhsView = asView(inputColumns[0]);
@@ -635,6 +740,13 @@ class BinaryFunction : public CudfFunction {
       return decimalDivide(lhsView, rhsView, type_, aRescale, stream);
     }
     auto rhsView = asView(inputColumns[0]);
+    std::unique_ptr<cudf::column> rhsD32c;
+    if (rhsView.type().id() == cudf::type_id::DECIMAL32) {
+      rhsD32c = cudf::cast(rhsView,
+          cudf::data_type{cudf::type_id::DECIMAL64, rhsView.type().scale()},
+          stream, mr);
+      rhsView = rhsD32c->view();
+    }
     if (isComparisonOp(op_) && cudf::is_fixed_point(left_->type()) &&
         cudf::is_fixed_point(rhsView.type())) {
       auto lhsCol =
@@ -696,6 +808,29 @@ class BinaryFunction : public CudfFunction {
         return cudf::binary_operation(
             lhsView, rhsView, op_, type_, stream, mr);
       }
+    }
+    if (cudf::is_fixed_point(left_->type()) ||
+        cudf::is_fixed_point(rhsView.type())) {
+      auto f64 = cudf::data_type{cudf::type_id::FLOAT64};
+      auto lhsCol =
+          cudf::make_column_from_scalar(*left_, rhsView.size(), stream, mr);
+      cudf::column_view lhsView2 = lhsCol->view();
+      std::unique_ptr<cudf::column> lhsConv, rhsConv;
+      if (cudf::is_fixed_point(left_->type())) {
+        lhsConv = cudf::cast(lhsView2, f64, stream, mr);
+        lhsView2 = lhsConv->view();
+      }
+      if (cudf::is_fixed_point(rhsView.type())) {
+        rhsConv = cudf::cast(rhsView, f64, stream, mr);
+        rhsView = rhsConv->view();
+      }
+      auto outType = cudf::is_fixed_point(type_) ? f64 : type_;
+      auto result =
+          cudf::binary_operation(lhsView2, rhsView, op_, outType, stream, mr);
+      if (cudf::is_fixed_point(type_)) {
+        return cudf::cast(result->view(), type_, stream, mr);
+      }
+      return result;
     }
     return cudf::binary_operation(*left_, rhsView, op_, type_, stream, mr);
   }
@@ -843,40 +978,60 @@ class BetweenFunction : public CudfFunction {
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr) const override {
     // return (value >= min) && (value <= max)
+    // For decimal types, align both operands to a common type before
+    // comparison since cuDF requires identical fixed_point types.
+    auto alignedCompare =
+        [&](cudf::column_view valView,
+            cudf::column_view boundView,
+            cudf::binary_operator op) -> std::unique_ptr<cudf::column> {
+      std::unique_ptr<cudf::column> valCast, boundCast;
+      if (cudf::is_fixed_point(valView.type()) &&
+          cudf::is_fixed_point(boundView.type()) &&
+          valView.type() != boundView.type()) {
+        auto valScale = -valView.type().scale();
+        auto boundScale = -boundView.type().scale();
+        auto targetScale = valScale > boundScale ? valScale : boundScale;
+        auto targetTypeId =
+            (valView.type().id() == cudf::type_id::DECIMAL128 ||
+             boundView.type().id() == cudf::type_id::DECIMAL128)
+            ? cudf::type_id::DECIMAL128
+            : cudf::type_id::DECIMAL64;
+        auto targetType = cudf::data_type{
+            targetTypeId, numeric::scale_type{-targetScale}};
+        if (valView.type() != targetType) {
+          valCast = cudf::cast(valView, targetType, stream, mr);
+          valView = valCast->view();
+        }
+        if (boundView.type() != targetType) {
+          boundCast = cudf::cast(boundView, targetType, stream, mr);
+          boundView = boundCast->view();
+        }
+      }
+      return cudf::binary_operation(
+          valView, boundView, op, kBoolType, stream, mr);
+    };
+
+    auto valueView = asView(inputColumns[0]);
     std::unique_ptr<cudf::column> geResultColumn, leResultColumn;
     if (minLiteral_) {
-      geResultColumn = cudf::binary_operation(
-          asView(inputColumns[0]),
-          *minLiteral_,
-          cudf::binary_operator::GREATER_EQUAL,
-          kBoolType,
-          stream,
-          mr);
+      auto minCol = cudf::make_column_from_scalar(
+          *minLiteral_, valueView.size(), stream, mr);
+      geResultColumn = alignedCompare(
+          valueView, minCol->view(), cudf::binary_operator::GREATER_EQUAL);
     } else {
-      geResultColumn = cudf::binary_operation(
-          asView(inputColumns[0]),
-          asView(inputColumns[1]),
-          cudf::binary_operator::GREATER_EQUAL,
-          kBoolType,
-          stream,
-          mr);
+      geResultColumn = alignedCompare(
+          valueView, asView(inputColumns[1]),
+          cudf::binary_operator::GREATER_EQUAL);
     }
     if (maxLiteral_) {
-      leResultColumn = cudf::binary_operation(
-          asView(inputColumns[0]),
-          *maxLiteral_,
-          cudf::binary_operator::LESS_EQUAL,
-          kBoolType,
-          stream,
-          mr);
+      auto maxCol = cudf::make_column_from_scalar(
+          *maxLiteral_, valueView.size(), stream, mr);
+      leResultColumn = alignedCompare(
+          valueView, maxCol->view(), cudf::binary_operator::LESS_EQUAL);
     } else {
-      leResultColumn = cudf::binary_operation(
-          asView(inputColumns[0]),
-          asView(inputColumns[2]),
-          cudf::binary_operator::LESS_EQUAL,
-          kBoolType,
-          stream,
-          mr);
+      leResultColumn = alignedCompare(
+          valueView, asView(inputColumns[2]),
+          cudf::binary_operator::LESS_EQUAL);
     }
     return cudf::binary_operation(
         geResultColumn->view(),
@@ -2682,6 +2837,27 @@ bool registerBuiltinFunctions(const std::string& prefix) {
            .returnType("varchar")
            .argumentType("varchar")
            .variableArity("varchar")
+           .build()});
+
+  // make_decimal is a special form (no prefix).
+  registerCudfFunction(
+      "make_decimal",
+      [](const std::string&,
+         const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<MakeDecimalCudfFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .integerVariable("p")
+           .integerVariable("s")
+           .returnType("decimal(p,s)")
+           .argumentType("bigint")
+           .build(),
+       FunctionSignatureBuilder()
+           .integerVariable("p")
+           .integerVariable("s")
+           .returnType("decimal(p,s)")
+           .argumentType("bigint")
+           .constantArgumentType("boolean")
            .build()});
 
   return true;

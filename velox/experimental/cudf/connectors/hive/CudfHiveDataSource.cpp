@@ -35,6 +35,7 @@
 #include "velox/connectors/hive/FileHandle.h"
 #include "velox/connectors/hive/HiveConnectorSplit.h"
 #include "velox/connectors/hive/HiveConnectorUtil.h"
+#include "velox/connectors/hive/SplitReader.h"
 #include "velox/connectors/hive/TableHandle.h"
 #include "velox/expression/FieldReference.h"
 
@@ -83,18 +84,30 @@ CudfHiveDataSource::CudfHiveDataSource(
       baseReaderOpts_(pool_),
       outputType_(outputType),
       expressionEvaluator_(connectorQueryCtx->expressionEvaluator()) {
-  // Set up column projection if needed
+  // Set up column projection.  All columns are always requested from the
+  // Parquet reader.  Partition-key columns are tracked separately so that
+  // injectPartitionColumns() can replace them with constants when the split
+  // actually provides partition values (Hive-partitioned data).
   auto readColumnTypes = outputType_->children();
-  for (const auto& outputName : outputType_->names()) {
+  for (size_t i = 0; i < outputType_->size(); ++i) {
+    const auto& outputName = outputType_->nameOf(i);
     auto it = columnHandles.find(outputName);
     VELOX_CHECK(
         it != columnHandles.end(),
         "ColumnHandle is missing for output column: {}",
         outputName);
 
-    auto* handle = static_cast<const hive::HiveColumnHandle*>(it->second.get());
+    auto* handle =
+        static_cast<const hive::HiveColumnHandle*>(it->second.get());
     readColumnNames_.emplace_back(handle->name());
+    if (handle->columnType() ==
+        hive::HiveColumnHandle::ColumnType::kPartitionKey) {
+      partitionColumns_.push_back(
+          {i, handle->name(), outputType_->childAt(i)});
+    }
   }
+
+  dataOutputType_ = outputType_;
 
   tableHandle_ =
       std::dynamic_pointer_cast<const hive::HiveTableHandle>(tableHandle);
@@ -386,26 +399,29 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
   // Output RowVectorPtr
   const auto nRows = cudfTable->num_rows();
 
-  // keep only outputType_.size() columns in cudfTable_
-  if (outputType_->size() < cudfTable->num_columns()) {
+  // Keep only dataOutputType_.size() columns (data columns; filter-only extras
+  // are trimmed).
+  if (dataOutputType_->size() < cudfTable->num_columns()) {
     auto cudfTableColumns = cudfTable->release();
     std::vector<std::unique_ptr<cudf::column>> originalColumns;
-    originalColumns.reserve(outputType_->size());
+    originalColumns.reserve(dataOutputType_->size());
     std::move(
         cudfTableColumns.begin(),
-        cudfTableColumns.begin() + outputType_->size(),
+        cudfTableColumns.begin() + dataOutputType_->size(),
         std::back_inserter(originalColumns));
     cudfTable = std::make_unique<cudf::table>(std::move(originalColumns));
   }
 
   auto output = cudfIsRegistered()
       ? std::make_shared<CudfVector>(
-            pool_, outputType_, nRows, std::move(cudfTable), stream_)
+            pool_, dataOutputType_, nRows, std::move(cudfTable), stream_)
       : with_arrow::toVeloxColumn(
-            cudfTable->view(), pool_, outputType_->names(), stream_);
+            cudfTable->view(), pool_, dataOutputType_->names(), stream_);
 
   // Check if conversion yielded a nullptr
   VELOX_CHECK_NOT_NULL(output, "Cudf to Velox conversion yielded a nullptr");
+
+  output = injectPartitionColumns(std::move(output), nRows);
 
   // Update completedRows_.
   completedRows_ += output->size();
@@ -460,7 +476,8 @@ void CudfHiveDataSource::addSplit(std::shared_ptr<ConnectorSplit> split) {
                                       .start(hiveSplit->start)
                                       .length(hiveSplit->length)
                                       .connectorId(hiveSplit->connectorId)
-                                      .splitWeight(hiveSplit->splitWeight);
+                                      .splitWeight(hiveSplit->splitWeight)
+                                      .partitionKeys(hiveSplit->partitionKeys);
       for (auto const& infoColumn : hiveSplit->infoColumns) {
         cudfHiveSplitBuilder.infoColumn(infoColumn.first, infoColumn.second);
       }
@@ -765,6 +782,51 @@ CudfHybridScanReaderPtr CudfHiveDataSource::createExperimentalSplitReader() {
   return exptSplitReader;
 }
 
+RowVectorPtr CudfHiveDataSource::injectPartitionColumns(
+    RowVectorPtr dataVector,
+    vector_size_t nRows) {
+  // Only inject when partition columns exist AND the split actually carries
+  // partition key values.  When partitionKeys is empty the columns were read
+  // from the Parquet file directly (flat / non-Hive-partitioned data).
+  if (partitionColumns_.empty() || split_->partitionKeys.empty()) {
+    return dataVector;
+  }
+
+  const size_t totalCols = outputType_->size();
+  std::vector<VectorPtr> children(totalCols);
+  bool anyInjected = false;
+
+  for (const auto& pc : partitionColumns_) {
+    auto it = split_->partitionKeys.find(pc.name);
+    if (it != split_->partitionKeys.end()) {
+      auto constantSize1 = connector::hive::newConstantFromString(
+          pc.type,
+          it->second,
+          pool_,
+          false /*isLocalTimestamp*/,
+          false /*isDaysSinceEpoch*/);
+      children[pc.outputIndex] =
+          BaseVector::wrapInConstant(nRows, 0, constantSize1);
+      anyInjected = true;
+    }
+  }
+
+  if (!anyInjected) {
+    return dataVector;
+  }
+
+  // Replace only injected positions; all others come from the data vector
+  // at the same position (dataOutputType_ == outputType_).
+  for (size_t i = 0; i < totalCols; ++i) {
+    if (!children[i]) {
+      children[i] = dataVector->childAt(i);
+    }
+  }
+
+  return std::make_shared<RowVector>(
+      pool_, outputType_, nullptr, nRows, std::move(children));
+}
+
 void CudfHiveDataSource::resetSplit() {
   split_.reset();
   splitReader_.reset();
@@ -933,14 +995,18 @@ bool CudfHiveDataSource::advanceToNextCoalescedFile() {
   exptFilteredRowGroups_.clear();
   exptNextRGIndex_ = 0;
 
-  // Build a temporary CudfHiveConnectorSplit for this file.
+  // Build a temporary CudfHiveConnectorSplit for this file, preserving
+  // partition keys from the original split.
+  auto savedPartitionKeys = split_->partitionKeys;
   split_ = std::make_shared<CudfHiveConnectorSplit>(
       split_->connectorId,
       fileRange.filePath,
       fileRange.start,
       fileRange.length,
       0,
-      fileRange.infoColumns);
+      fileRange.infoColumns,
+      std::vector<CoalescedFileRange>{},
+      std::move(savedPartitionKeys));
 
   // Try to use the async pre-read pinned buffer (pipelined IO).
   // The future blocks only until THIS file's IO completes — other files'
@@ -1071,25 +1137,26 @@ RowVectorPtr CudfHiveDataSource::flushAccumulated() {
     return nullptr;
   }
 
-  // Keep only outputType_.size() columns
-  if (outputType_->size() < cudfTable->num_columns()) {
+  // Keep only dataOutputType_.size() columns
+  if (dataOutputType_->size() < cudfTable->num_columns()) {
     auto cudfTableColumns = cudfTable->release();
     std::vector<std::unique_ptr<cudf::column>> originalColumns;
-    originalColumns.reserve(outputType_->size());
+    originalColumns.reserve(dataOutputType_->size());
     std::move(
         cudfTableColumns.begin(),
-        cudfTableColumns.begin() + outputType_->size(),
+        cudfTableColumns.begin() + dataOutputType_->size(),
         std::back_inserter(originalColumns));
     cudfTable = std::make_unique<cudf::table>(std::move(originalColumns));
   }
 
   auto output = cudfIsRegistered()
       ? std::make_shared<CudfVector>(
-            pool_, outputType_, nRows, std::move(cudfTable), stream_)
+            pool_, dataOutputType_, nRows, std::move(cudfTable), stream_)
       : with_arrow::toVeloxColumn(
-            cudfTable->view(), pool_, outputType_->names(), stream_);
+            cudfTable->view(), pool_, dataOutputType_->names(), stream_);
 
   VELOX_CHECK_NOT_NULL(output, "Cudf to Velox conversion yielded a nullptr");
+  output = injectPartitionColumns(std::move(output), nRows);
   completedRows_ += output->size();
   return output;
 }
