@@ -42,7 +42,9 @@ set_target_properties(velox_cudf_exec PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_
 
 target_link_libraries(
   velox_cudf_exec
-  PUBLIC cudf::cudf
+  PUBLIC
+    cudf::cudf
+    CURL::libcurl
   PRIVATE
     velox_cudf_kernels
     arrow

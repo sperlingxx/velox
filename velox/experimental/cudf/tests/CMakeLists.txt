@@ -27,6 +27,7 @@ add_executable(velox_cudf_nested_loop_join_test Main.cpp NestedLoopJoinTest.cpp)
 add_executable(velox_cudf_limit_test Main.cpp LimitTest.cpp)
 add_executable(velox_cudf_local_partition_test Main.cpp LocalPartitionTest.cpp)
 add_executable(velox_cudf_order_by_test Main.cpp OrderByTest.cpp)
+add_executable(velox_cudf_window_test Main.cpp WindowTest.cpp)
 if(VELOX_ENABLE_S3)
   add_executable(velox_cudf_s3_read_test Main.cpp S3ReadTest.cpp)
 endif()
@@ -118,6 +119,12 @@ add_test(
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
+add_test(
+  NAME velox_cudf_window_test
+  COMMAND velox_cudf_window_test
+  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
 if(VELOX_ENABLE_S3)
   add_test(
     NAME velox_cudf_s3_read_test
@@ -185,6 +192,7 @@ set_tests_properties(velox_cudf_nested_loop_join_test PROPERTIES LABELS cuda_dri
 set_tests_properties(velox_cudf_limit_test PROPERTIES LABELS cuda_driver TIMEOUT 3000)
 set_tests_properties(velox_cudf_local_partition_test PROPERTIES LABELS cuda_driver TIMEOUT 3000)
 set_tests_properties(velox_cudf_order_by_test PROPERTIES LABELS cuda_driver TIMEOUT 3000)
+set_tests_properties(velox_cudf_window_test PROPERTIES LABELS cuda_driver TIMEOUT 3000)
 if(VELOX_ENABLE_S3)
   set_tests_properties(velox_cudf_s3_read_test PROPERTIES LABELS cuda_driver TIMEOUT 3000)
 endif()
@@ -327,6 +335,18 @@ target_link_libraries(
 
 target_link_libraries(
   velox_cudf_order_by_test
+  velox_cudf_exec
+  velox_cudf_gpu_guard_stub
+  velox_exec
+  velox_exec_test_lib
+  velox_test_util
+  gtest
+  gtest_main
+  fmt::fmt
+)
+
+target_link_libraries(
+  velox_cudf_window_test
   velox_cudf_exec
   velox_cudf_gpu_guard_stub
   velox_exec

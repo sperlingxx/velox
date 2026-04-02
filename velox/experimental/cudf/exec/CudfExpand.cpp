@@ -63,9 +63,8 @@ std::unique_ptr<cudf::scalar> createScalarDispatch(
   } else if constexpr (cudf::is_fixed_width<T>()) {
     if (type->isDate()) {
       using CudfDateType = cudf::timestamp_D;
-      return std::make_unique<
-          cudf::timestamp_scalar<CudfDateType>>(
-          value, true, stream, mr);
+      return std::make_unique<cudf::timestamp_scalar<CudfDateType>>(
+          static_cast<CudfDateType::rep>(value), true, stream, mr);
     }
     return std::make_unique<cudf::numeric_scalar<T>>(
         value, true, stream, mr);

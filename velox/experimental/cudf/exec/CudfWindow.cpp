@@ -15,16 +15,22 @@
  */
 
 #include "velox/experimental/cudf/exec/CudfWindow.h"
+#include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/GpuGuard.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 
 #include <cudf/column/column_factories.hpp>
+#include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/groupby.hpp>
 #include <cudf/reduction.hpp>
+#include <cudf/search.hpp>
+#include <cudf/stream_compaction.hpp>
 #include <cudf/sorting.hpp>
 #include <cudf/unary.hpp>
+
+#include <glog/logging.h>
 
 namespace {
 
@@ -296,10 +302,18 @@ CudfWindow::CudfWindow(
           operatorId,
           fmt::format("[{}]", windowNode->id())),
       windowNode_(windowNode),
-      inputType_(windowNode->sources()[0]->outputType()) {
+      inputType_(windowNode->sources()[0]->outputType()),
+      isFlushByPartition_(
+          windowNode->inputsSorted() &&
+          !windowNode->partitionKeys().empty()) {
+  std::vector<std::string> partitionKeyNames;
+  std::vector<TypePtr> partitionKeyTypes;
+
   // Parse partition key channels.
   partitionKeyChannels_.reserve(
       windowNode->partitionKeys().size());
+  partitionKeyOrders_.reserve(windowNode->partitionKeys().size());
+  partitionKeyNullOrders_.reserve(windowNode->partitionKeys().size());
   for (auto const& key : windowNode->partitionKeys()) {
     auto ch = exec::exprToChannel(key.get(), inputType_);
     VELOX_CHECK_NE(
@@ -308,6 +322,14 @@ CudfWindow::CudfWindow(
         "Window partition key must be a column");
     partitionKeyChannels_.push_back(
         static_cast<cudf::size_type>(ch));
+    partitionKeyOrders_.push_back(cudf::order::ASCENDING);
+    partitionKeyNullOrders_.push_back(cudf::null_order::BEFORE);
+    partitionKeyNames.push_back(fmt::format("pk{}", ch));
+    partitionKeyTypes.push_back(inputType_->childAt(ch));
+  }
+  if (!partitionKeyTypes.empty()) {
+    partitionKeyType_ =
+        facebook::velox::ROW(std::move(partitionKeyNames), std::move(partitionKeyTypes));
   }
 
   // Parse sort key channels and orders.
@@ -375,7 +397,14 @@ void CudfWindow::addInput(RowVectorPtr input) {
   auto cudfInput =
       std::dynamic_pointer_cast<CudfVector>(input);
   VELOX_CHECK_NOT_NULL(cudfInput);
-  inputs_.push_back(std::move(cudfInput));
+
+  GpuGuard gpuGuard;
+  auto stream = cudfGlobalStreamPool().get_stream();
+  cudf::detail::join_streams(
+      std::vector<rmm::cuda_stream_view>{cudfInput->stream()}, stream);
+
+  cacheNextBatch(std::move(cudfInput), stream);
+  refreshFinished();
 }
 
 void CudfWindow::noMoreInput() {
@@ -383,42 +412,283 @@ void CudfWindow::noMoreInput() {
 
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
   GpuGuard gpuGuard;
-
-  if (inputs_.empty()) {
-    return;
-  }
-
   auto stream = cudfGlobalStreamPool().get_stream();
-  auto inputTable =
-      getConcatenatedTable(inputs_, inputType_, stream);
-  inputs_.clear();
-
-  auto outputTable =
-      computeOutputTable(std::move(inputTable), stream);
-  output_ = std::make_shared<CudfVector>(
-      pool(),
-      outputType_,
-      outputTable->num_rows(),
-      std::move(outputTable),
-      stream);
+  if (isFlushByPartition_) {
+    if (!cachedInputs_.empty()) {
+      VLOG(1) << "CudfWindow planNodeId=" << windowNode_->id()
+              << " flushing remaining cached input at noMoreInput: batches="
+              << cachedInputs_.size() << " rows=" << cachedRows_
+              << " bytes=" << cachedBytes_;
+    }
+    cachedRows_ = 0;
+    cachedBytes_ = 0;
+  }
+  flushCachedInput(stream, false);
+  refreshFinished();
 }
 
 RowVectorPtr CudfWindow::getOutput() {
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
-  if (finished_ || !noMoreInput_) {
+  if (outputQueue_.empty()) {
+    refreshFinished();
     return nullptr;
   }
-  finished_ = true;
-  if (!output_ || output_->size() == 0) {
-    return nullptr;
-  }
-  return output_;
+  auto output = outputQueue_.front();
+  outputQueue_.pop_front();
+  refreshFinished();
+  return output;
 }
 
 void CudfWindow::close() {
   exec::Operator::close();
-  inputs_.clear();
-  output_.reset();
+  cachedInputs_.clear();
+  outputQueue_.clear();
+  cachedRows_ = 0;
+  cachedBytes_ = 0;
+  isFinished_ = true;
+}
+
+CudfVectorPtr CudfWindow::materializeTableView(
+    cudf::table_view view,
+    const RowTypePtr& type,
+    rmm::cuda_stream_view stream) const {
+  auto mr = cudf::get_current_device_resource_ref();
+  return wrapOwnedTable(
+      std::make_unique<cudf::table>(view, stream, mr), type, stream);
+}
+
+CudfVectorPtr CudfWindow::wrapOwnedTable(
+    std::unique_ptr<cudf::table> table,
+    const RowTypePtr& type,
+    rmm::cuda_stream_view stream) const {
+  auto size = static_cast<vector_size_t>(table->num_rows());
+  return std::make_shared<CudfVector>(
+      pool(), type, size, std::move(table), stream);
+}
+
+cudf::table_view CudfWindow::extractPartitionKeyRow(
+    cudf::table_view input,
+    cudf::size_type row,
+    rmm::cuda_stream_view stream) const {
+  auto partitionKeys = cudf::table_view(selectColumns(input, partitionKeyChannels_));
+  return cudf::slice(partitionKeys, {row, row + 1}, stream).front();
+}
+
+bool CudfWindow::isSamePartitionKey(
+    cudf::table_view lhs,
+    cudf::table_view rhs,
+    rmm::cuda_stream_view stream) const {
+  auto mr = cudf::get_current_device_resource_ref();
+  std::vector<cudf::table_view> tableViews{lhs, rhs};
+  auto combined = cudf::concatenate(tableViews, stream, mr);
+  return cudf::distinct_count(
+             combined->view(), cudf::null_equality::EQUAL, stream) == 1;
+}
+
+cudf::size_type CudfWindow::trailingPartitionStartRow(
+    cudf::table_view input,
+    rmm::cuda_stream_view stream) const {
+  VELOX_CHECK_GT(input.num_rows(), 0);
+  VELOX_CHECK(
+      !partitionKeyChannels_.empty(),
+      "Trailing partition split requires partition keys");
+
+  auto mr = cudf::get_current_device_resource_ref();
+  auto partitionTable = cudf::table_view(selectColumns(input, partitionKeyChannels_));
+  auto lastKey = extractPartitionKeyRow(input, input.num_rows() - 1, stream);
+  auto lowerBound = cudf::lower_bound(
+      partitionTable,
+      lastKey,
+      partitionKeyOrders_,
+      partitionKeyNullOrders_,
+      stream,
+      mr);
+  VELOX_CHECK_EQ(lowerBound->size(), 1);
+  auto lowerBoundScalar = cudf::get_element(lowerBound->view(), 0, stream, mr);
+  VELOX_CHECK(lowerBoundScalar->is_valid(stream));
+  return static_cast<cudf::numeric_scalar<cudf::size_type>*>(lowerBoundScalar.get())
+      ->value(stream);
+}
+
+bool CudfWindow::batchTargetReached(
+    vector_size_t rows,
+    uint64_t bytes) const {
+  const auto& config = CudfConfig::getInstance();
+  if (config.gpuTargetBatchBytes > 0) {
+    return bytes > static_cast<uint64_t>(config.gpuTargetBatchBytes);
+  }
+  if (config.gpuTargetBatchRows == 0) {
+    return true;
+  }
+  return rows > static_cast<vector_size_t>(config.gpuTargetBatchRows);
+}
+
+void CudfWindow::enqueueOutputTable(
+    std::unique_ptr<cudf::table> outputTable,
+    rmm::cuda_stream_view stream) {
+  if (!outputTable || outputTable->num_rows() == 0) {
+    return;
+  }
+  outputQueue_.push_back(wrapOwnedTable(std::move(outputTable), outputType_, stream));
+}
+
+void CudfWindow::cacheNextBatch(
+    CudfVectorPtr input,
+    rmm::cuda_stream_view stream) {
+  VELOX_CHECK_NOT_NULL(input);
+  cachedInputs_.push_back(std::move(input));
+
+  if (!isFlushByPartition_) {
+    return;
+  }
+
+  cachedRows_ += cachedInputs_.back()->size();
+  cachedBytes_ += cachedInputs_.back()->estimateFlatSize();
+  if (batchTargetReached(cachedRows_, cachedBytes_)) {
+    const auto& config = CudfConfig::getInstance();
+    VLOG(1) << "CudfWindow planNodeId=" << windowNode_->id()
+            << " triggering partition-aware flush attempt: batches="
+            << cachedInputs_.size() << " rows=" << cachedRows_
+            << " bytes=" << cachedBytes_
+            << " targetRows=" << config.gpuTargetBatchRows
+            << " targetBytes=" << config.gpuTargetBatchBytes;
+    flushCachedInput(stream, true);
+  }
+}
+
+void CudfWindow::flushCachedInput(
+    rmm::cuda_stream_view stream,
+    bool isPartitionAware) {
+  if (cachedInputs_.empty()) {
+    return;
+  }
+
+  auto cachedInputs = std::move(cachedInputs_);
+  cachedInputs_.clear();
+  cachedRows_ = 0;
+  cachedBytes_ = 0;
+
+  std::vector<CudfVectorPtr> nextCachedInputs;
+  auto inputTable = isPartitionAware
+      ? preparePartitionAwareFlush(
+            std::move(cachedInputs), stream, nextCachedInputs)
+      : getConcatenatedTable(cachedInputs, inputType_, stream);
+  cachedInputs.clear();
+
+  if (inputTable && inputTable->num_rows() > 0) {
+    auto outputTable = computeOutputTable(std::move(inputTable), stream);
+    enqueueOutputTable(std::move(outputTable), stream);
+  }
+
+  for (auto& cachedInput : nextCachedInputs) {
+    cachedRows_ += cachedInput->size();
+    cachedBytes_ += cachedInput->estimateFlatSize();
+    cachedInputs_.push_back(std::move(cachedInput));
+  }
+}
+
+std::unique_ptr<cudf::table> CudfWindow::preparePartitionAwareFlush(
+    std::vector<CudfVectorPtr> cachedInputs,
+    rmm::cuda_stream_view stream,
+    std::vector<CudfVectorPtr>& nextCachedInputs) {
+  // Start from the optimistic assumption that everything except the last cached
+  // batch is flushable. The primary goal is to keep this flush close to the
+  // batch-size threshold that triggered in cacheNextBatch(). Once batch-size
+  // control forces a split, we also have to verify that the split point does
+  // not land in the middle of a partition.
+  auto mr = cudf::get_current_device_resource_ref();
+  auto splitTrailingPartition =
+      [&](std::unique_ptr<cudf::table> inputTable) -> std::unique_ptr<cudf::table> {
+    auto processView = inputTable->view();
+    auto trailingStart = trailingPartitionStartRow(processView, stream);
+    if (trailingStart == 0) {
+      // The whole flush candidate belongs to that trailing partition, so keep it
+      // all cached and emit nothing this round.
+      VLOG(1) << "CudfWindow planNodeId=" << windowNode_->id()
+              << " deferring flush because the current candidate belongs to a "
+                 "single trailing partition: rows="
+              << processView.num_rows() << " batches="
+              << cachedInputs.size() << " heldBackTailBatches="
+              << nextCachedInputs.size();
+      nextCachedInputs.insert(
+          nextCachedInputs.begin(),
+          wrapOwnedTable(std::move(inputTable), inputType_, stream));
+      return nullptr;
+    }
+
+    // Split the candidate into a flushable prefix and a trailing partition tail.
+    auto slices = cudf::split(processView, {trailingStart}, stream);
+    auto processSlice = slices[0];
+    auto trailingSlice = slices[1];
+    VLOG(1) << "CudfWindow planNodeId=" << windowNode_->id()
+            << " splitting partition-aware flush candidate at row "
+            << trailingStart << ": flushRows=" << processSlice.num_rows()
+            << " cachedTailRows=" << trailingSlice.num_rows();
+    auto trailingInput =
+        materializeTableView(trailingSlice, inputType_, stream);
+    nextCachedInputs.insert(nextCachedInputs.begin(), std::move(trailingInput));
+    auto outputTable = std::make_unique<cudf::table>(processSlice, stream, mr);
+    inputTable.reset();
+    return outputTable;
+  };
+
+  std::vector<CudfVectorPtr> processInputs;
+  if (cachedInputs.size() == 1) {
+    // With only one cached batch, we still need to honor partition integrity.
+    // If this batch contains only one partition, keep pulling more input until
+    // a partition boundary shows up, even if that means going past the nominal
+    // batch-size threshold.
+    processInputs = std::move(cachedInputs);
+  } else {
+    auto lastInput = std::move(cachedInputs.back());
+    cachedInputs.pop_back();
+    processInputs = std::move(cachedInputs);
+    nextCachedInputs.push_back(std::move(lastInput));
+  }
+
+  auto inputTable = getConcatenatedTable(processInputs, inputType_, stream);
+  processInputs.clear();
+  if (inputTable->num_rows() == 0) {
+    return nullptr;
+  }
+
+  if (nextCachedInputs.empty()) {
+    if (noMoreInput_) {
+      return inputTable;
+    }
+
+    // No tail batch has been held back yet, but the current candidate may still
+    // end in the middle of a partition and need to keep that trailing partition cached.
+    return splitTrailingPartition(std::move(inputTable));
+  }
+
+  auto processView = inputTable->view();
+  // Batch-size control picked a tentative flush boundary. Compare the last
+  // partition key in that flush candidate with the first key in the still-
+  // cached tail. If they differ, the batch-size split already lands on a
+  // partition boundary and the whole candidate table is safe to emit.
+  // The cached tail may have been produced on a different stream.
+  cudf::detail::join_streams(
+      std::vector<rmm::cuda_stream_view>{nextCachedInputs.front()->stream()},
+      stream);
+  auto lastProcessKey = extractPartitionKeyRow(
+      processView, processView.num_rows() - 1, stream);
+  auto firstCachedKey =
+      extractPartitionKeyRow(nextCachedInputs.front()->getTableView(), 0, stream);
+
+  if (!isSamePartitionKey(lastProcessKey, firstCachedKey, stream)) {
+    return inputTable;
+  }
+
+  // Batch-size control landed in the middle of a partition. Peel that trailing
+  // partition back out so the next flush still computes the full partition in
+  // one shot.
+  return splitTrailingPartition(std::move(inputTable));
+}
+
+void CudfWindow::refreshFinished() {
+  isFinished_ =
+      noMoreInput_ && outputQueue_.empty() && cachedInputs_.empty();
 }
 
 std::unique_ptr<cudf::rolling_aggregation>
@@ -715,6 +985,9 @@ std::unique_ptr<cudf::table> CudfWindow::computeOutputTable(
     resultCols.push_back(std::move(col));
   }
 
+  // The result columns no longer depend on the temporary sorted table.
+  sortedTable.reset();
+
   // Scatter results back to original order if we sorted.
   if (sortedOrder) {
     for (auto& col : resultCols) {
@@ -732,6 +1005,7 @@ std::unique_ptr<cudf::table> CudfWindow::computeOutputTable(
           mr);
       col = std::move(scattered->release()[0]);
     }
+    sortedOrder.reset();
   }
 
   // Assemble output: all input columns + result columns.

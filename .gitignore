@@ -320,6 +320,9 @@ src/amalgamation/
 .settings
 ~
 
+# clangd in IDE
+.clangd
+
 #docs
 velox/docs/sphinx/source/README_generated_*
 velox/docs/bindings/python/_generate/*
