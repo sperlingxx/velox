@@ -199,7 +199,7 @@ class CudfHashAggregation : public exec::Operator, public NvtxHelper {
   // partialBypassMode_ is sticky: once set, the operator stays in bypass
   // for the rest of its lifetime (no transition back to compacting mode).
   bool partialBypassMode_{false};
-  int64_t partialCumulativeSmallRows_{0};
+  int64_t partialCumulativeInputRows_{0};
 };
 
 // Step-aware aggregation function registry

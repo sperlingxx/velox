@@ -1124,7 +1124,7 @@ void CudfHashAggregation::computePartialGroupbyStreaming(CudfVectorPtr tbl) {
         bufferedResultType_,
         partialOutputStream);
     bufferedResult_ = compactedOutput;
-    partialCumulativeSmallRows_ += groupbyOnInput->size();
+    partialCumulativeInputRows_ += groupbyOnInput->size();
 
     // Convergence detection: after each cross-batch merge, check whether
     // bufferedResult_ is compacting relative to cumulative small input.
@@ -1134,15 +1134,18 @@ void CudfHashAggregation::computePartialGroupbyStreaming(CudfVectorPtr tbl) {
     if (!partialBypassMode_) {
       static constexpr double kPartialBypassThreshold = 0.75;
       const int64_t bufRows = bufferedResult_->size();
-      const double ratio = partialCumulativeSmallRows_ > 0
+      const double ratio = partialCumulativeInputRows_ > 0
           ? static_cast<double>(bufRows) /
-              static_cast<double>(partialCumulativeSmallRows_)
+              static_cast<double>(partialCumulativeInputRows_)
           : 0.0;
       if (ratio > kPartialBypassThreshold) {
-        LOG(WARNING) << "STREAM_PARTIAL[" << planNodeId()
-                     << "] partial bypass mode triggered: ratio="
-                     << ratio << " buf_rows=" << bufRows
-                     << " cum_small=" << partialCumulativeSmallRows_;
+        // Fires at most once per operator lifetime (partialBypassMode_ is
+        // sticky), but kept at LOG(INFO) so the transition is visible in
+        // production logs -- it's a one-shot state-change event, not noise.
+        LOG(INFO) << "STREAM_PARTIAL[" << planNodeId()
+                  << "] partial bypass mode triggered: ratio="
+                  << ratio << " buf_rows=" << bufRows
+                  << " cum_input=" << partialCumulativeInputRows_;
         partialBypassMode_ = true;
       }
     }
@@ -1150,7 +1153,7 @@ void CudfHashAggregation::computePartialGroupbyStreaming(CudfVectorPtr tbl) {
     // First time processing, just store the result of the input batch's groupby
     // This means we're storing the stream from the first batch.
     bufferedResult_ = groupbyOnInput;
-    partialCumulativeSmallRows_ += groupbyOnInput->size();
+    partialCumulativeInputRows_ += groupbyOnInput->size();
   }
 }
 
