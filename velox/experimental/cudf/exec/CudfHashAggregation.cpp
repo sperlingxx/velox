@@ -828,6 +828,14 @@ bool hasCompanionAggregates(
   });
 }
 
+bool hasNonPartialCompanionAggregates(
+    std::vector<core::AggregationNode::Aggregate> const& aggregates) {
+  return std::any_of(aggregates.begin(), aggregates.end(), [](auto const& agg) {
+    const auto& name = agg.call->name();
+    return isCompanionAggregateName(name) && !name.ends_with("_partial");
+  });
+}
+
 struct AggregationInputChannels {
   std::vector<column_index_t> channels;
   std::vector<VectorPtr> constants;
@@ -886,7 +894,8 @@ auto toAggregators(
     core::AggregationNode const& aggregationNode,
     core::AggregationNode::Step step,
     TypePtr const& outputType,
-    std::vector<VectorPtr> const& constants) {
+    std::vector<VectorPtr> const& constants,
+    bool useRequestedStepForCompanions = false) {
   bool const isGlobal = aggregationNode.groupingKeys().empty();
   const auto numKeys = aggregationNode.groupingKeys().size();
 
@@ -900,13 +909,20 @@ auto toAggregators(
     auto const inputIndex = numKeys + i;
     auto const kind = aggregate.call->name();
     auto const constant = constants[i];
-    auto const companionStep = getCompanionStep(kind, step);
+    auto const companionStep =
+        useRequestedStepForCompanions ? step : getCompanionStep(kind, step);
+    const auto originalName = getOriginalName(kind);
     const auto resultType = exec::isPartialOutput(companionStep)
         ? companionAwareIntermediateType(aggregate)
         : outputType->childAt(numKeys + i);
 
     aggregators.push_back(createAggregator(
-        companionStep, kind, inputIndex, constant, isGlobal, resultType));
+        companionStep,
+        useRequestedStepForCompanions ? originalName : kind,
+        inputIndex,
+        constant,
+        isGlobal,
+        resultType));
   }
   return aggregators;
 }
@@ -992,22 +1008,21 @@ void CudfHashAggregation::initialize() {
       aggregationNode_->step(),
       outputType_,
       aggregationInput.constants);
-  // The hasCompanionAggregates guard (PR #16488) kept streaming on
-  // Presto-style plans only (bare function names like "avg"). With the
-  // slot-aware getCompanionStep above, _merge_extract companions can
-  // correctly participate in the 4-slot streaming pipeline, so the
-  // guard is no longer needed; removing it lets MPP single-task plans
-  // (which always use companion names) avoid the 2^31 column-size
-  // limit on high-cardinality final aggregations.
-  streamingEnabled_ = !isGlobal_;
+  const bool hasCompanions =
+      hasCompanionAggregates(aggregationNode_->aggregates());
+  const bool canStreamPartialCompanions =
+      aggregationNode_->step() == core::AggregationNode::Step::kPartial &&
+      hasCompanions &&
+      !hasNonPartialCompanionAggregates(aggregationNode_->aggregates());
+  streamingEnabled_ =
+      (!hasCompanions || canStreamPartialCompanions) && !isGlobal_;
 
-  // Experimental override: env var CUDF_DISABLE_AGG_STREAMING=1 forces the
-  // non-streaming (inputs_-accumulate then final concat) path. Limited to
-  // kSingle step only -- a global disable would also block PARTIAL stages,
-  // and PARTIAL's bufferedResult_ flush mechanism is what keeps high-card
-  // groupby (Q17 lineitem) under cuDF's 2^31 column-size limit. PARTIAL
-  // streaming must stay on so that the upstream stage's row count is
-  // bounded before reaching kSingle's inputs_ accumulation.
+  // Diagnostic override (retained from local pre-merge work, vestigial under
+  // the gating above but kept as a force-off hook): CUDF_DISABLE_AGG_STREAMING=1
+  // forces the non-streaming (inputs_-accumulate then final concat) path for
+  // kSingle only. A global disable would also block PARTIAL stages; PARTIAL's
+  // bufferedResult_ flush mechanism is what keeps high-cardinality groupby
+  // (e.g. Q17 lineitem) under cuDF's 2^31 column-size limit.
   if (isSingleStep_) {
     if (const char* disable = std::getenv("CUDF_DISABLE_AGG_STREAMING")) {
       if (std::string_view(disable) == "1") {
@@ -1016,10 +1031,9 @@ void CudfHashAggregation::initialize() {
     }
   }
 
-  // EXPERIMENTAL: when CUDF_RESTORE_COMPANION_NONSTREAMING=1, force
-  // non-streaming for *every* groupby aggregation operator. Tightest possible
-  // test to isolate whether the Q8/Q9 regression is in the streaming path
-  // itself or somewhere else in the binary.
+  // Diagnostic override (retained from local pre-merge work): when
+  // CUDF_RESTORE_COMPANION_NONSTREAMING=1, force non-streaming for every
+  // groupby aggregation operator. Used during Q8/Q9 regression isolation.
   if (const char* restore = std::getenv("CUDF_RESTORE_COMPANION_NONSTREAMING")) {
     if (std::string_view(restore) == "1") {
       LOG(WARNING) << "AGG_INIT[" << planNodeId()
@@ -1045,7 +1059,8 @@ void CudfHashAggregation::initialize() {
         *aggregationNode_,
         core::AggregationNode::Step::kIntermediate,
         bufferedResultType_,
-        nullConstants);
+        nullConstants,
+        canStreamPartialCompanions);
 
     if (isSingleStep_) {
       partialAggregators_ = toAggregators(
