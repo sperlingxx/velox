@@ -735,16 +735,6 @@ core::AggregationNode::Step getCompanionStep(
   // as raw values, triggering cuDF "Invalid type/aggregation combination"
   // at groupby.cu.
   if (kind.ends_with("_partial")) {
-    // EXPERIMENTAL: env var CUDF_PARTIAL_COMPANION_LEGACY_STEP=1 reverts the
-    // slot-aware logic introduced by c65bd2c8f and returns kPartial
-    // unconditionally (the pre-c65bd2c8f / 5/11 behavior). Used to isolate
-    // whether c65bd2c8f is the root cause of the Q8/Q9 regression.
-    if (const char* legacy =
-            std::getenv("CUDF_PARTIAL_COMPANION_LEGACY_STEP")) {
-      if (std::string_view(legacy) == "1") {
-        return core::AggregationNode::Step::kPartial;
-      }
-    }
     if (step == core::AggregationNode::Step::kPartial) {
       return core::AggregationNode::Step::kPartial;
     }
@@ -1016,33 +1006,6 @@ void CudfHashAggregation::initialize() {
       !hasNonPartialCompanionAggregates(aggregationNode_->aggregates());
   streamingEnabled_ =
       (!hasCompanions || canStreamPartialCompanions) && !isGlobal_;
-
-  // Diagnostic override (retained from local pre-merge work, vestigial under
-  // the gating above but kept as a force-off hook): CUDF_DISABLE_AGG_STREAMING=1
-  // forces the non-streaming (inputs_-accumulate then final concat) path for
-  // kSingle only. A global disable would also block PARTIAL stages; PARTIAL's
-  // bufferedResult_ flush mechanism is what keeps high-cardinality groupby
-  // (e.g. Q17 lineitem) under cuDF's 2^31 column-size limit.
-  if (isSingleStep_) {
-    if (const char* disable = std::getenv("CUDF_DISABLE_AGG_STREAMING")) {
-      if (std::string_view(disable) == "1") {
-        streamingEnabled_ = false;
-      }
-    }
-  }
-
-  // Diagnostic override (retained from local pre-merge work): when
-  // CUDF_RESTORE_COMPANION_NONSTREAMING=1, force non-streaming for every
-  // groupby aggregation operator. Used during Q8/Q9 regression isolation.
-  if (const char* restore = std::getenv("CUDF_RESTORE_COMPANION_NONSTREAMING")) {
-    if (std::string_view(restore) == "1") {
-      LOG(WARNING) << "AGG_INIT[" << planNodeId()
-                   << "] CUDF_RESTORE_COMPANION_NONSTREAMING=1 set; "
-                   << "forcing non-streaming (was " << streamingEnabled_ << ")";
-      streamingEnabled_ = false;
-    }
-  }
-
 
   // Make aggregators for intermediate step when streaming is enabled.
   // Distinct does not need any aggregators.
