@@ -273,6 +273,13 @@ void CudfLocalPartition::addInput(RowVectorPtr input) {
     auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input);
     const uint64_t bytes =
         cudfInput ? cudfInput->estimateFlatSize() : input->retainedSize();
+    // Diagnostic: count enqueue on the single-partition pass-through path
+    // too, so LP_SUMMARY's enqueueCount/enqueueRows include both fan-out
+    // and pass-through topologies. cudfVector is the validated downcast
+    // from addInput's top, so size() here matches the actual enqueued
+    // payload rather than input->size() of the unchecked upstream type.
+    ++lpEnqueueCount_;
+    lpEnqueueRows_ += cudfVector->size();
     auto blockingReason = queues_[0]->enqueue(input, bytes, &future);
     if (blockingReason != exec::BlockingReason::kNotBlocked) {
       blockingReasons_.push_back(blockingReason);

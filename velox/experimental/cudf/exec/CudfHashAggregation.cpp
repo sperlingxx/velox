@@ -1098,6 +1098,15 @@ void CudfHashAggregation::computePartialGroupbyStreaming(CudfVectorPtr tbl) {
       bufferedResultType_,
       inputTableStream);
 
+  // doGroupByAggregation returns nullptr when the input batch produces no
+  // output groups (for example all-null grouping keys with ignoreNullKeys_
+  // active). Skip the merge / state-update so we don't deref nullptr in
+  // the bufferedResult_ branch's getTableView() or in the first-time
+  // branch's size() accounting below.
+  if (!groupbyOnInput) {
+    return;
+  }
+
   // If we already have partial output, concatenate the new results with it.
   if (bufferedResult_) {
     // Create a vector of tables to concatenate
@@ -1420,6 +1429,13 @@ CudfVectorPtr CudfHashAggregation::releaseAndResetPartialOutput() {
   }
 
   numInputRows_ = 0;
+  // Reset cumulative input-row counter so the post-flush bypass-trigger
+  // ratio compares bufferedResult_ against rows newly accumulated AFTER
+  // the flush, not against the (now-released) pre-flush input total.
+  // Without this reset, a memory-limit flush that fires before bypass has
+  // triggered can leave the ratio permanently low and suppress later
+  // bypass detection on subsequent high-cardinality batches.
+  partialCumulativeInputRows_ = 0;
   return std::exchange(bufferedResult_, nullptr);
 }
 
@@ -1429,9 +1445,14 @@ RowVectorPtr CudfHashAggregation::getOutput() {
   // Handle partial groupby and distinct.
   if (isPartialOutput_ && !isGlobal_ && streamingEnabled_) {
     // In bypass mode, flush bufferedResult_ every getOutput regardless of
-    // size. Combined with computePartialGroupbyStreaming's bypass branch,
-    // this means each addInput's pre-aggregated output is emitted directly
-    // to the downstream stage without further cross-batch merging.
+    // size, instead of waiting for the maxPartialAggregationMemoryUsage_
+    // threshold. computePartialGroupbyStreaming itself still does the
+    // cross-batch concat + intermediate-aggregator merge each addInput
+    // (there is no skip-merge branch keyed on partialBypassMode_), so the
+    // bypass saves only the flush-latency / late-emit memory; the
+    // per-batch merge CPU/GPU cost is still paid, which preserves
+    // semantic correctness vs. emitting raw doGroupByAggregation output.
+    // See partialBypassMode_ trigger in computePartialGroupbyStreaming.
     const bool bypassFlush = partialBypassMode_ && bufferedResult_;
     if (bypassFlush ||
         (bufferedResult_ &&
