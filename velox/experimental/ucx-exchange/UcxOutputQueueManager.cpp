@@ -145,6 +145,11 @@ bool UcxOutputQueueManager::canUseIntraNode(const std::string& taskId) {
       queue->kind() != core::PartitionedOutputNode::Kind::kBroadcast;
 }
 
+bool UcxOutputQueueManager::hostStagingEnabled(const std::string& taskId) {
+  auto queue = getQueueIfExists(taskId);
+  return queue && queue->hostStagingEnabled();
+}
+
 void UcxOutputQueueManager::removeTask(const std::string& taskId) {
   auto queue =
       queues_.withLock([&](auto& queues) -> std::shared_ptr<UcxOutputQueue> {

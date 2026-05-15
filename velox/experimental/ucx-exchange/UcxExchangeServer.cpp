@@ -16,6 +16,7 @@
 #include "velox/experimental/ucx-exchange/UcxExchangeServer.h"
 #include <glog/logging.h>
 #include <rmm/cuda_stream_view.hpp>
+#include <vector>
 #include "cuda_runtime.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/ucx-exchange/Communicator.h"
@@ -23,6 +24,8 @@
 #include "velox/experimental/ucx-exchange/UcxExchangeProtocol.h"
 
 namespace facebook::velox::ucx_exchange {
+
+namespace {
 
 // Context wrappers for UCXX tagSend callbackData. These decouple the
 // ucxx::Request lifetime (which must survive for UCP wireup replay) from
@@ -39,7 +42,34 @@ struct MetaSendContext {
 
 struct DataSendContext {
   std::shared_ptr<cudf::packed_columns> data;
+  std::shared_ptr<std::vector<uint8_t>> hostData;
 };
+
+std::shared_ptr<std::vector<uint8_t>> stageDeviceBufferToHost(
+    const cudf::packed_columns& data,
+    const PartitionKey& partitionKey) {
+  VELOX_CHECK_NOT_NULL(data.gpu_data);
+
+  auto hostData = std::make_shared<std::vector<uint8_t>>(data.gpu_data->size());
+  if (hostData->empty()) {
+    return hostData;
+  }
+
+  auto status = cudaMemcpy(
+      hostData->data(),
+      data.gpu_data->data(),
+      hostData->size(),
+      cudaMemcpyDeviceToHost);
+  VELOX_CHECK(
+      status == cudaSuccess,
+      "Failed to stage UCX exchange payload from device to host for task {}: {}",
+      partitionKey.toString(),
+      cudaGetErrorString(status));
+
+  return hostData;
+}
+
+} // namespace
 
 void UcxExchangeServer::setState(ServerState newState) {
   auto oldState = state_.exchange(newState, std::memory_order_seq_cst);
@@ -287,6 +317,9 @@ void UcxExchangeServer::sendData() {
   } else {
     // REMOTE EXCHANGE PATH: Use UCXX for metadata and data transfer
     std::shared_ptr<MetadataMsg> metadataMsg = std::make_shared<MetadataMsg>();
+    std::shared_ptr<DataSendContext> dataCtx;
+    const bool hostStaging =
+        queueMgr_->hostStagingEnabled(partitionKey_.taskId);
 
     if (dataPtr_) {
       // Copy metadata (not move) because in broadcast mode, the same
@@ -297,6 +330,16 @@ void UcxExchangeServer::sendData() {
       metadataMsg->dataSizeBytes = dataPtr_->gpu_data->size();
       metadataMsg->remainingBytes = {};
       metadataMsg->atEnd = false;
+      metadataMsg->hostStaging = hostStaging;
+
+      dataCtx = std::make_shared<DataSendContext>();
+      dataCtx->data = dataPtr_;
+      if (hostStaging) {
+        // UCX deployments are not guaranteed to have CUDA-aware transports
+        // enabled. Stage remote payloads through host memory so TCP/self/shm
+        // transports never try to CPU-memcpy directly from device memory.
+        dataCtx->hostData = stageDeviceBufferToHost(*dataPtr_, partitionKey_);
+      }
     } else {
       VLOG(3) << "@" << partitionKey_.taskId << " Final exchange for "
               << partitionKey_.toString();
@@ -383,29 +426,37 @@ void UcxExchangeServer::sendData() {
         completedRequests_.push_back(std::move(dataRequest_));
       }
 
-      // Wrap the GPU data buffer in a context so the callback can release
-      // it after the DMA completes, while the Request (and context shell)
-      // stays alive for UCP wireup replay.
-      auto dataCtx = std::make_shared<DataSendContext>();
-      dataCtx->data = dataPtr_;
-
+      void* sendBuffer = nullptr;
+      size_t sendSize = 0;
+      if (hostStaging) {
+        sendBuffer = dataCtx->hostData->data();
+        sendSize = dataCtx->hostData->size();
+      } else {
+        sendBuffer = dataCtx->data->gpu_data->data();
+        sendSize = dataCtx->data->gpu_data->size();
+      }
       dataRequest_ = endpointRef_->endpoint_->tagSend(
-          dataCtx->data->gpu_data->data(),
-          dataCtx->data->gpu_data->size(),
+          sendBuffer,
+          sendSize,
           ucxx::Tag{dataTag},
           false,
-          [weakData](ucs_status_t status, std::shared_ptr<void> arg) {
-            // Release the GPU data buffer from the context. The DMA has
-            // completed by the time this callback fires, so the buffer is
-            // safe to free. The context shell stays alive with the Request.
+          [weakData, hostStaging](
+              ucs_status_t status, std::shared_ptr<void> arg) {
+            // Release buffers from the context. The UCX send has completed by
+            // the time this callback fires, so the buffers are safe to free.
+            // The context shell stays alive with the Request.
             auto ctx = std::static_pointer_cast<DataSendContext>(arg);
             auto dataHolder = std::move(ctx->data);
+            std::shared_ptr<std::vector<uint8_t>> hostDataHolder;
+            if (hostStaging) {
+              hostDataHolder = std::move(ctx->hostData);
+            }
 
             if (auto self = weakData.lock()) {
               self->sendComplete(status, arg);
             }
-            // dataHolder is destroyed here, releasing the GPU buffer if
-            // sendComplete() already reset the server's dataPtr_.
+            // Holders are destroyed here, releasing buffers if sendComplete()
+            // already reset the server's dataPtr_.
           },
           dataCtx);
     } else {

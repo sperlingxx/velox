@@ -479,7 +479,25 @@ void UcxExchangeSource::onMetadata(
       return;
     }
 
-    // REMOTE EXCHANGE PATH: Allocate buffer and receive via UCXX
+    if (ptr->metadata.dataSizeBytes < 0) {
+      std::string errorMsg = fmt::format(
+          "Invalid negative UCX exchange payload size {} from host {}:{}, task {}",
+          ptr->metadata.dataSizeBytes,
+          host_,
+          port_,
+          partitionKey_.toString());
+      VLOG(0) << toString() << " " << errorMsg;
+      queue_->setError(errorMsg);
+      deliverEndMarker();
+      setState(ReceiverState::Done);
+      communicator_->addToWorkQueue(getSelfPtr());
+      return;
+    }
+    const auto dataSize = static_cast<size_t>(ptr->metadata.dataSizeBytes);
+    ptr->hostStaging = ptr->metadata.hostStaging;
+
+    // REMOTE EXCHANGE PATH: optionally receive UCXX data into host memory, then
+    // copy it to device memory before unpacking.
     // Get a stream from the global stream pool
     auto stream =
         facebook::velox::cudf_velox::cudfGlobalStreamPool().get_stream();
@@ -487,12 +505,20 @@ void UcxExchangeSource::onMetadata(
     // in onData() when creating the PackedTableWithStream.
     ptr->stream = stream;
     try {
-      ptr->dataBuf = std::make_unique<rmm::device_buffer>(
-          ptr->metadata.dataSizeBytes, stream);
-    } catch (const rmm::bad_alloc& e) {
-      VLOG(0) << toString() << " *** RMM  failed to allocate: " << e.what();
-      queue_->setError("Failed to alloc GPU memory"); // Let the operator know
-                                                      // via the queue
+      ptr->dataBuf = std::make_unique<rmm::device_buffer>(dataSize, stream);
+      if (ptr->hostStaging) {
+        ptr->hostData = std::make_shared<std::vector<uint8_t>>(dataSize);
+      }
+    } catch (const std::exception& e) {
+      std::string errorMsg = fmt::format(
+          "Failed to allocate UCX exchange receive buffers for host {}:{}, task {}, size {}: {}",
+          host_,
+          port_,
+          partitionKey_.toString(),
+          dataSize,
+          e.what());
+      VLOG(0) << toString() << " " << errorMsg;
+      queue_->setError(errorMsg);
       deliverEndMarker();
       setState(ReceiverState::Done);
       communicator_->addToWorkQueue(getSelfPtr());
@@ -505,7 +531,7 @@ void UcxExchangeSource::onMetadata(
     VLOG(3) << toString() << " Allocated " << ptr->metadata.dataSizeBytes
             << " bytes of device memory";
 
-    // Initiate the transfer of the actual data from GPU-2-GPU
+    // Initiate the payload transfer.
     uint64_t dataTag = getDataTag(partitionKeyHash_, sequenceNumber_);
     VLOG(3) << toString() << " waiting for data for chunk: " << sequenceNumber_
             << " using tag: " << std::hex << dataTag << std::dec;
@@ -521,9 +547,17 @@ void UcxExchangeSource::onMetadata(
     if (request_) {
       completedRequests_.push_back(std::move(request_));
     }
+    void* recvBuffer = nullptr;
+    size_t recvSize = dataSize;
+    if (ptr->hostStaging) {
+      recvBuffer = ptr->hostData->data();
+      recvSize = ptr->hostData->size();
+    } else {
+      recvBuffer = ptr->dataBuf->data();
+    }
     request_ = endpointRef_->endpoint_->tagRecv(
-        ptr->dataBuf->data(),
-        ptr->metadata.dataSizeBytes,
+        recvBuffer,
+        recvSize,
         ucxx::Tag{dataTag},
         ucxx::TagMaskFull,
         false,
@@ -574,6 +608,35 @@ void UcxExchangeSource::onData(ucs_status_t status, std::shared_ptr<void> arg) {
 
     metrics_.numPackedColumns_.addValue(1);
     metrics_.totalBytes_.addValue(ptr->metadata.dataSizeBytes);
+
+    const auto dataSize = static_cast<size_t>(ptr->metadata.dataSizeBytes);
+    if (ptr->hostStaging && dataSize > 0) {
+      VELOX_CHECK_NOT_NULL(ptr->hostData);
+      auto copyStatus = cudaMemcpyAsync(
+          ptr->dataBuf->data(),
+          ptr->hostData->data(),
+          dataSize,
+          cudaMemcpyHostToDevice,
+          ptr->stream.value());
+      if (copyStatus == cudaSuccess) {
+        copyStatus = cudaStreamSynchronize(ptr->stream.value());
+      }
+      if (copyStatus != cudaSuccess) {
+        std::string errorMsg = fmt::format(
+            "Failed to stage UCX exchange payload from host to device for host {}:{}, task {}: {}",
+            host_,
+            port_,
+            partitionKey_.toString(),
+            cudaGetErrorString(copyStatus));
+        VLOG(0) << toString() << " " << errorMsg;
+        queue_->setError(errorMsg);
+        deliverEndMarker();
+        setState(ReceiverState::Done);
+        communicator_->addToWorkQueue(getSelfPtr());
+        return;
+      }
+    }
+    ptr->hostData.reset();
 
     // Create packed_columns from the received metadata and data buffer
     cudf::packed_columns packedCols(

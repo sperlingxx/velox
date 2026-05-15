@@ -57,6 +57,9 @@ struct CudfConfig {
   static constexpr const char* kUcxxErrorHandling{"ucxx.error_handling"};
   static constexpr const char* kUcxIntraNodeExchange{
       "cudf.intra_node_exchange"};
+  static constexpr const char* kUcxExchangeHostStaging{
+      "cudf.exchange.host_staging"};
+  static constexpr const char* kUcxExchangeHostStagingDefault{"false"};
   static constexpr const char* kUcxxBlockingPolling{"ucxx.blocking_polling"};
   static constexpr const char* kUcxExchangeLogLevel{"cudf.exchange_log_level"};
 
@@ -146,6 +149,10 @@ struct CudfConfig {
   /// Whether intra-node exchange optimization is enabled.
   /// When disabled, all transfers use UCXX even within the same node.
   bool intraNodeExchange{false};
+
+  /// Whether remote UCX exchange payloads should stage GPU data through host
+  /// memory. Enable this when UCX lacks CUDA-aware transports.
+  bool exchangeHostStaging{false};
 
   /// Whether to use blocking polling in UCXX.
   bool ucxxBlockingPolling{true};

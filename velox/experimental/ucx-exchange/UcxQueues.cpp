@@ -17,7 +17,22 @@
 
 #include <atomic>
 
+#include "velox/experimental/cudf/CudfConfig.h"
+
 namespace facebook::velox::ucx_exchange {
+
+namespace {
+
+bool ucxExchangeHostStagingEnabled(const std::shared_ptr<exec::Task>& task) {
+  if (!task) {
+    return cudf_velox::CudfConfig::getInstance().exchangeHostStaging;
+  }
+  return task->queryCtx()->queryConfig().get<bool>(
+      cudf_velox::CudfConfig::kUcxExchangeHostStaging,
+      cudf_velox::CudfConfig::getInstance().exchangeHostStaging);
+}
+
+} // namespace
 
 void UcxDestinationQueue::Stats::recordEnqueue(
     const cudf::packed_columns* data) {
@@ -147,6 +162,7 @@ UcxOutputQueue::UcxOutputQueue(
   if (task_) {
     maxSize_ = task_->queryCtx()->queryConfig().maxOutputBufferSize();
     continueSize_ = (maxSize_ * kContinuePct) / 100;
+    hostStagingEnabled_ = ucxExchangeHostStagingEnabled(task_);
   } // else: maxSize_ and continueSize_ will be set once the task is created and
     // initialize called.
   // create a queue for each destination.
@@ -169,6 +185,7 @@ bool UcxOutputQueue::initialize(
   }
   kind_ = kind;
   numDrivers_ = numDrivers;
+  hostStagingEnabled_ = ucxExchangeHostStagingEnabled(task);
   // Release fence: ensure kind_ and numDrivers_ are visible before task_
   // is published. Concurrent lock-free readers (e.g. isBroadcast() via
   // kind()) use task_ != nullptr as the "initialized" signal, so kind_
@@ -183,6 +200,11 @@ bool UcxOutputQueue::initialize(
     queues_.emplace_back(std::make_unique<UcxDestinationQueue>());
   }
   return true;
+}
+
+bool UcxOutputQueue::hostStagingEnabled() {
+  std::lock_guard<std::mutex> l(mutex_);
+  return hostStagingEnabled_;
 }
 
 void UcxOutputQueue::updateNumDrivers(uint32_t newNumDrivers) {

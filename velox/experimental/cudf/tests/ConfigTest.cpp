@@ -27,9 +27,11 @@ TEST(ConfigTest, CudfConfig) {
       {CudfConfig::kCudfMemoryResource, "arena"},
       {CudfConfig::kCudfMemoryPercent, "25"},
       {CudfConfig::kCudfFunctionNamePrefix, "presto"},
-      {CudfConfig::kCudfAllowCpuFallback, "false"}};
+      {CudfConfig::kCudfAllowCpuFallback, "false"},
+      {CudfConfig::kUcxExchangeHostStaging, "true"}};
 
   CudfConfig config;
+  ASSERT_EQ(config.exchangeHostStaging, false);
   config.initialize(std::move(options));
   ASSERT_EQ(config.enabled, false);
   ASSERT_EQ(config.debugEnabled, true);
@@ -37,5 +39,10 @@ TEST(ConfigTest, CudfConfig) {
   ASSERT_EQ(config.memoryPercent, 25);
   ASSERT_EQ(config.functionNamePrefix, "presto");
   ASSERT_EQ(config.allowCpuFallback, false);
+  ASSERT_EQ(config.exchangeHostStaging, true);
+
+  std::unordered_map<std::string, std::string> defaultOptions;
+  config.initialize(std::move(defaultOptions));
+  ASSERT_EQ(config.exchangeHostStaging, false);
 }
 } // namespace facebook::velox::cudf_velox::test

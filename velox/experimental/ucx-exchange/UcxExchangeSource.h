@@ -35,6 +35,8 @@
 #include <rmm/mr/device_memory_resource.hpp>
 #include <rmm/mr/pool_memory_resource.hpp>
 
+#include <vector>
+
 namespace facebook::velox::ucx_exchange {
 
 struct UcxExchangeMetrics {
@@ -141,6 +143,8 @@ class UcxExchangeSource
   struct DataAndMetadata {
     MetadataMsg metadata;
     std::unique_ptr<rmm::device_buffer> dataBuf;
+    std::shared_ptr<std::vector<uint8_t>> hostData;
+    bool hostStaging{false};
     rmm::cuda_stream_view stream; // The stream used to allocate dataBuf
   };
 

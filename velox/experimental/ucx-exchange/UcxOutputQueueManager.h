@@ -107,6 +107,10 @@ class UcxOutputQueueManager {
   /// source's destructive move would corrupt data for other servers).
   bool canUseIntraNode(const std::string& taskId);
 
+  /// Returns true if remote UCXX sends for the given task should stage payloads
+  /// through host memory.
+  bool hostStagingEnabled(const std::string& taskId);
+
   /// @brief Removes the queue for the given task from the queue manager.
   /// Calls "terminate" on the queue to awake waiting producers.
   void removeTask(const std::string& taskId);

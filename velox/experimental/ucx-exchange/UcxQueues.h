@@ -163,6 +163,9 @@ class UcxOutputQueue : public std::enable_shared_from_this<UcxOutputQueue> {
     return task_ != nullptr;
   }
 
+  /// Whether remote UCXX sends for this task should stage through host memory.
+  bool hostStagingEnabled();
+
   /// @brief When we understand the final number of split groups (for grouped
   /// execution only), we need to update the number of producing drivers here.
   void updateNumDrivers(uint32_t newNumDrivers);
@@ -264,6 +267,9 @@ class UcxOutputQueue : public std::enable_shared_from_this<UcxOutputQueue> {
 
   // Reference to the task that owns this UcxQueue.
   std::shared_ptr<exec::Task> task_{nullptr};
+
+  // Remote UCXX payloads use host staging when the task config requests it.
+  bool hostStagingEnabled_{false};
 
   // The output mode (partitioned, broadcast, etc.)
   core::PartitionedOutputNode::Kind kind_{

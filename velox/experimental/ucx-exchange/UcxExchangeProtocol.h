@@ -110,6 +110,7 @@ struct MetadataMsg {
   WireDataSizeType dataSizeBytes;
   std::vector<WireRemainingElementType> remainingBytes;
   bool atEnd;
+  bool hostStaging{false};
 
   uint32_t getSerializedSize() const {
     // The header: the magic number and the metadata length.
@@ -124,6 +125,8 @@ struct MetadataMsg {
     totalSize += sizeof(WireLengthType); // for numRemaining count
     totalSize += remainingBytes.size() * sizeof(remainingBytes[0]);
     // atEnd, encoded in a byte.
+    totalSize += sizeof(uint8_t);
+    // hostStaging, encoded in a byte.
     totalSize += sizeof(uint8_t);
 
     return totalSize;
@@ -188,6 +191,11 @@ struct MetadataMsg {
     // Serialize atEnd bool as 0/1.
     uint8_t atEndByte = atEnd ? 1 : 0;
     *ptr = atEndByte;
+    ptr += sizeof(atEndByte);
+
+    // Serialize hostStaging bool as 0/1.
+    uint8_t hostStagingByte = hostStaging ? 1 : 0;
+    *ptr = hostStagingByte;
 
     return std::make_pair<std::shared_ptr<uint8_t>, size_t>(
         std::move(buffer), totalSize);
@@ -258,6 +266,13 @@ struct MetadataMsg {
     // Deserialize bool `atEnd` (stored as a single byte: 1 for true, 0 for
     // false)
     record.atEnd = (*ptr != 0);
+    ptr += sizeof(uint8_t);
+
+    // Deserialize bool `hostStaging` if present. Older metadata did not include
+    // this byte, so default to false when reading that format.
+    if (ptr < endPtr) {
+      record.hostStaging = (*ptr != 0);
+    }
 
     return record;
   }

@@ -434,6 +434,12 @@ void CudfConfig::initialize(
   if (config.find(kUcxIntraNodeExchange) != config.end()) {
     intraNodeExchange = folly::to<bool>(config[kUcxIntraNodeExchange]);
   }
+  auto hostStaging = config.find(kUcxExchangeHostStaging);
+  if (hostStaging != config.end()) {
+    exchangeHostStaging = folly::to<bool>(hostStaging->second);
+  } else {
+    exchangeHostStaging = folly::to<bool>(kUcxExchangeHostStagingDefault);
+  }
   if (config.find(kUcxxErrorHandling) != config.end()) {
     ucxxErrorHandling = folly::to<bool>(config[kUcxxErrorHandling]);
   }
