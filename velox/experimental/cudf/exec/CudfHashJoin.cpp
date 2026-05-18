@@ -135,6 +135,25 @@ std::optional<rmm::cuda_stream_view> CudfHashJoinBridge::getBuildStream() {
   return buildStream_;
 }
 
+void CudfHashJoinBridge::setFilteredJoins(
+    CudfHashJoinBridge::filtered_join_type filteredJoins) {
+  // Must be called before setHashTable so that probe drivers waking up from
+  // hashOrFuture observe a populated filteredJoins_ via getFilteredJoins().
+  // setHashTable performs the notify() under the same mutex_; ordering caller
+  // -> setFilteredJoins -> setHashTable guarantees probe-side visibility.
+  std::lock_guard<std::mutex> l(mutex_);
+  VELOX_CHECK(
+      !filteredJoins_.has_value(),
+      "CudfHashJoinBridge already has filteredJoins");
+  filteredJoins_ = std::move(filteredJoins);
+}
+
+std::optional<CudfHashJoinBridge::filtered_join_type>
+CudfHashJoinBridge::getFilteredJoins() {
+  std::lock_guard<std::mutex> l(mutex_);
+  return filteredJoins_;
+}
+
 CudfHashJoinBuild::CudfHashJoinBuild(
     int32_t operatorId,
     exec::DriverCtx* driverCtx,
@@ -256,15 +275,31 @@ void CudfHashJoinBuild::noMoreInput() {
   }
 
   // Construct hash_join object for join types that use hb->inner_join() or
-  // hb->left_join(). Semi filter and anti joins use standalone cudf functions
-  // (e.g., mixed_left_semi_join, filtered_join) that build hash tables
-  // internally, so they don't need this.
+  // hb->left_join(). Semi-filter / anti joins use standalone cudf APIs:
+  // mixed_left_semi_join / mixed_left_anti_join (free functions, mixed
+  // predicate case) or cudf::filtered_join (class, no-filter case). The
+  // latter is also a build-once-probe-many handle and is cached via
+  // buildFilteredJoin below so probe-side does not recreate the hash table
+  // per call.
   bool buildHashJoin =
       (joinNode_->isInnerJoin() || joinNode_->isLeftJoin() ||
        joinNode_->isRightJoin() || joinNode_->isFullJoin() ||
        joinNode_->isLeftSemiProjectJoin());
 
+  // Cache cudf::filtered_join when probe-side will reach the no-filter branch
+  // of leftSemiFilterJoin / antiJoin. With a filter expression the probe path
+  // uses cudf::mixed_left_semi_join / cudf::mixed_left_anti_join (free
+  // functions, no cacheable handle).
+  //
+  // Right-semi-filter is intentionally excluded: that path builds the cuDF
+  // hash table on the left (probe) side, not the right (build) side, so a
+  // build-time cache constructed from right tables would not match the right
+  // semi probe direction. Right semi continues to rebuild per probe call.
+  bool buildFilteredJoin = !joinNode_->filter() &&
+      (joinNode_->isLeftSemiFilterJoin() || joinNode_->isAntiJoin());
+
   std::vector<std::shared_ptr<cudf::hash_join>> hashObjects;
+  std::vector<std::shared_ptr<cudf::filtered_join>> filteredJoins;
   for (auto i = 0; i < tbls.size(); i++) {
     hashObjects.push_back(
         (buildHashJoin) ? std::make_shared<cudf::hash_join>(
@@ -275,12 +310,26 @@ void CudfHashJoinBuild::noMoreInput() {
     if (buildHashJoin) {
       VELOX_CHECK_NOT_NULL(hashObjects.back());
     }
+    filteredJoins.push_back(
+        (buildFilteredJoin) ? std::make_shared<cudf::filtered_join>(
+                                  tbls[i]->view().select(buildKeyIndices),
+                                  cudf::null_equality::UNEQUAL,
+                                  cudf::set_as_build_table::RIGHT,
+                                  stream)
+                            : nullptr);
+    if (buildFilteredJoin) {
+      VELOX_CHECK_NOT_NULL(filteredJoins.back());
+    }
     if (CudfConfig::getInstance().debugEnabled) {
       if (hashObjects.back() != nullptr) {
         VLOG(2) << "hashObject " << i << " is not nullptr "
                 << hashObjects.back().get() << "\n";
       } else {
         VLOG(2) << "hashObject " << i << " is *** nullptr\n";
+      }
+      if (filteredJoins.back() != nullptr) {
+        VLOG(2) << "filteredJoin " << i << " is not nullptr "
+                << filteredJoins.back().get() << "\n";
       }
     }
   }
@@ -296,6 +345,7 @@ void CudfHashJoinBuild::noMoreInput() {
       std::dynamic_pointer_cast<CudfHashJoinBridge>(joinBridge);
 
   cudfHashJoinBridge->setBuildStream(stream);
+  cudfHashJoinBridge->setFilteredJoins(std::move(filteredJoins));
   cudfHashJoinBridge->setHashTable(
       std::make_optional(
           std::make_pair(std::move(shared_tbls), std::move(hashObjects))));
@@ -1210,12 +1260,16 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::leftSemiFilterJoin(
           stream,
           get_temp_mr());
     } else {
-      cudf::filtered_join filter_join(
-          rightTableView.select(rightKeyIndices_),
-          cudf::null_equality::UNEQUAL,
-          cudf::set_as_build_table::RIGHT,
-          stream);
-      leftJoinIndices = filter_join.semi_join(
+      // Reuse the cached filtered_join handle built once on the build side
+      // (CudfHashJoinBuild::noMoreInput), instead of constructing a fresh
+      // hash table per probe call. Saves a full insert_if_n build pass per
+      // (driver, batch, probe call) -- the entry was the per-probe hash
+      // table rebuild that drove 240+ insert_if_n launches on Q21.
+      VELOX_CHECK(filteredJoins_.has_value());
+      auto& filteredJoins = filteredJoins_.value();
+      VELOX_CHECK_LT(i, filteredJoins.size());
+      VELOX_CHECK_NOT_NULL(filteredJoins[i]);
+      leftJoinIndices = filteredJoins[i]->semi_join(
           leftTableView.select(leftKeyIndices_), stream, get_temp_mr());
     }
 
@@ -1600,12 +1654,14 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::antiJoin(
       leftJoinIndices = std::make_unique<rmm::device_uvector<cudf::size_type>>(
           0, stream, get_temp_mr());
     } else {
-      cudf::filtered_join filter_join(
-          rightTableView.select(rightKeyIndices_),
-          cudf::null_equality::UNEQUAL,
-          cudf::set_as_build_table::RIGHT,
-          stream);
-      leftJoinIndices = filter_join.anti_join(
+      // Reuse the cached filtered_join handle built once on the build side.
+      // antiJoin asserts rightTables.size() == 1 above, so index 0 is the
+      // only valid index here.
+      VELOX_CHECK(filteredJoins_.has_value());
+      auto& filteredJoins = filteredJoins_.value();
+      VELOX_CHECK_EQ(filteredJoins.size(), 1);
+      VELOX_CHECK_NOT_NULL(filteredJoins[0]);
+      leftJoinIndices = filteredJoins[0]->anti_join(
           leftTableView.select(leftKeyIndices_), stream, get_temp_mr());
     }
   }
@@ -1836,6 +1892,11 @@ exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
   }
   hashObject_ = std::move(hashObject);
   buildStream_ = cudfJoinBridge->getBuildStream();
+  // Pull the cached filtered_join handles populated by CudfHashJoinBuild.
+  // Always set after hashOrFuture returns: the build side calls
+  // setFilteredJoins() before setHashTable(), so by the time we're here both
+  // are visible under the bridge mutex.
+  filteredJoins_ = cudfJoinBridge->getFilteredJoins();
 
   // Lazy initialize matched flags only when build side is done
   if (joinNode_->isRightJoin() || joinNode_->isFullJoin()) {

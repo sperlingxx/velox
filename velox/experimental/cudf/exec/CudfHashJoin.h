@@ -28,6 +28,7 @@
 
 #include <cudf/ast/expressions.hpp>
 #include <cudf/copying.hpp>
+#include <cudf/join/filtered_join.hpp>
 #include <cudf/join/hash_join.hpp>
 #include <cudf/table/table.hpp>
 
@@ -63,9 +64,30 @@ class CudfHashJoinBridge : public exec::JoinBridge {
       std::vector<std::shared_ptr<cudf::table>>,
       std::vector<std::shared_ptr<cudf::hash_join>>>;
 
+  /// Per-build-batch cuDF filtered_join objects used by the left-semi-filter
+  /// and anti probe paths. Built once on the build side and reused across all
+  /// probe calls to avoid the per-probe-call hash table rebuild that was
+  /// previously happening as a stack local in
+  /// CudfHashJoinProbe::leftSemiFilterJoin / antiJoin. Entries are nullptr
+  /// when the join uses the cudf::mixed_left_semi_join /
+  /// mixed_left_anti_join free functions (mixed predicate case, no reusable
+  /// hash table object available) or when the join type is not a
+  /// filter-style semi/anti join (e.g. right-semi-filter, which builds the
+  /// cuDF hash table on the probe side and cannot be cached at build time).
+  using filtered_join_type = std::vector<std::shared_ptr<cudf::filtered_join>>;
+
   void setHashTable(std::optional<hash_type> hashObject);
 
   std::optional<hash_type> hashOrFuture(ContinueFuture* future);
+
+  /// Stores the per-build-batch filtered_join objects. Must be called BEFORE
+  /// setHashTable: setHashTable performs notify() under the same internal
+  /// mutex_, so callers must populate filteredJoins_ first to guarantee
+  /// probe-side getFilteredJoins() returns a populated vector once
+  /// hashOrFuture wakes the probe driver up.
+  void setFilteredJoins(filtered_join_type filteredJoins);
+
+  std::optional<filtered_join_type> getFilteredJoins();
 
   // Store and retrieve the CUDA stream used for building the hash join.
   void setBuildStream(rmm::cuda_stream_view buildStream);
@@ -76,6 +98,9 @@ class CudfHashJoinBridge : public exec::JoinBridge {
   /** @brief Hash tables and join objects transferred from build to probe
    * operators */
   std::optional<hash_type> hashObject_;
+  /// Per-build-batch filtered_join cache for filter-style semi/anti probes.
+  /// Parallel to hashObject_.second; index i corresponds to right table i.
+  std::optional<filtered_join_type> filteredJoins_;
   /** @brief CUDA stream used by build operator for proper synchronization */
   std::optional<rmm::cuda_stream_view> buildStream_;
 };
@@ -174,6 +199,13 @@ class CudfHashJoinProbe : public exec::Operator, public NvtxHelper {
   std::shared_ptr<const core::HashJoinNode> joinNode_;
   /** @brief Hash tables and join objects received from build operator */
   std::optional<hash_type> hashObject_;
+  /// Per-build-batch cuDF filtered_join cache for filter-style semi/anti
+  /// probes. Populated alongside hashObject_ in isBlocked once the build
+  /// side finishes. nullptr entries are present when the corresponding
+  /// build batch does not support cached filtered_join (mixed predicate
+  /// path uses cudf::mixed_left_semi_join / cudf::mixed_left_anti_join free
+  /// functions instead).
+  std::optional<CudfHashJoinBridge::filtered_join_type> filteredJoins_;
 
   // Filter related members
   /** @brief CUDF AST tree for join filter evaluation */
