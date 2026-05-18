@@ -137,10 +137,13 @@ std::optional<rmm::cuda_stream_view> CudfHashJoinBridge::getBuildStream() {
 
 void CudfHashJoinBridge::setFilteredJoins(
     CudfHashJoinBridge::filtered_join_type filteredJoins) {
-  // Must be called before setHashTable so that probe drivers waking up from
-  // hashOrFuture observe a populated filteredJoins_ via getFilteredJoins().
-  // setHashTable performs the notify() under the same mutex_; ordering caller
-  // -> setFilteredJoins -> setHashTable guarantees probe-side visibility.
+  // Must be called before setHashTable. Both setters publish their state
+  // under mutex_; the mutex_ acquire-release ordering gives happens-before
+  // from this write to any probe-side acquire of mutex_ (hashOrFuture /
+  // getFilteredJoins) that follows the subsequent setHashTable call. The
+  // notify() inside setHashTable runs after its lock is released and is
+  // only a wake signal -- visibility is owned by the mutex_ ordering, not
+  // by where notify() sits relative to the lock.
   std::lock_guard<std::mutex> l(mutex_);
   VELOX_CHECK(
       !filteredJoins_.has_value(),
@@ -310,14 +313,25 @@ void CudfHashJoinBuild::noMoreInput() {
     if (buildHashJoin) {
       VELOX_CHECK_NOT_NULL(hashObjects.back());
     }
+    // Per-table refinement of buildFilteredJoin. The probe path for an
+    // anti join short-circuits to an empty result (without touching the
+    // cached handle) when the join is null-aware AND the build-side keys
+    // contain NULLs. Skip the GPU hash table build in that case to avoid
+    // wasted memory and a potential OOM on large NULL-heavy build sides.
+    bool buildThisFilteredJoin = buildFilteredJoin;
+    if (buildThisFilteredJoin && joinNode_->isAntiJoin() &&
+        joinNode_->isNullAware() &&
+        cudf::has_nulls(tbls[i]->view().select(buildKeyIndices))) {
+      buildThisFilteredJoin = false;
+    }
     filteredJoins.push_back(
-        (buildFilteredJoin) ? std::make_shared<cudf::filtered_join>(
-                                  tbls[i]->view().select(buildKeyIndices),
-                                  cudf::null_equality::UNEQUAL,
-                                  cudf::set_as_build_table::RIGHT,
-                                  stream)
-                            : nullptr);
-    if (buildFilteredJoin) {
+        (buildThisFilteredJoin) ? std::make_shared<cudf::filtered_join>(
+                                      tbls[i]->view().select(buildKeyIndices),
+                                      cudf::null_equality::UNEQUAL,
+                                      cudf::set_as_build_table::RIGHT,
+                                      stream)
+                                : nullptr);
+    if (buildThisFilteredJoin) {
       VELOX_CHECK_NOT_NULL(filteredJoins.back());
     }
     if (CudfConfig::getInstance().debugEnabled) {
@@ -1263,14 +1277,28 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::leftSemiFilterJoin(
       // Reuse the cached filtered_join handle built once on the build side
       // (CudfHashJoinBuild::noMoreInput), instead of constructing a fresh
       // hash table per probe call. Saves a full insert_if_n build pass per
-      // (driver, batch, probe call) -- the entry was the per-probe hash
-      // table rebuild that drove 240+ insert_if_n launches on Q21.
+      // (driver, batch, probe call).
+      //
+      // The cached filtered_join was constructed on buildStream_ in
+      // CudfHashJoinBuild::noMoreInput. semi_join enqueues work on the
+      // passed-in stream; if that stream is the probe stream, the probe
+      // kernels can race the still-pending build kernels. Mirror the
+      // inner_join cached hash_join pattern: cross-stream sync before, issue
+      // on buildStream_, cross-stream sync after.
       VELOX_CHECK(filteredJoins_.has_value());
       auto& filteredJoins = filteredJoins_.value();
       VELOX_CHECK_LT(i, filteredJoins.size());
       VELOX_CHECK_NOT_NULL(filteredJoins[i]);
+      if (buildStream_.has_value()) {
+        cudaEvent_->recordFrom(stream).waitOn(buildStream_.value());
+      }
       leftJoinIndices = filteredJoins[i]->semi_join(
-          leftTableView.select(leftKeyIndices_), stream, get_temp_mr());
+          leftTableView.select(leftKeyIndices_),
+          buildStream_.has_value() ? buildStream_.value() : stream,
+          get_temp_mr());
+      if (buildStream_.has_value()) {
+        cudaEvent_->recordFrom(buildStream_.value()).waitOn(stream);
+      }
     }
 
     auto leftIndicesSpan =
@@ -1656,13 +1684,23 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::antiJoin(
     } else {
       // Reuse the cached filtered_join handle built once on the build side.
       // antiJoin asserts rightTables.size() == 1 above, so index 0 is the
-      // only valid index here.
+      // only valid index here. anti_join is enqueued on buildStream_ with
+      // cross-stream sync on both ends; see leftSemiFilterJoin for the same
+      // pattern and reasoning.
       VELOX_CHECK(filteredJoins_.has_value());
       auto& filteredJoins = filteredJoins_.value();
       VELOX_CHECK_EQ(filteredJoins.size(), 1);
       VELOX_CHECK_NOT_NULL(filteredJoins[0]);
+      if (buildStream_.has_value()) {
+        cudaEvent_->recordFrom(stream).waitOn(buildStream_.value());
+      }
       leftJoinIndices = filteredJoins[0]->anti_join(
-          leftTableView.select(leftKeyIndices_), stream, get_temp_mr());
+          leftTableView.select(leftKeyIndices_),
+          buildStream_.has_value() ? buildStream_.value() : stream,
+          get_temp_mr());
+      if (buildStream_.has_value()) {
+        cudaEvent_->recordFrom(buildStream_.value()).waitOn(stream);
+      }
     }
   }
 

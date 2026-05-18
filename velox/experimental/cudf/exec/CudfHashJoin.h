@@ -81,10 +81,13 @@ class CudfHashJoinBridge : public exec::JoinBridge {
   std::optional<hash_type> hashOrFuture(ContinueFuture* future);
 
   /// Stores the per-build-batch filtered_join objects. Must be called BEFORE
-  /// setHashTable: setHashTable performs notify() under the same internal
-  /// mutex_, so callers must populate filteredJoins_ first to guarantee
-  /// probe-side getFilteredJoins() returns a populated vector once
-  /// hashOrFuture wakes the probe driver up.
+  /// setHashTable. Both setters take the same internal mutex_ to publish
+  /// their state; probe drivers wake on hashOrFuture (which observes
+  /// hashObject_ under that same mutex_). The mutex_ acquire-release
+  /// ordering establishes happens-before between the build-side writes and
+  /// the probe-side reads, so populating filteredJoins_ first guarantees
+  /// getFilteredJoins() returns a populated vector once hashOrFuture has
+  /// woken the probe driver up.
   void setFilteredJoins(filtered_join_type filteredJoins);
 
   std::optional<filtered_join_type> getFilteredJoins();
