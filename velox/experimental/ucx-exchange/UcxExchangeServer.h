@@ -70,6 +70,7 @@ class UcxExchangeServer
     WaitingForDataFromQueue,
     DataReady,
     WaitingForSendComplete,
+    WaitingForEndMarkerSendComplete,
     WaitingForIntraNodeRetrieve, // Intra-node transfer: waiting for source to
                                  // retrieve
     Done
@@ -112,6 +113,7 @@ class UcxExchangeServer
         "WaitingForDataFromQueue",
         "DataReady",
         "WaitingForSendComplete",
+        "WaitingForEndMarkerSendComplete",
         "WaitingForIntraNodeRetrieve",
         "Done"};
     return stateMap[static_cast<uint32_t>(s)];
@@ -140,6 +142,13 @@ class UcxExchangeServer
 
   /// For intra-node transfer: true if the last published entry was atEnd.
   bool intraNodeAtEndPublished_{false};
+
+  /// True while the remote path is sending the final atEnd metadata marker.
+  bool remoteEndMarkerInFlight_{false};
+
+  /// True after the remote final atEnd marker has been sent successfully and
+  /// the producer destination buffer has been destroyed.
+  bool remoteEndMarkerSent_{false};
 
   uint32_t sequenceNumber_{0};
   uint32_t intraNodePollCount_{0};

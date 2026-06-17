@@ -33,6 +33,23 @@ void Acceptor::cStyleAMCallback(
   auto buffer =
       std::dynamic_pointer_cast<ucxx::Buffer>(request->getRecvBuffer());
   VELOX_CHECK(buffer != nullptr, "AMCallback: failed to get receive buffer.");
+  if (buffer->getSize() >= sizeof(UcxControlMsg)) {
+    const auto* controlPtr =
+        reinterpret_cast<const UcxControlMsg*>(buffer->data());
+    if (controlPtr->magic == kControlMagicNumber) {
+      VELOX_CHECK_EQ(
+          controlPtr->type,
+          static_cast<uint32_t>(UcxControlMessageType::kAbortResults),
+          "Unknown UCX exchange control message type {}",
+          controlPtr->type);
+      const PartitionKey key = {controlPtr->taskId, controlPtr->destination};
+      VLOG(2) << "[UCX-ACCEPTOR-ABORT-RESULTS] task=" << key.taskId
+              << " destination=" << key.destination;
+      UcxOutputQueueManager::getInstanceRef()->deleteResults(
+          key.taskId, key.destination);
+      return;
+    }
+  }
   // Validate buffer size BEFORE casting to prevent reading past buffer bounds.
   VELOX_CHECK_GE(
       buffer->getSize(),

@@ -714,6 +714,34 @@ TEST_F(UcxOutputQueueManagerTest, callbackFiredOnTerminateAfterInit) {
   EXPECT_TRUE(callback1Nullptr);
 }
 
+TEST_F(UcxOutputQueueManagerTest, onNoMoreDataAfterRemoveReportsTerminated) {
+  const std::string taskId = "removedNoMoreDataCallback";
+  auto task = initializeTask(taskId, 1 /* numDestinations */, 1 /* numDrivers */);
+
+  queueManager_->removeTask(taskId);
+
+  bool callbackFired = false;
+  UcxOutputQueueEndState callbackState{UcxOutputQueueEndState::kNoMoreData};
+  queueManager_->onNoMoreData(
+      taskId,
+      [&](UcxOutputQueueEndState state) {
+        callbackFired = true;
+        callbackState = state;
+      });
+
+  EXPECT_TRUE(callbackFired);
+  EXPECT_EQ(callbackState, UcxOutputQueueEndState::kTerminated);
+}
+
+TEST_F(UcxOutputQueueManagerTest, noMoreDataAfterRemoveIsIgnored) {
+  const std::string taskId = "removedNoMoreData";
+  auto task = initializeTask(taskId, 1 /* numDestinations */, 1 /* numDrivers */);
+
+  queueManager_->removeTask(taskId);
+
+  EXPECT_NO_THROW(queueManager_->noMoreData(taskId));
+}
+
 // --- Broadcast tests ---
 
 // Basic broadcast: enqueue data, all destinations receive the same data.

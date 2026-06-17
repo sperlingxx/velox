@@ -465,8 +465,40 @@ void UcxOutputQueue::noMoreDrivers() {
   checkIfDone(false);
 }
 
+void UcxOutputQueue::onNoMoreData(UcxNoMoreDataCallback notify) {
+  UcxNoMoreDataCallback readyCallback;
+  UcxOutputQueueEndState readyState{UcxOutputQueueEndState::kNoMoreData};
+  {
+    std::lock_guard<std::mutex> l(mutex_);
+    if (atEnd_) {
+      readyCallback = std::move(notify);
+    } else {
+      noMoreDataCallbacks_.push_back(std::move(notify));
+    }
+  }
+  if (readyCallback) {
+    readyCallback(readyState);
+  }
+}
+
+void UcxOutputQueue::onFinished(UcxOutputQueueFinishedCallback notify) {
+  UcxOutputQueueFinishedCallback readyCallback;
+  {
+    std::lock_guard<std::mutex> l(mutex_);
+    if (isFinishedLocked()) {
+      readyCallback = std::move(notify);
+    } else {
+      finishedCallbacks_.push_back(std::move(notify));
+    }
+  }
+  if (readyCallback) {
+    readyCallback();
+  }
+}
+
 void UcxOutputQueue::checkIfDone(bool oneDriverFinished) {
   std::vector<UcxDataAvailable> finished;
+  std::vector<UcxNoMoreDataCallback> noMoreDataCallbacks;
   {
     std::lock_guard<std::mutex> l(mutex_);
     if (oneDriverFinished) {
@@ -476,6 +508,7 @@ void UcxOutputQueue::checkIfDone(bool oneDriverFinished) {
         numFinished_,
         numDrivers_,
         "Each driver should call noMoreData exactly once");
+    const bool wasAtEnd = atEnd_;
     atEnd_ = numFinished_ == numDrivers_;
     if (!atEnd_) {
       return;
@@ -496,10 +529,18 @@ void UcxOutputQueue::checkIfDone(bool oneDriverFinished) {
         finished.push_back(queue->getAndClearNotify());
       }
     }
+    if (!wasAtEnd) {
+      noMoreDataCallbacks = std::move(noMoreDataCallbacks_);
+    }
   }
   // Notify outside of mutex.
   for (auto& notification : finished) {
     notification.notify();
+  }
+  for (auto& callback : noMoreDataCallbacks) {
+    if (callback) {
+      callback(UcxOutputQueueEndState::kNoMoreData);
+    }
   }
 }
 
@@ -560,15 +601,27 @@ bool UcxOutputQueue::isFinishedLocked() {
 void UcxOutputQueue::updateOutputBuffers(int numBuffers, bool noMoreBuffers) {
   using Kind = core::PartitionedOutputNode::Kind;
   if (kind_ == Kind::kPartitioned) {
-    std::lock_guard<std::mutex> l(mutex_);
-    VELOX_CHECK_EQ(queues_.size(), numBuffers);
-    VELOX_CHECK(noMoreBuffers);
-    noMoreQueues_ = true;
+    std::vector<UcxOutputQueueFinishedCallback> finishedCallbacks;
+    {
+      std::lock_guard<std::mutex> l(mutex_);
+      VELOX_CHECK_EQ(queues_.size(), numBuffers);
+      VELOX_CHECK(noMoreBuffers);
+      noMoreQueues_ = true;
+      if (isFinishedLocked()) {
+        finishedCallbacks = std::move(finishedCallbacks_);
+      }
+    }
+    for (auto& callback : finishedCallbacks) {
+      if (callback) {
+        callback();
+      }
+    }
     return;
   }
 
   VELOX_CHECK_EQ(kind_, Kind::kBroadcast);
   bool isFinished;
+  std::vector<UcxOutputQueueFinishedCallback> finishedCallbacks;
   {
     std::lock_guard<std::mutex> l(mutex_);
 
@@ -599,10 +652,18 @@ void UcxOutputQueue::updateOutputBuffers(int numBuffers, bool noMoreBuffers) {
     noMoreQueues_ = true;
     dataToBroadcast_.clear();
     isFinished = isFinishedLocked();
+    if (isFinished) {
+      finishedCallbacks = std::move(finishedCallbacks_);
+    }
   }
 
   if (isFinished && task_) {
     task_->setAllOutputConsumed();
+  }
+  for (auto& callback : finishedCallbacks) {
+    if (callback) {
+      callback();
+    }
   }
 }
 
@@ -610,6 +671,7 @@ void UcxOutputQueue::deleteResults(int destination) {
   bool isFinished;
   UcxDataAvailable dataAvailable;
   std::vector<ContinuePromise> promises;
+  std::vector<UcxOutputQueueFinishedCallback> finishedCallbacks;
   {
     std::lock_guard<std::mutex> l(mutex_);
     if (destination >= queues_.size()) {
@@ -629,6 +691,9 @@ void UcxOutputQueue::deleteResults(int destination) {
     queue->finish();
     queues_[destination] = nullptr;
     isFinished = isFinishedLocked();
+    if (isFinished) {
+      finishedCallbacks = std::move(finishedCallbacks_);
+    }
     // update UcxOutputQueue stats
     if (bytes > 0 || packedCols > 0) {
       updateStatsWithFreedLocked(bytes, packedCols, promises);
@@ -647,10 +712,16 @@ void UcxOutputQueue::deleteResults(int destination) {
   if (isFinished && task_) {
     task_->setAllOutputConsumed();
   }
+  for (auto& callback : finishedCallbacks) {
+    if (callback) {
+      callback();
+    }
+  }
 }
 
 void UcxOutputQueue::terminate() {
   std::vector<UcxDataAvailable> pendingCallbacks;
+  std::vector<UcxNoMoreDataCallback> noMoreDataCallbacks;
   std::vector<ContinuePromise> promises;
   {
     std::lock_guard<std::mutex> l(mutex_);
@@ -669,11 +740,17 @@ void UcxOutputQueue::terminate() {
     }
     // Release any outstanding producer-side promises (blocked on queue-full).
     promises = std::move(promises_);
+    noMoreDataCallbacks = std::move(noMoreDataCallbacks_);
   }
 
   // Fire callbacks outside of mutex to avoid potential deadlocks.
   for (auto& callback : pendingCallbacks) {
     callback.notify();
+  }
+  for (auto& callback : noMoreDataCallbacks) {
+    if (callback) {
+      callback(UcxOutputQueueEndState::kTerminated);
+    }
   }
   // Unblock any blocked producers.
   for (auto& promise : promises) {

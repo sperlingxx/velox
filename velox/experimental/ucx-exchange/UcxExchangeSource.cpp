@@ -216,6 +216,9 @@ void UcxExchangeSource::cleanUp() {
     if (request_) {
       communicator_->deferRequestCleanup(std::move(request_));
     }
+    if (abortRequest_) {
+      communicator_->deferRequestCleanup(std::move(abortRequest_));
+    }
     for (auto& req : completedRequests_) {
       communicator_->deferRequestCleanup(std::move(req));
     }
@@ -248,6 +251,8 @@ void UcxExchangeSource::close() {
   VLOG(2) << "[UCX-SOURCE-CLOSE] " << toString()
           << " state=" << getStateAsString() << " seq=" << sequenceNumber_
           << " hasRequest=" << (request_ != nullptr) << " atEnd=" << atEnd_;
+
+  abortResults();
 
   // Guarantee the end marker is delivered before transitioning to Done.
   deliverEndMarker();
@@ -342,6 +347,62 @@ void UcxExchangeSource::deliverEndMarker() {
   }
   VLOG(3) << toString() << " delivering end-of-stream marker to queue";
   enqueue(nullptr);
+}
+
+void UcxExchangeSource::abortResults() {
+  bool expected = false;
+  if (!abortResultsIssued_.compare_exchange_strong(
+          expected, true, std::memory_order_acq_rel)) {
+    return;
+  }
+
+  if (!endpointRef_ || !endpointRef_->endpoint_ ||
+      !endpointRef_->endpoint_->isAlive()) {
+    VLOG(2) << "[UCX-SOURCE-ABORT-RESULTS-SKIP] " << toString()
+            << " endpoint unavailable";
+    return;
+  }
+
+  auto abortMsg = std::make_shared<UcxControlMsg>();
+  abortMsg->type =
+      static_cast<uint32_t>(UcxControlMessageType::kAbortResults);
+  strncpy(
+      abortMsg->taskId,
+      partitionKey_.taskId.c_str(),
+      sizeof(abortMsg->taskId) - 1);
+  abortMsg->taskId[sizeof(abortMsg->taskId) - 1] = '\0';
+  abortMsg->destination = partitionKey_.destination;
+
+  VLOG(2) << "[UCX-SOURCE-ABORT-RESULTS] localTask=" << taskId_
+          << " remoteTask=" << partitionKey_.taskId
+          << " destination=" << partitionKey_.destination << " peer=" << host_
+          << ":" << port_;
+
+  ucxx::AmReceiverCallbackInfo info(
+      communicator_->kAmCallbackOwner, communicator_->kAmCallbackId);
+  std::weak_ptr<UcxExchangeSource> weak = weak_from_this();
+  if (abortRequest_) {
+    completedRequests_.push_back(std::move(abortRequest_));
+  }
+  abortRequest_ = endpointRef_->endpoint_->amSend(
+      abortMsg.get(),
+      sizeof(*abortMsg),
+      UCS_MEMORY_TYPE_HOST,
+      info,
+      false,
+      [weak](ucs_status_t status, std::shared_ptr<void> /*arg*/) {
+        if (auto self = weak.lock()) {
+          if (status == UCS_OK) {
+            VLOG(3) << "[UCX-SOURCE-ABORT-RESULTS-ACK] "
+                    << self->toString();
+          } else {
+            VLOG(2) << "[UCX-SOURCE-ABORT-RESULTS-ERROR] "
+                    << self->toString()
+                    << " status=" << ucs_status_string(status);
+          }
+        }
+      },
+      abortMsg);
 }
 
 void UcxExchangeSource::setEndpoint(std::shared_ptr<EndpointRef> endpointRef) {

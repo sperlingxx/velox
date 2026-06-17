@@ -78,6 +78,24 @@ struct HandshakeMsg {
   uint64_t workerId{0};
 };
 
+constexpr uint32_t kControlMagicNumber = 0x55435843; // "UCXC"
+
+enum class UcxControlMessageType : uint32_t {
+  kAbortResults = 1,
+};
+
+/// Best-effort consumer-to-producer control message. This mirrors Presto's
+/// DELETE /v1/task/<task>/results/<destination>: the downstream source is
+/// closing early, so the producer can destroy the corresponding destination
+/// buffer. The message is intentionally idempotent.
+struct UcxControlMsg {
+  uint32_t magic{kControlMagicNumber};
+  uint32_t type{0};
+  char taskId[256];
+  uint32_t destination{0};
+  uint32_t padding{0};
+};
+
 /// @brief Response sent from server to source after handshake.
 /// Informs the source whether intra-node transfer optimization is available,
 /// allowing the source to bypass UCXX for all subsequent data transfers.

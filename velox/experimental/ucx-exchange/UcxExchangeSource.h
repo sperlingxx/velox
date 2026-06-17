@@ -262,6 +262,10 @@ class UcxExchangeSource
   /// with the queue (i.e., registered_ is false).
   void deliverEndMarker();
 
+  /// @brief Best-effort abort for the producer-side destination buffer during
+  /// early source close. Modeled after Presto's abortResults().
+  void abortResults();
+
   /// @brief Sets the state to "desired" if and only if the current
   /// state is "expected".
   /// @param expected The expected state
@@ -292,6 +296,9 @@ class UcxExchangeSource
   /// Only one thread can win the CAS and call enqueue(nullptr).
   std::atomic<bool> endMarkerDelivered_{false};
 
+  /// @brief Guards exactly-once producer-side destination abort.
+  std::atomic<bool> abortResultsIssued_{false};
+
   /// @brief True only after addSourceLocked() has been called for this source.
   /// Prevents deliverEndMarker() from incrementing numCompleted_ for sources
   /// that were never registered with the queue (e.g., created after client
@@ -318,6 +325,9 @@ class UcxExchangeSource
   // NOTE: The request owns/holds a reference to the upcall function
   // and must therefore exist until the upcall is done.
   std::shared_ptr<ucxx::Request> request_{nullptr};
+
+  // Best-effort control request used for producer-side destination abort.
+  std::shared_ptr<ucxx::Request> abortRequest_{nullptr};
 
   // Completed UCXX requests are kept alive here to prevent use-after-free.
   // UCP's ucp_wireup_replay_pending_requests can fire callbacks on already-

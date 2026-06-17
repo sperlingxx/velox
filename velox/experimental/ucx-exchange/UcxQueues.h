@@ -41,6 +41,16 @@ using UcxDataAvailableCallbackV2 = std::function<void(
     int64_t sequence,
     std::vector<int64_t> remainingBytes)>;
 
+enum class UcxOutputQueueEndState {
+  kNoMoreData,
+  kTerminated,
+};
+
+using UcxNoMoreDataCallback =
+    std::function<void(UcxOutputQueueEndState state)>;
+
+using UcxOutputQueueFinishedCallback = std::function<void()>;
+
 struct UcxDataAvailable {
   UcxDataAvailableCallback callback{nullptr};
   UcxDataAvailableCallbackV2 callbackV2{nullptr};
@@ -222,6 +232,15 @@ class UcxOutputQueue : public std::enable_shared_from_this<UcxOutputQueue> {
   /// @brief Indicates that a driver is done and won't enqueue any more data.
   void noMoreData();
 
+  /// @brief Registers a callback that fires when all producer drivers have
+  /// reported noMoreData. If the queue is already at end, fires immediately.
+  void onNoMoreData(UcxNoMoreDataCallback notify);
+
+  /// @brief Registers a callback that fires when all destination queues have
+  /// been consumed and deleted. If the queue is already finished, fires
+  /// immediately.
+  void onFinished(UcxOutputQueueFinishedCallback notify);
+
   /// @brief Updates the number of destination buffers. For broadcast mode,
   /// new destinations are backfilled with previously broadcast data.
   /// Modeled on OutputBuffer::updateOutputBuffers().
@@ -328,6 +347,12 @@ class UcxOutputQueue : public std::enable_shared_from_this<UcxOutputQueue> {
 
   // promises when buffer reached capacity and blocked further enqueueing.
   std::vector<ContinuePromise> promises_;
+
+  // callbacks waiting for all producer drivers to reach noMoreData.
+  std::vector<UcxNoMoreDataCallback> noMoreDataCallbacks_;
+
+  // callbacks waiting for all destination buffers to be consumed.
+  std::vector<UcxOutputQueueFinishedCallback> finishedCallbacks_;
 
   // actual data in 'queues_'
   int64_t queuedBytes_{0};

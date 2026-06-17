@@ -87,7 +87,47 @@ bool UcxOutputQueueManager::checkBlocked(
 }
 
 void UcxOutputQueueManager::noMoreData(const std::string& taskId) {
-  getQueue(taskId)->noMoreData();
+  auto queue = getQueueIfExists(taskId);
+  if (queue != nullptr) {
+    queue->noMoreData();
+    return;
+  }
+  if (removedTasks_.withLock(
+          [&](auto& removed) { return removed.count(taskId) > 0; })) {
+    VLOG(2) << "[QUEUE-MGR] task=" << taskId
+            << " noMoreData ignored (task already removed)";
+    return;
+  }
+  VELOX_FAIL("Output cudf queue for task not found: {}", taskId);
+}
+
+void UcxOutputQueueManager::onNoMoreData(
+    const std::string& taskId,
+    UcxNoMoreDataCallback notify) {
+  auto queue = getQueueIfExists(taskId);
+  if (queue != nullptr) {
+    queue->onNoMoreData(std::move(notify));
+    return;
+  }
+  if (removedTasks_.withLock(
+          [&](auto& removed) { return removed.count(taskId) > 0; })) {
+    if (notify) {
+      notify(UcxOutputQueueEndState::kTerminated);
+    }
+    return;
+  }
+  VELOX_FAIL("Output cudf queue for task not found: {}", taskId);
+}
+
+bool UcxOutputQueueManager::onFinished(
+    const std::string& taskId,
+    UcxOutputQueueFinishedCallback notify) {
+  auto queue = getQueueIfExists(taskId);
+  if (queue != nullptr) {
+    queue->onFinished(std::move(notify));
+    return true;
+  }
+  return false;
 }
 
 bool UcxOutputQueueManager::isFinished(const std::string& taskId) {

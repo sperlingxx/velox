@@ -79,6 +79,16 @@ class UcxOutputQueueManager {
   /// @brief Indicates that no more data will be coming for this task.
   void noMoreData(const std::string& taskId);
 
+  /// @brief Registers a callback that fires when the task output queue reaches
+  /// noMoreData. If the task is already at end, fires immediately. If the
+  /// queue is terminated before noMoreData, fires with kTerminated.
+  void onNoMoreData(const std::string& taskId, UcxNoMoreDataCallback notify);
+
+  /// @brief Registers a callback that fires when the task output queue has no
+  /// remaining destination buffers. Returns false when no queue exists for the
+  /// task (for example, tasks with no UCX partitioned output).
+  bool onFinished(const std::string& taskId, UcxOutputQueueFinishedCallback notify);
+
   /// @returns true if noMoreData has been called and all the accumulated data
   /// have been fetched and acknowledged.
   bool isFinished(const std::string& taskId);

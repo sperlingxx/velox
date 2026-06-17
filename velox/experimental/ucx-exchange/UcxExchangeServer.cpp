@@ -159,6 +159,9 @@ void UcxExchangeServer::process() {
       // Waiting for send complete is handled by an upcall from UCXX. Nothing to
       // do
       break;
+    case ServerState::WaitingForEndMarkerSendComplete:
+      // Waiting for the final atEnd metadata send to complete.
+      break;
     case ServerState::WaitingForIntraNodeRetrieve:
       // Intra-node transfer: check if the source has retrieved the data
       if (intraNodeRetrieveFuture_.valid()) {
@@ -208,7 +211,7 @@ void UcxExchangeServer::close() {
           << " hasDataRequest=" << (dataRequest_ != nullptr)
           << " hasDataPtr=" << (dataPtr_ != nullptr);
 
-  if (queueMgr_) {
+  if (queueMgr_ && !remoteEndMarkerSent_) {
     queueMgr_->deleteResults(partitionKey_.taskId, partitionKey_.destination);
   }
 
@@ -303,8 +306,6 @@ void UcxExchangeServer::sendData() {
               key, nullptr, rmm::cuda_stream_default, /*atEnd=*/true);
       intraNodeAtEndPublished_ = true;
 
-      queueMgr_->deleteResults(partitionKey_.taskId, partitionKey_.destination);
-
       // Wait for source to acknowledge atEnd before finishing
       setState(ServerState::WaitingForIntraNodeRetrieve);
       communicator_->addToWorkQueue(getSelfPtr());
@@ -312,6 +313,7 @@ void UcxExchangeServer::sendData() {
   } else {
     // REMOTE EXCHANGE PATH: Use UCXX for metadata and data transfer
     std::shared_ptr<MetadataMsg> metadataMsg = std::make_shared<MetadataMsg>();
+    const bool isEndMarker = dataPtr_ == nullptr;
 
     if (dataPtr_) {
       // Copy metadata (not move) because in broadcast mode, the same
@@ -332,6 +334,10 @@ void UcxExchangeServer::sendData() {
     }
 
     auto [serializedMetadata, serMetaSize] = metadataMsg->serialize();
+    if (isEndMarker) {
+      remoteEndMarkerInFlight_ = true;
+      setState(ServerState::WaitingForEndMarkerSendComplete);
+    }
 
     // send metadata.
     uint64_t metadataTag =
@@ -375,6 +381,23 @@ void UcxExchangeServer::sendData() {
             VLOG(3) << "@" << self->partitionKey_.taskId
                     << " metadata successfully sent to " << tid
                     << " with tag: " << std::hex << metadataTag;
+            if (self->remoteEndMarkerInFlight_) {
+              self->remoteEndMarkerInFlight_ = false;
+              self->remoteEndMarkerSent_ = true;
+              // Match Presto's output-buffer state model: after the producer
+              // has flushed the final marker to the consumer, the destination
+              // buffer can be destroyed. Source abortResults() remains a
+              // best-effort DELETE/abort signal for early close paths, but
+              // normal task completion does not depend on a reverse control
+              // message.
+              if (self->queueMgr_) {
+                self->queueMgr_->deleteResults(
+                    self->partitionKey_.taskId,
+                    self->partitionKey_.destination);
+              }
+              self->setState(ServerState::Done);
+              self->communicator_->addToWorkQueue(self);
+            }
           } else {
             VLOG(0) << "[UCX-SERVER-METADATA-SEND-ERROR] task="
                     << self->partitionKey_.taskId << " key=" << tid
@@ -440,9 +463,9 @@ void UcxExchangeServer::sendData() {
       VLOG(3) << "@" << partitionKey_.taskId
               << " Finished transferring partition for task "
               << partitionKey_.toString();
-      queueMgr_->deleteResults(partitionKey_.taskId, partitionKey_.destination);
-      setState(ServerState::Done);
-      communicator_->addToWorkQueue(getSelfPtr());
+      // The producer-side destination buffer is destroyed when this final
+      // marker send completes. Source abortResults() is reserved for early
+      // close/retry paths.
     }
   }
 }
@@ -517,6 +540,7 @@ void UcxExchangeServer::onIntraNodeRetrieveComplete() {
     // This was the final atEnd marker, we're done
     VLOG(3) << "@" << partitionKey_.taskId
             << " Intra-node transfer: atEnd acknowledged, finishing";
+    queueMgr_->deleteResults(partitionKey_.taskId, partitionKey_.destination);
     setState(ServerState::Done);
   } else {
     // More data may be coming, continue transfer loop
