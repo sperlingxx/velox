@@ -25,8 +25,11 @@
 #include <folly/synchronization/EventCount.h>
 #include <gtest/gtest-param-test.h>
 #include <gtest/gtest.h>
+#include <rmm/cuda_stream.hpp>
 #include <rmm/device_buffer.hpp>
+#include <atomic>
 #include <chrono>
+#include <cstring>
 #include <future>
 #include <memory>
 #include <sstream>
@@ -35,7 +38,9 @@
 #include "velox/core/QueryConfig.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
 #include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/ucx-exchange/Communicator.h"
+#include "velox/experimental/ucx-exchange/UcxExchangeSource.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeProtocol.h"
 #include "velox/experimental/ucx-exchange/UcxOutputQueueManager.h"
 #include "velox/experimental/ucx-exchange/tests/SinkDriverMock.h"
@@ -49,6 +54,78 @@ using namespace facebook::velox::exec;
 using namespace facebook::velox::core;
 
 namespace facebook::velox::ucx_exchange {
+
+namespace {
+
+class StreamGate {
+ public:
+  explicit StreamGate(rmm::cuda_stream_view target)
+      : control_(rmm::cuda_stream::flags::non_blocking),
+        event_(cudaEventDisableTiming) {
+    CUDF_CUDA_TRY(cudaLaunchHostFunc(
+        control_.value(),
+        [](void* state) {
+          auto* open = static_cast<std::atomic<bool>*>(state);
+          while (!open->load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+          }
+        },
+        &open_));
+    event_.recordFrom(control_).waitOn(target);
+  }
+
+  ~StreamGate() {
+    release();
+  }
+
+  void release() {
+    if (!open_.exchange(true, std::memory_order_acq_rel)) {
+      control_.synchronize();
+    }
+  }
+
+ private:
+  std::atomic<bool> open_{false};
+  rmm::cuda_stream control_;
+  cudf_velox::CudaEvent event_;
+};
+
+std::vector<uint8_t> variableStringPayload() {
+  const std::vector<std::string> strings{
+      "",
+      "a",
+      std::string(17, 'b'),
+      std::string(4093, 'c'),
+      std::string(1 << 20, 'd')};
+  std::vector<int32_t> offsets(strings.size() + 1, 0);
+  for (size_t i = 0; i < strings.size(); ++i) {
+    offsets[i + 1] = offsets[i] + strings[i].size();
+  }
+
+  const auto offsetBytes = offsets.size() * sizeof(offsets[0]);
+  std::vector<uint8_t> payload(offsetBytes + offsets.back());
+  std::memcpy(payload.data(), offsets.data(), offsetBytes);
+  auto* chars = payload.data() + offsetBytes;
+  for (const auto& string : strings) {
+    std::memcpy(chars, string.data(), string.size());
+    chars += string.size();
+  }
+  return payload;
+}
+
+void expectDeviceBytes(
+    const rmm::device_buffer& device,
+    const std::vector<uint8_t>& expected) {
+  std::vector<uint8_t> actual(expected.size());
+  CUDF_CUDA_TRY(cudaMemcpy(
+      actual.data(),
+      device.data(),
+      actual.size(),
+      cudaMemcpyDeviceToHost));
+  EXPECT_EQ(actual, expected);
+}
+
+} // namespace
 
 struct ExchangeTestParams {
   int numSrcDrivers;
@@ -1474,6 +1551,86 @@ TEST_P(UcxExchangeTest, deferredRequestCleanupOnTaskAbort) {
   VLOG(0) << "deferredRequestCleanupOnTaskAbort: completed without crash";
 
   config.intraNodeExchange = origIntraNode;
+}
+
+TEST(UcxExchangeSourceStreamOrderingTest, pageableH2DCompletesOwningStream) {
+  auto payload = variableStringPayload();
+  rmm::cuda_stream receiveStream(rmm::cuda_stream::flags::non_blocking);
+  rmm::device_buffer destination(payload.size(), receiveStream.view());
+  receiveStream.synchronize();
+
+  StreamGate receiveGate(receiveStream.view());
+  std::promise<void> copyStarted;
+  auto copyStartedFuture = copyStarted.get_future();
+  auto copy = std::async(std::launch::async, [&]() {
+    copyStarted.set_value();
+    detail::copyPageableHostToDevice(
+        destination.data(),
+        payload.data(),
+        payload.size(),
+        receiveStream.view());
+  });
+  copyStartedFuture.wait();
+
+  EXPECT_EQ(copy.wait_for(std::chrono::milliseconds(100)),
+            std::future_status::timeout)
+      << "host-staging copy returned before its owning stream completed";
+
+  receiveGate.release();
+  ASSERT_EQ(copy.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+  EXPECT_NO_THROW(copy.get());
+  expectDeviceBytes(destination, payload);
+}
+
+TEST(UcxExchangeSourceStreamOrderingTest, cloneWaitsForProducer) {
+  auto payload = variableStringPayload();
+  rmm::cuda_stream producerStream(rmm::cuda_stream::flags::non_blocking);
+  rmm::cuda_stream cloneStream(rmm::cuda_stream::flags::non_blocking);
+  rmm::device_buffer source(payload.size(), producerStream.view());
+  producerStream.synchronize();
+
+  StreamGate producerGate(producerStream.view());
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+      source.data(),
+      payload.data(),
+      payload.size(),
+      cudaMemcpyHostToDevice,
+      producerStream.value()));
+
+  auto clone = detail::cloneDeviceBufferAcrossStreams(
+      source, producerStream.view(), cloneStream.view());
+  EXPECT_EQ(cudaStreamQuery(cloneStream.value()), cudaErrorNotReady)
+      << "clone stream did not wait for pending producer work";
+
+  producerGate.release();
+  producerStream.synchronize();
+  cloneStream.synchronize();
+  expectDeviceBytes(*clone, payload);
+}
+
+TEST(UcxExchangeSourceStreamOrderingTest, producerWaitsForCloneRead) {
+  auto payload = variableStringPayload();
+  rmm::cuda_stream producerStream(rmm::cuda_stream::flags::non_blocking);
+  rmm::cuda_stream cloneStream(rmm::cuda_stream::flags::non_blocking);
+  rmm::device_buffer source(payload.size(), producerStream.view());
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+      source.data(),
+      payload.data(),
+      payload.size(),
+      cudaMemcpyHostToDevice,
+      producerStream.value()));
+  producerStream.synchronize();
+
+  StreamGate cloneGate(cloneStream.view());
+  auto clone = detail::cloneDeviceBufferAcrossStreams(
+      source, producerStream.view(), cloneStream.view());
+  EXPECT_EQ(cudaStreamQuery(producerStream.value()), cudaErrorNotReady)
+      << "producer stream could free the source before the clone read";
+
+  cloneGate.release();
+  cloneStream.synchronize();
+  producerStream.synchronize();
+  expectDeviceBytes(*clone, payload);
 }
 
 std::shared_ptr<UcxOutputQueueManager> UcxExchangeTest::queueManager_;

@@ -43,6 +43,8 @@
 #include "velox/exec/PartitionedOutput.h"
 #include "velox/exec/Values.h"
 
+#include <limits>
+
 #include <cudf/detail/nvtx/ranges.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
@@ -513,6 +515,23 @@ void CudfConfig::initialize(
     concatOptimizationEnabled =
         folly::to<bool>(config[kCudfConcatOptimizationEnabled]);
   }
+  if (config.find(kCudfGroupbyStreamingMaxDistinctKeys) != config.end()) {
+    const auto value =
+        folly::to<int64_t>(config[kCudfGroupbyStreamingMaxDistinctKeys]);
+    VELOX_USER_CHECK_GE(
+        value,
+        0,
+        "{} must be between 0 and {}",
+        kCudfGroupbyStreamingMaxDistinctKeys,
+        std::numeric_limits<int32_t>::max());
+    VELOX_USER_CHECK_LE(
+        value,
+        std::numeric_limits<int32_t>::max(),
+        "{} must be between 0 and {}",
+        kCudfGroupbyStreamingMaxDistinctKeys,
+        std::numeric_limits<int32_t>::max());
+    groupbyStreamingMaxDistinctKeys = static_cast<int32_t>(value);
+  }
   if (config.find(kCudfFunctionNamePrefix) != config.end()) {
     functionNamePrefix = config[kCudfFunctionNamePrefix];
   }
@@ -537,6 +556,23 @@ void CudfConfig::initialize(
   }
   if (config.find(kCudfTopNBatchSize) != config.end()) {
     topNBatchSize = folly::to<int32_t>(config[kCudfTopNBatchSize]);
+  }
+  if (config.find(kCudfTopNCompactionConcurrency) != config.end()) {
+    const auto value =
+        folly::to<int64_t>(config[kCudfTopNCompactionConcurrency]);
+    VELOX_USER_CHECK_GE(
+        value,
+        0,
+        "{} must be between 0 and {}",
+        kCudfTopNCompactionConcurrency,
+        std::numeric_limits<int32_t>::max());
+    VELOX_USER_CHECK_LE(
+        value,
+        std::numeric_limits<int32_t>::max(),
+        "{} must be between 0 and {}",
+        kCudfTopNCompactionConcurrency,
+        std::numeric_limits<int32_t>::max());
+    topNCompactionConcurrency = static_cast<int32_t>(value);
   }
   if (config.find(kUcxExchange) != config.end()) {
     exchange = folly::to<bool>(config[kUcxExchange]);

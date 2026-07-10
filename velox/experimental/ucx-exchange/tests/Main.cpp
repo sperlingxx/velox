@@ -26,6 +26,10 @@ DEFINE_int32(
     0,
     "VLOG level for ucx-exchange modules (0=silent, 1-3=increasing verbosity)");
 
+// Gluten normally defines this process-wide flag in VeloxBackend.cc. The
+// standalone Velox UCX test executable does not link that translation unit.
+DEFINE_bool(velox_ucx_exchange, true, "Enable Velox UCX exchange.");
+
 // This main is needed for some tests on linux.
 int main(int argc, char** argv) {
   testing::InitGoogleTest(&argc, argv);

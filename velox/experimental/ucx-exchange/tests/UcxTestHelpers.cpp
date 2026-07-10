@@ -19,6 +19,7 @@
 #include <cudf/column/column_factories.hpp>
 #include <cudf/strings/detail/utilities.hpp>
 #include <cudf/strings/strings_column_view.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 
 using namespace facebook::velox;
 using namespace facebook::velox::exec;
@@ -180,8 +181,8 @@ template <typename T>
 std::unique_ptr<cudf::column> make_numeric_column_from_vector(
     const std::vector<T>& host_values,
     rmm::cuda_stream_view stream = cudf::get_default_stream(),
-    rmm::mr::device_memory_resource* mr =
-        rmm::mr::get_current_device_resource()) {
+    rmm::device_async_resource_ref mr =
+        cudf::get_current_device_resource_ref()) {
   size_t num_rows = host_values.size();
 
   // Allocate a device buffer of the correct size
@@ -194,6 +195,7 @@ std::unique_ptr<cudf::column> make_numeric_column_from_vector(
       num_rows * sizeof(T),
       cudaMemcpyHostToDevice,
       stream.value());
+  stream.synchronize();
 
   // Build the cudf::column from the device buffer
   return std::make_unique<cudf::column>(
@@ -208,8 +210,8 @@ std::unique_ptr<cudf::column> make_numeric_column_from_vector(
 rmm::device_buffer make_chars_buffer_from_host(
     const std::vector<std::string>& host_strings,
     rmm::cuda_stream_view stream = cudf::get_default_stream(),
-    rmm::mr::device_memory_resource* mr =
-        rmm::mr::get_current_device_resource()) {
+    rmm::device_async_resource_ref mr =
+        cudf::get_current_device_resource_ref()) {
   // Compute total bytes needed
   size_t total_bytes = 0;
   for (auto const& s : host_strings)
@@ -231,12 +233,14 @@ rmm::device_buffer make_chars_buffer_from_host(
       total_bytes,
       cudaMemcpyHostToDevice,
       stream.value());
+  stream.synchronize();
 
   return chars_buffer;
 }
 
 std::unique_ptr<cudf::column> make_strings_column_from_host(
-    const std::vector<std::string>& host_strings) {
+    const std::vector<std::string>& host_strings,
+    rmm::cuda_stream_view stream) {
   auto num_rows = host_strings.size();
 
   // --- Create offsets array ---
@@ -250,16 +254,18 @@ std::unique_ptr<cudf::column> make_strings_column_from_host(
   auto offsets_col = cudf::make_numeric_column(
       cudf::data_type{cudf::type_id::INT32},
       num_rows + 1,
-      cudf::mask_state::UNALLOCATED);
+      cudf::mask_state::UNALLOCATED,
+      stream);
 
-  cudaMemcpy(
+  cudaMemcpyAsync(
       offsets_col->mutable_view().data<int32_t>(),
       h_offsets.data(),
       sizeof(int32_t) * (num_rows + 1),
-      cudaMemcpyHostToDevice);
+      cudaMemcpyHostToDevice,
+      stream.value());
 
   // --- Create chars buffer ---
-  auto chars_buffer = make_chars_buffer_from_host(host_strings);
+  auto chars_buffer = make_chars_buffer_from_host(host_strings, stream);
 
   // --- Build strings column ---
   return cudf::make_strings_column(
@@ -287,20 +293,20 @@ std::unique_ptr<cudf::table> makeTable(
     switch (type->kind()) {
       case TypeKind::INTEGER: {
         cudfType = cudf::type_id::INT32;
-        std::vector<uint32_t> values(numRows);
-        col = make_numeric_column_from_vector(values);
+        std::vector<int32_t> values(numRows);
+        col = make_numeric_column_from_vector(values, stream);
         break;
       }
       case TypeKind::DOUBLE: {
         cudfType = cudf::type_id::FLOAT64;
-        std::vector<float> values(numRows);
-        col = make_numeric_column_from_vector(values);
+        std::vector<double> values(numRows);
+        col = make_numeric_column_from_vector(values, stream);
 
         break;
       }
       case TypeKind::VARCHAR: {
         std::vector<std::string> myStrings(numRows);
-        col = make_strings_column_from_host(myStrings);
+        col = make_strings_column_from_host(myStrings, stream);
         break;
       }
       default:

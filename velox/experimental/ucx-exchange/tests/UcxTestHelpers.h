@@ -137,7 +137,8 @@ std::vector<std::string> getStringCol(
 /// @param host_strings The vector of strings to use for creating the column.
 /// @return A unique pointer to the created strings column.
 std::unique_ptr<cudf::column> make_strings_column_from_host(
-    const std::vector<std::string>& host_strings);
+    const std::vector<std::string>& host_strings,
+    rmm::cuda_stream_view stream = cudf::get_default_stream());
 
 /// @brief Template function for retrieving the contents of a fixed-size column.
 /// @param column_view The column view to be dumped.

@@ -15,12 +15,15 @@
  */
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/CudfConversion.h"
+#include "velox/experimental/cudf/exec/CudfTopNRowNumber.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 
 #include "velox/common/base/tests/GTestUtils.h"
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
 #include "velox/exec/tests/utils/OperatorTestBase.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
+
+#include <stdexcept>
 
 using namespace facebook::velox;
 using namespace facebook::velox::exec::test;
@@ -362,3 +365,317 @@ TEST_F(TopNTest, planNodeValidation) {
       plan({"a", "b", "a"}),
       "TopN must specify unique sorting keys. Found duplicate key: a");
 }
+
+namespace facebook::velox::cudf_velox::test {
+
+class CudfTopNRowNumberTestHelper {
+ public:
+  using CompactionPermit = CudfTopNRowNumber::CompactionPermit;
+
+  static void setMemoryLimits(
+      uint64_t candidateRunBytes,
+      uint64_t mergeChunkBytes,
+      uint64_t outputChunkBytes,
+      cudf::size_type maxOutputRows) {
+    CudfTopNRowNumber::testingSetMemoryLimits(
+        candidateRunBytes,
+        mergeChunkBytes,
+        outputChunkBytes,
+        maxOutputRows);
+  }
+
+  static void resetMemoryLimits() {
+    CudfTopNRowNumber::testingResetMemoryLimits();
+  }
+
+  static size_t activeCompactionPermits() {
+    return CompactionPermit::testingActivePermits();
+  }
+};
+
+} // namespace facebook::velox::cudf_velox::test
+
+namespace facebook::velox::cudf_velox {
+namespace {
+
+using TopNTestHelper = test::CudfTopNRowNumberTestHelper;
+
+class TopNRowNumberTest : public exec::test::OperatorTestBase {
+ protected:
+  void SetUp() override {
+    OperatorTestBase::SetUp();
+    registerCudf();
+    // Force one spill run per input vector and many small reader/output chunks.
+    TopNTestHelper::setMemoryLimits(1, 512, 4096, 31);
+  }
+
+  void TearDown() override {
+    TopNTestHelper::resetMemoryLimits();
+    unregisterCudf();
+    OperatorTestBase::TearDown();
+  }
+
+  std::vector<RowVectorPtr> makeRankInputs(int32_t numRuns) {
+    constexpr vector_size_t kRowsPerRun = 97;
+    std::vector<RowVectorPtr> inputs;
+    inputs.reserve(numRuns);
+    for (int32_t run = 0; run < numRuns; ++run) {
+      auto partition = makeFlatVector<int64_t>(
+          kRowsPerRun,
+          [run](vector_size_t row) { return (row + run * 3) % 11; },
+          nullEvery(17, run % 17));
+      auto orderKey = makeFlatVector<int64_t>(
+          kRowsPerRun,
+          [run](vector_size_t row) {
+            // Small key space creates peers spanning input runs and chunks.
+            return (row * 5 + run * 7) % 13;
+          },
+          nullEvery(19, (run * 2) % 19));
+      auto payload = makeFlatVector<int64_t>(
+          kRowsPerRun,
+          [run](vector_size_t row) {
+            return static_cast<int64_t>(run) * kRowsPerRun + row;
+          });
+      inputs.push_back(makeRowVector({partition, orderKey, payload}));
+    }
+    return inputs;
+  }
+};
+
+class TopNRowNumberRunTest
+    : public TopNRowNumberTest,
+      public testing::WithParamInterface<int32_t> {};
+
+TEST_P(TopNRowNumberRunTest, pausedMergeRunsAndNullOrdering) {
+  auto inputs = makeRankInputs(GetParam());
+  createDuckDbTable(inputs);
+
+  for (const auto& order : {"DESC NULLS LAST", "ASC NULLS FIRST"}) {
+    auto plan = exec::test::PlanBuilder()
+                    .values(inputs)
+                    .topNRank("rank", {"c0"}, {fmt::format("c1 {}", order)}, 1, true)
+                    .planNode();
+    assertQuery(
+        plan,
+        fmt::format(
+            "SELECT c0, c1, c2, row_number FROM ("
+            "SELECT c0, c1, c2, rank() OVER (PARTITION BY c0 ORDER BY c1 {}) "
+            "AS row_number FROM tmp) WHERE row_number = 1",
+            order));
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    TwoThreeFiveRuns,
+    TopNRowNumberRunTest,
+    testing::Values(2, 3, 5),
+    [](const testing::TestParamInfo<int32_t>& info) {
+      return fmt::format("{}Runs", info.param);
+    });
+
+TEST_F(TopNRowNumberTest, globalPartitionAndGiantPeerStreamInChunks) {
+  constexpr int32_t kRuns = 5;
+  constexpr vector_size_t kRowsPerRun = 257;
+  std::vector<RowVectorPtr> inputs;
+  for (int32_t run = 0; run < kRuns; ++run) {
+    auto partition = makeFlatVector<int64_t>(
+        kRowsPerRun, [](vector_size_t /*row*/) { return 0; });
+    auto orderKey = makeFlatVector<int64_t>(
+        kRowsPerRun, [](vector_size_t /*row*/) { return 7; });
+    auto payload = makeFlatVector<int64_t>(
+        kRowsPerRun,
+        [run](vector_size_t row) {
+          return static_cast<int64_t>(run) * kRowsPerRun + row;
+        });
+    inputs.push_back(makeRowVector({partition, orderKey, payload}));
+  }
+  createDuckDbTable(inputs);
+
+  auto partitioned = exec::test::PlanBuilder()
+                         .values(inputs)
+                         .topNRank(
+                             "dense_rank",
+                             {"c0"},
+                             {"c1 DESC NULLS LAST"},
+                             1,
+                             true)
+                         .planNode();
+  assertQuery(
+      partitioned,
+      "SELECT c0, c1, c2, row_number FROM ("
+      "SELECT c0, c1, c2, dense_rank() OVER (PARTITION BY c0 ORDER BY c1 DESC "
+      "NULLS LAST) AS row_number FROM tmp) WHERE row_number = 1");
+
+  // Empty partition keys are one global partition. This used to select a
+  // zero-column cuDF table and slice it with non-zero row indices.
+  auto global = exec::test::PlanBuilder()
+                    .values(inputs)
+                    .topNRank(
+                        "rank", {}, {"c1 DESC NULLS LAST"}, 1, true)
+                    .planNode();
+  assertQuery(
+      global,
+      "SELECT c0, c1, c2, row_number FROM ("
+      "SELECT c0, c1, c2, rank() OVER (ORDER BY c1 DESC NULLS LAST) AS "
+      "row_number FROM tmp) WHERE row_number = 1");
+}
+
+TEST_F(TopNRowNumberTest, giantPartitionDropsWorseContinuation) {
+  constexpr int32_t kRuns = 5;
+  constexpr vector_size_t kRowsPerRun = 257;
+  std::vector<RowVectorPtr> inputs;
+  for (int32_t run = 0; run < kRuns; ++run) {
+    auto partition = makeFlatVector<int64_t>(
+        kRowsPerRun, [](vector_size_t /*row*/) { return 0; });
+    auto orderKey = makeFlatVector<int64_t>(
+        kRowsPerRun, [run](vector_size_t /*row*/) { return run == 0 ? 10 : 9; });
+    auto payload = makeFlatVector<int64_t>(
+        kRowsPerRun,
+        [run](vector_size_t row) {
+          return static_cast<int64_t>(run) * kRowsPerRun + row;
+        });
+    inputs.push_back(makeRowVector({partition, orderKey, payload}));
+  }
+  createDuckDbTable(inputs);
+
+  auto plan = exec::test::PlanBuilder()
+                  .values(inputs)
+                  .topNRank(
+                      "rank", {"c0"}, {"c1 DESC NULLS LAST"}, 1, true)
+                  .planNode();
+  assertQuery(
+      plan,
+      "SELECT c0, c1, c2, row_number FROM ("
+      "SELECT c0, c1, c2, rank() OVER (PARTITION BY c0 ORDER BY c1 DESC NULLS "
+      "LAST) AS row_number FROM tmp) WHERE row_number = 1");
+}
+
+TEST_F(TopNRowNumberTest, rowNumberManyPartitionsAndSpanningContinuation) {
+  constexpr int32_t kRuns = 5;
+  constexpr vector_size_t kRowsPerRun = 257;
+  std::vector<RowVectorPtr> inputs;
+  inputs.reserve(kRuns);
+  for (int32_t run = 0; run < kRuns; ++run) {
+    auto partition = makeFlatVector<int64_t>(
+        kRowsPerRun, [run](vector_size_t row) {
+          // One partition crosses every run; all others are unique so the
+          // candidate reduction is intentionally close to a no-op (Job8-like).
+          return row == 0
+              ? -1
+              : static_cast<int64_t>(run) * kRowsPerRun + row;
+        });
+    auto orderKey = makeFlatVector<int64_t>(
+        kRowsPerRun, [run](vector_size_t row) {
+          if (row == 0) {
+            // The first run owns the winner. Later chunks for partition -1 are
+            // strictly worse and must be dropped by cross-batch row_number
+            // state instead of emitted again.
+            return static_cast<int64_t>(run == 0 ? 100 : 90);
+          }
+          return static_cast<int64_t>((row * 17 + run * 11) % 101);
+        });
+    auto payload = makeFlatVector<std::string>(
+        kRowsPerRun, [run](vector_size_t row) {
+          // Wider-than-test-reader-limit rows force the shared partition's five
+          // candidates across paused reader/output chunks.
+          return fmt::format("run={};row={};", run, row) +
+              std::string(2048, static_cast<char>('a' + run));
+        });
+    inputs.push_back(makeRowVector({partition, orderKey, payload}));
+  }
+  createDuckDbTable(inputs);
+
+  auto plan = exec::test::PlanBuilder()
+                  .values(inputs)
+                  .topNRowNumber(
+                      {"c0"}, {"c1 DESC NULLS LAST"}, 1, true)
+                  .planNode();
+  assertQuery(
+      plan,
+      "SELECT c0, c1, c2, row_number FROM ("
+      "SELECT c0, c1, c2, row_number() OVER (PARTITION BY c0 ORDER BY c1 DESC "
+      "NULLS LAST) AS row_number FROM tmp) WHERE row_number = 1");
+}
+
+} // namespace
+
+TEST(TopNCompactionAdmissionTest, exceptionRelease) {
+  using Helper = test::CudfTopNRowNumberTestHelper;
+  using Permit = Helper::CompactionPermit;
+
+  EXPECT_EQ(Helper::activeCompactionPermits(), 0);
+  bool caught{false};
+  try {
+    Permit permit(1);
+    EXPECT_TRUE(permit.ready());
+    EXPECT_FALSE(permit.hasWaitFuture());
+    EXPECT_EQ(Helper::activeCompactionPermits(), 1);
+    throw std::runtime_error("injected compaction failure");
+  } catch (const std::runtime_error&) {
+    caught = true;
+  }
+  EXPECT_TRUE(caught);
+  EXPECT_EQ(Helper::activeCompactionPermits(), 0);
+  {
+    Permit nextPermit(1);
+    EXPECT_EQ(Helper::activeCompactionPermits(), 1);
+  }
+  EXPECT_EQ(Helper::activeCompactionPermits(), 0);
+}
+
+TEST(TopNCompactionAdmissionTest, fifoAndCancellation) {
+  using Helper = test::CudfTopNRowNumberTestHelper;
+  using Permit = Helper::CompactionPermit;
+
+  EXPECT_EQ(Helper::activeCompactionPermits(), 0);
+
+  // Zero preserves the documented unlimited mode and never consumes a slot.
+  {
+    Permit unlimited(0);
+    EXPECT_TRUE(unlimited.ready());
+    EXPECT_FALSE(unlimited.hasWaitFuture());
+    EXPECT_EQ(Helper::activeCompactionPermits(), 0);
+  }
+
+  auto first = std::make_unique<Permit>(1);
+  auto second = std::make_unique<Permit>(1);
+  auto third = std::make_unique<Permit>(1);
+  ASSERT_TRUE(first->ready());
+  ASSERT_FALSE(second->ready());
+  ASSERT_FALSE(third->ready());
+  ASSERT_TRUE(second->hasWaitFuture());
+  ASSERT_TRUE(third->hasWaitFuture());
+  auto secondFuture = second->takeWaitFuture();
+  auto thirdFuture = third->takeWaitFuture();
+  EXPECT_FALSE(secondFuture.isReady());
+  EXPECT_FALSE(thirdFuture.isReady());
+
+  // Releasing the holder grants exactly the oldest request.
+  first.reset();
+  EXPECT_TRUE(secondFuture.isReady());
+  EXPECT_FALSE(thirdFuture.isReady());
+  EXPECT_TRUE(second->ready());
+  EXPECT_FALSE(third->ready());
+  EXPECT_EQ(Helper::activeCompactionPermits(), 1);
+
+  // Cancelling the granted request releases its slot and wakes the next FIFO
+  // waiter. A queued cancellation also realizes its future without consuming a
+  // slot, which is what lets task cancellation remove a parked driver.
+  second.reset();
+  EXPECT_TRUE(thirdFuture.isReady());
+  EXPECT_TRUE(third->ready());
+  EXPECT_EQ(Helper::activeCompactionPermits(), 1);
+
+  auto cancelled = std::make_unique<Permit>(1);
+  ASSERT_FALSE(cancelled->ready());
+  auto cancelledFuture = cancelled->takeWaitFuture();
+  EXPECT_FALSE(cancelledFuture.isReady());
+  cancelled.reset();
+  EXPECT_TRUE(cancelledFuture.isReady());
+  EXPECT_EQ(Helper::activeCompactionPermits(), 1);
+
+  third.reset();
+  EXPECT_EQ(Helper::activeCompactionPermits(), 0);
+}
+
+} // namespace facebook::velox::cudf_velox

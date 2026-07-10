@@ -15,6 +15,7 @@
  */
 
 #include "velox/experimental/cudf/CudfNoDefaults.h"
+#include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/CudfTopNRowNumber.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
@@ -41,6 +42,7 @@
 
 #include <atomic>
 #include <filesystem>
+#include <mutex>
 
 namespace facebook::velox::cudf_velox {
 namespace {
@@ -48,10 +50,140 @@ namespace {
 constexpr uint64_t kSortedRunBytes = 3ULL << 30;
 constexpr uint64_t kCandidateRunBytes = 128ULL << 20;
 constexpr uint64_t kMergeChunkBytes = 32ULL << 20;
-constexpr size_t kMergeFanIn = 4;
+constexpr uint64_t kMergePassBytes = 128ULL << 20;
+constexpr uint64_t kSpillRowGroupBytes = 64ULL << 20;
+constexpr uint64_t kOutputChunkBytes = 32ULL << 20;
+constexpr size_t kMergeFanIn = 2;
+constexpr size_t kFinalMergeRuns = 2;
 constexpr cudf::size_type kMaxCompleteOutputRows = 262144;
 constexpr std::string_view kConditionalTopNMarker = "__gluten_mpp_topn_active";
 std::atomic<uint64_t> spillDirectorySequence{0};
+std::atomic<uint64_t> candidateRunBytes{kCandidateRunBytes};
+std::atomic<uint64_t> mergeChunkBytes{kMergeChunkBytes};
+std::atomic<uint64_t> outputChunkBytes{kOutputChunkBytes};
+std::atomic<cudf::size_type> maxOutputRows{kMaxCompleteOutputRows};
+
+size_t topNCompactionConcurrency() {
+  return static_cast<size_t>(
+      CudfConfig::getInstance().topNCompactionConcurrency);
+}
+
+class TopNCompactionAdmission {
+ public:
+  enum class RequestState { kQueued, kAcquired, kCancelled };
+
+  struct Request {
+    RequestState state{RequestState::kQueued};
+    std::optional<ContinuePromise> promise;
+  };
+
+  struct Reservation {
+    std::shared_ptr<Request> request;
+    ContinueFuture future{ContinueFuture::makeEmpty()};
+  };
+
+  Reservation reserve(size_t concurrency) {
+    if (concurrency == 0) {
+      return {};
+    }
+
+    Reservation reservation;
+    reservation.request = std::make_shared<Request>();
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (capacity_ == 0) {
+      capacity_ = concurrency;
+    }
+    VELOX_CHECK_EQ(
+        capacity_,
+        concurrency,
+        "Concurrent TopN compaction requests must use one process-wide "
+        "concurrency limit");
+
+    if (waiters_.empty() && active_ < capacity_) {
+      reservation.request->state = RequestState::kAcquired;
+      ++active_;
+      return reservation;
+    }
+
+    auto [promise, future] = makeVeloxContinuePromiseContract(
+        "CudfTopNRowNumber compaction admission");
+    reservation.request->promise = std::move(promise);
+    reservation.future = std::move(future);
+    waiters_.push_back(reservation.request);
+    return reservation;
+  }
+
+  bool acquired(const std::shared_ptr<Request>& request) const {
+    if (!request) {
+      // A zero concurrency setting disables admission limiting.
+      return true;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    return request->state == RequestState::kAcquired;
+  }
+
+  void cancelOrRelease(const std::shared_ptr<Request>& request) {
+    if (!request) {
+      return;
+    }
+
+    std::vector<ContinuePromise> promises;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (request->state == RequestState::kAcquired) {
+        VELOX_CHECK_GT(active_, 0);
+        --active_;
+        request->state = RequestState::kCancelled;
+      } else if (request->state == RequestState::kQueued) {
+        request->state = RequestState::kCancelled;
+        movePromise(*request, promises);
+      }
+      grantWaitersLocked(promises);
+      if (active_ == 0 && waiters_.empty()) {
+        capacity_ = 0;
+      }
+    }
+    for (auto& promise : promises) {
+      promise.setValue();
+    }
+  }
+
+  size_t active() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return active_;
+  }
+
+ private:
+  static void movePromise(
+      Request& request,
+      std::vector<ContinuePromise>& promises) {
+    if (request.promise.has_value()) {
+      promises.push_back(std::move(*request.promise));
+      request.promise.reset();
+    }
+  }
+
+  void grantWaitersLocked(std::vector<ContinuePromise>& promises) {
+    while (active_ < capacity_ && !waiters_.empty()) {
+      auto request = std::move(waiters_.front());
+      waiters_.pop_front();
+      if (request->state == RequestState::kCancelled) {
+        continue;
+      }
+      VELOX_CHECK(request->state == RequestState::kQueued);
+      request->state = RequestState::kAcquired;
+      ++active_;
+      movePromise(*request, promises);
+    }
+  }
+
+  mutable std::mutex mutex_;
+  std::deque<std::shared_ptr<Request>> waiters_;
+  size_t capacity_{0};
+  size_t active_{0};
+};
+
+TopNCompactionAdmission topNCompactionAdmission;
 
 bool isSupportedKeyType(const TypePtr& type) {
   switch (type->kind()) {
@@ -92,7 +224,82 @@ cudf::size_type firstSearchPosition(
   return result;
 }
 
+// nullOrders_ uses cuDF's direction-adjusted convention from the other cuDF
+// sort operators. Convert it back to the SQL meaning before deciding whether
+// min/max may ignore nulls.
+bool semanticNullsLast(
+    cudf::order order,
+    cudf::null_order nullOrder) {
+  return (order == cudf::order::ASCENDING &&
+          nullOrder == cudf::null_order::AFTER) ||
+      (order == cudf::order::DESCENDING &&
+       nullOrder == cudf::null_order::BEFORE);
+}
+
 } // namespace
+
+struct CudfTopNRowNumber::CompactionPermit::State {
+  std::shared_ptr<TopNCompactionAdmission::Request> request;
+  ContinueFuture future{ContinueFuture::makeEmpty()};
+};
+
+CudfTopNRowNumber::CompactionPermit::CompactionPermit(size_t concurrency)
+    : state_(std::make_unique<State>()) {
+  auto reservation = topNCompactionAdmission.reserve(concurrency);
+  state_->request = std::move(reservation.request);
+  state_->future = std::move(reservation.future);
+}
+
+CudfTopNRowNumber::CompactionPermit::~CompactionPermit() {
+  topNCompactionAdmission.cancelOrRelease(state_->request);
+}
+
+bool CudfTopNRowNumber::CompactionPermit::ready() const {
+  return topNCompactionAdmission.acquired(state_->request);
+}
+
+bool CudfTopNRowNumber::CompactionPermit::hasWaitFuture() const {
+  return state_->future.valid();
+}
+
+ContinueFuture CudfTopNRowNumber::CompactionPermit::takeWaitFuture() {
+  VELOX_CHECK(state_->future.valid());
+  return std::move(state_->future);
+}
+
+size_t CudfTopNRowNumber::CompactionPermit::testingActivePermits() {
+  return topNCompactionAdmission.active();
+}
+
+void CudfTopNRowNumber::testingSetMemoryLimits(
+    uint64_t candidateBytes,
+    uint64_t chunkBytes,
+    uint64_t outputBytes,
+    cudf::size_type outputRows) {
+  VELOX_CHECK_GT(candidateBytes, 0);
+  VELOX_CHECK_GT(chunkBytes, 0);
+  VELOX_CHECK_GT(outputBytes, 0);
+  VELOX_CHECK_GT(outputRows, 0);
+  candidateRunBytes.store(candidateBytes);
+  mergeChunkBytes.store(chunkBytes);
+  outputChunkBytes.store(outputBytes);
+  maxOutputRows.store(outputRows);
+}
+
+void CudfTopNRowNumber::testingResetMemoryLimits() {
+  candidateRunBytes.store(kCandidateRunBytes);
+  mergeChunkBytes.store(kMergeChunkBytes);
+  outputChunkBytes.store(kOutputChunkBytes);
+  maxOutputRows.store(kMaxCompleteOutputRows);
+}
+
+exec::BlockingReason CudfTopNRowNumber::isBlocked(ContinueFuture* future) {
+  if (compactionPermit_ && compactionPermit_->hasWaitFuture()) {
+    *future = compactionPermit_->takeWaitFuture();
+    return exec::BlockingReason::kWaitForMemory;
+  }
+  return exec::BlockingReason::kNotBlocked;
+}
 
 bool CudfTopNRowNumber::shouldReplace(
     const std::shared_ptr<const core::TopNRowNumberNode>& node) {
@@ -143,7 +350,8 @@ CudfTopNRowNumber::CudfTopNRowNumber(
       rankFunction_(node->rankFunction()),
       generateRowNumber_(node->generateRowNumber()),
       inputType_(node->inputType()),
-      diagnosticNodeId_(node->id()) {
+      diagnosticNodeId_(node->id()),
+      stateStream_(cudfGlobalStreamPool().get_stream()) {
   VELOX_CHECK_EQ(limit_, 1, "CudfTopNRowNumber only supports limit=1");
   VELOX_CHECK(
       rankFunction_ == core::TopNRowNumberNode::RankFunction::kRowNumber ||
@@ -208,8 +416,20 @@ void CudfTopNRowNumber::doAddInput(RowVectorPtr input) {
   auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input);
   VELOX_CHECK_NOT_NULL(cudfInput, "Expected CudfVector input");
 
+  const auto inputStream = cudfInput->stream();
+  if (inputStream.value() != stateStream_.value()) {
+    std::vector<rmm::cuda_stream_view> inputStreams{inputStream};
+    cudf::detail::join_streams(inputStreams, stateStream_);
+  }
+  // Rebind unconditionally before taking any views. A packed-table backing
+  // buffer may still carry a different deallocation stream even when the
+  // CudfVector's logical stream already equals stateStream_.
+  VELOX_CHECK(
+      cudfInput->rebindStream(stateStream_),
+      "CudfTopNRowNumber cannot rebind its input to the state stream");
+  auto stream = stateStream_;
+
   if (passthroughKey_.has_value()) {
-    auto stream = cudfInput->stream();
     auto inputView = cudfInput->getTableView();
     auto activeMask = inputView.column(*passthroughKey_);
     VELOX_CHECK(
@@ -239,7 +459,6 @@ void CudfTopNRowNumber::doAddInput(RowVectorPtr input) {
         pool(), inputType_, active->num_rows(), std::move(active), stream);
   }
 
-  auto stream = cudfInput->stream();
   auto mr = get_output_mr();
   auto batchCandidates =
       reduceToCandidates(cudfInput->getTableView(), stream, mr);
@@ -259,7 +478,7 @@ void CudfTopNRowNumber::doAddInput(RowVectorPtr input) {
       std::move(candidates_),
       stream);
   const auto candidateBytes = candidateVector->estimateFlatSize();
-  if (candidateBytes >= kCandidateRunBytes) {
+  if (candidateBytes >= candidateRunBytes.load()) {
     inputs_.push_back(std::move(candidateVector));
     bufferedBytes_ = candidateBytes;
     spillSortedRun();
@@ -271,7 +490,7 @@ void CudfTopNRowNumber::doAddInput(RowVectorPtr input) {
 void CudfTopNRowNumber::doNoMoreInput() {
   Operator::noMoreInput();
   if (spilled_ && candidates_) {
-    auto stream = cudfGlobalStreamPool().get_stream();
+    auto stream = stateStream_;
     auto candidateVector = std::make_shared<CudfVector>(
         pool(),
         inputType_,
@@ -283,8 +502,30 @@ void CudfTopNRowNumber::doNoMoreInput() {
     spillSortedRun();
   }
   if (spilled_) {
-    compactSortedRunsForMerge();
-    initializeSortedRunReaders();
+    const auto compactionConcurrency = topNCompactionConcurrency();
+    if (!compactionPermit_) {
+      if (compactionConcurrency > 0) {
+        logDeviceMemorySnapshot(fmt::format(
+            "operator=CudfTopNRowNumber node={} state=compaction.admission.wait "
+            "runs={} concurrency={}",
+            diagnosticNodeId_,
+            sortedRuns_.size(),
+            compactionConcurrency));
+      }
+      // reserve() never waits on this driver thread. A queued request exposes a
+      // ContinueFuture from isBlocked() and resumes in getOutput after its FIFO
+      // turn is granted.
+      compactionPermit_ =
+          std::make_unique<CompactionPermit>(compactionConcurrency);
+    }
+    try {
+      if (compactionPermit_->ready()) {
+        prepareSpilledOutput();
+      }
+    } catch (...) {
+      cleanupSpillStateAfterFailure("noMoreInput");
+      throw;
+    }
   }
   if (!candidates_ && passthroughOutputs_.empty()) {
     finished_ = !spilled_;
@@ -303,13 +544,25 @@ RowVectorPtr CudfTopNRowNumber::doGetOutput() {
   }
 
   if (spilled_) {
-    auto result = computeNextSortedOutput();
-    if (result != nullptr) {
-      return result;
+    try {
+      prepareSpilledOutput();
+      auto result = computeNextSortedOutput();
+      if (result != nullptr) {
+        return result;
+      }
+      finished_ = true;
+      cleanupSpillFiles();
+      return nullptr;
+    } catch (...) {
+      // Preserve the original merge failure while ensuring all GPU owners are
+      // destroyed before handing the admission slot to another operator.
+      cleanupSpillStateAfterFailure("getOutput");
+      throw;
     }
-    finished_ = true;
-    cleanupSpillFiles();
-    return nullptr;
+  }
+
+  if (auto output = takePendingOutput()) {
+    return output;
   }
 
   if (!candidates_) {
@@ -317,15 +570,15 @@ RowVectorPtr CudfTopNRowNumber::doGetOutput() {
     return nullptr;
   }
 
-  auto stream = cudfGlobalStreamPool().get_stream();
+  auto stream = stateStream_;
   auto mr = get_output_mr();
   auto input = std::exchange(candidates_, nullptr);
   auto result =
       rankFunction_ == core::TopNRowNumberNode::RankFunction::kRowNumber
       ? computeLimitOneRowNumber(input->view(), stream, mr)
       : computeLimitOneRankLike(input->view(), stream, mr);
-  finished_ = true;
-  return result;
+  setPendingOutput(result->release());
+  return takePendingOutput();
 }
 
 std::unique_ptr<cudf::table> CudfTopNRowNumber::reduceToCandidates(
@@ -367,7 +620,7 @@ void CudfTopNRowNumber::spillSortedRun() {
     spilled_ = true;
   }
 
-  auto stream = cudfGlobalStreamPool().get_stream();
+  auto stream = stateStream_;
   auto mr = get_output_mr();
   logDeviceMemorySnapshot(
       fmt::format(
@@ -402,6 +655,7 @@ void CudfTopNRowNumber::spillSortedRun() {
       "{}/run-{:06}.parquet", spillDirectory_, spillFileSequence_++);
   auto options = cudf::io::parquet_writer_options::builder(
                      cudf::io::sink_info{path}, sorted->view())
+                     .row_group_size_bytes(kSpillRowGroupBytes)
                      .build();
   cudf::io::write_parquet(options, stream);
   sortedRuns_.push_back({std::move(path), nullptr});
@@ -412,185 +666,135 @@ void CudfTopNRowNumber::initializeSortedRunReaders() {
   if (readersInitialized_) {
     return;
   }
-  auto stream = cudfGlobalStreamPool().get_stream();
+  auto stream = stateStream_;
   auto mr = get_output_mr();
   for (auto& run : sortedRuns_) {
     auto options = cudf::io::parquet_reader_options::builder(
                        cudf::io::source_info{run.path})
                        .build();
     run.reader = std::make_unique<cudf::io::chunked_parquet_reader>(
-        kMergeChunkBytes, 0, options, stream, mr);
+        mergeChunkBytes.load(), kMergePassBytes, options, stream, mr);
+    run.chunk.reset();
+    run.chunkOffset = 0;
+    run.chunkBytes = 0;
   }
   readersInitialized_ = true;
+  logDeviceMemorySnapshot(fmt::format(
+      "operator=CudfTopNRowNumber node={} state=output.merge.begin runs={} "
+      "chunkReadLimit={} passReadLimit={}",
+      diagnosticNodeId_,
+      sortedRuns_.size(),
+      mergeChunkBytes.load(),
+      kMergePassBytes));
 }
 
-void CudfTopNRowNumber::compactSortedRunsForMerge() {
-  auto stream = cudfGlobalStreamPool().get_stream();
-  auto mr = get_output_mr();
+uint64_t CudfTopNRowNumber::measureTableBytes(
+    std::unique_ptr<cudf::table>& table,
+    const TypePtr& type,
+    rmm::cuda_stream_view stream) {
+  VELOX_CHECK_NOT_NULL(table);
+  const auto rows = table->num_rows();
+  auto vector = std::make_shared<CudfVector>(
+      pool(), type, rows, std::move(table), stream);
+  const auto bytes = vector->estimateFlatSize();
+  table = vector->release();
+  return bytes;
+}
 
-  while (sortedRuns_.size() > kMergeFanIn) {
-    std::vector<SortedRun> nextLevel;
-    nextLevel.reserve((sortedRuns_.size() + kMergeFanIn - 1) / kMergeFanIn);
+bool CudfTopNRowNumber::loadPausedChunk(
+    SortedRun& run,
+    rmm::cuda_stream_view stream,
+    PausedMergeStats& stats) {
+  VELOX_CHECK(stream.value() == stateStream_.value());
+  VELOX_CHECK_NOT_NULL(run.reader);
 
-    for (size_t begin = 0; begin < sortedRuns_.size(); begin += kMergeFanIn) {
-      const auto end = std::min(sortedRuns_.size(), begin + kMergeFanIn);
-      if (end - begin == 1) {
-        nextLevel.push_back(std::move(sortedRuns_[begin]));
-        continue;
-      }
-
-      std::vector<std::unique_ptr<cudf::io::chunked_parquet_reader>> readers;
-      readers.reserve(end - begin);
-      for (size_t index = begin; index < end; ++index) {
-        auto options = cudf::io::parquet_reader_options::builder(
-                           cudf::io::source_info{sortedRuns_[index].path})
-                           .build();
-        readers.push_back(
-            std::make_unique<cudf::io::chunked_parquet_reader>(
-                kMergeChunkBytes, 0, options, stream, mr));
-      }
-
-      const auto outputPath = fmt::format(
-          "{}/merge-{:06}.parquet", spillDirectory_, spillFileSequence_++);
-      auto writerOptions = cudf::io::chunked_parquet_writer_options::builder(
-                               cudf::io::sink_info{outputPath})
-                               .build();
-      cudf::io::chunked_parquet_writer writer(writerOptions, stream);
-      std::unique_ptr<cudf::table> carry;
-
-      while (true) {
-        std::vector<std::unique_ptr<cudf::table>> chunks;
-        std::vector<cudf::table_view> mergeViews;
-        std::vector<cudf::table_view> boundaryRows;
-        if (carry && carry->num_rows() > 0) {
-          mergeViews.push_back(carry->view());
-        }
-        for (auto& reader : readers) {
-          if (!reader->has_next()) {
-            continue;
-          }
-          auto chunk = reader->read_chunk();
-          if (chunk.tbl->num_rows() == 0) {
-            continue;
-          }
-          chunks.push_back(std::move(chunk.tbl));
-          mergeViews.push_back(chunks.back()->view());
-          if (reader->has_next()) {
-            auto last = cudf::slice(
-                chunks.back()->view(),
-                {chunks.back()->num_rows() - 1, chunks.back()->num_rows()},
-                stream);
-            boundaryRows.push_back(last.front());
-          }
-        }
-
-        if (mergeViews.empty()) {
-          break;
-        }
-        std::unique_ptr<cudf::table> merged = mergeViews.size() == 1
-            ? std::make_unique<cudf::table>(mergeViews.front(), stream, mr)
-            : cudf::merge(
-                  mergeViews,
-                  allKeyIndices_,
-                  columnOrders_,
-                  nullOrders_,
-                  stream,
-                  mr);
-        carry.reset();
-        if (boundaryRows.empty()) {
-          writer.write(merged->view());
-          break;
-        }
-
-        auto boundaryCandidates = cudf::concatenate(boundaryRows, stream, mr);
-        auto sortedBoundaries = cudf::sort_by_key(
-            boundaryCandidates->view(),
-            boundaryCandidates->view().select(allKeyIndices_),
-            columnOrders_,
-            nullOrders_,
-            stream,
-            mr);
-        auto boundary = cudf::slice(sortedBoundaries->view(), {0, 1}, stream);
-        auto positions = cudf::upper_bound(
-            merged->view().select(allKeyIndices_),
-            boundary.front().select(allKeyIndices_),
-            columnOrders_,
-            nullOrders_,
-            stream,
-            mr);
-        const auto safeEnd = firstSearchPosition(positions->view(), stream);
-        carry = copyTableSlice(
-            merged->view(), safeEnd, merged->num_rows(), stream, mr);
-        if (safeEnd > 0) {
-          auto safe = cudf::slice(merged->view(), {0, safeEnd}, stream);
-          writer.write(safe.front());
-        }
-      }
-      writer.close();
-
-      for (size_t index = begin; index < end; ++index) {
-        std::error_code error;
-        std::filesystem::remove(sortedRuns_[index].path, error);
-      }
-      nextLevel.push_back({outputPath, nullptr});
-    }
-    sortedRuns_ = std::move(nextLevel);
+  if (run.chunk && run.chunkOffset < run.chunk->num_rows()) {
+    return true;
   }
+  run.chunk.reset();
+  run.chunkOffset = 0;
+  run.chunkBytes = 0;
+
+  while (run.reader->has_next()) {
+    auto chunk = run.reader->read_chunk();
+    ++stats.sourceChunks;
+    stats.sourceRows += chunk.tbl->num_rows();
+    if (chunk.tbl->num_rows() == 0) {
+      continue;
+    }
+    run.chunk = std::move(chunk.tbl);
+    run.chunkBytes =
+        measureTableBytes(run.chunk, inputType_, stateStream_);
+    stats.sourceBytes += run.chunkBytes;
+    return true;
+  }
+  return false;
 }
 
-std::unique_ptr<cudf::table> CudfTopNRowNumber::mergeNextSortedBatch(
+std::unique_ptr<cudf::table> CudfTopNRowNumber::mergeNextPausedBatch(
+    std::vector<SortedRun*>& runs,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr,
-    bool& finalBatch) {
-  // Once all readers are exhausted, a subsequent call may exist solely to
-  // drain partitionCarry_. Mark it final so the last partition is emitted
-  // instead of being retained forever as a possibly-incomplete peer group.
-  finalBatch = mergeFinished_;
-  while (!mergeFinished_) {
-    std::vector<std::unique_ptr<cudf::table>> chunks;
-    std::vector<cudf::table_view> mergeViews;
+    bool& finished,
+    PausedMergeStats& stats) {
+  VELOX_CHECK(stream.value() == stateStream_.value());
+  if (finished) {
+    return nullptr;
+  }
+
+  std::vector<SortedRun*> activeRuns;
+  std::vector<cudf::table_view> remainingViews;
+  activeRuns.reserve(runs.size());
+  remainingViews.reserve(runs.size());
+  uint64_t residentRows{0};
+  uint64_t residentBytes{0};
+  for (auto* run : runs) {
+    VELOX_CHECK_NOT_NULL(run);
+    if (!loadPausedChunk(*run, stream, stats)) {
+      continue;
+    }
+    auto slices = cudf::slice(
+        run->chunk->view(),
+        {run->chunkOffset, run->chunk->num_rows()},
+        stream);
+    VELOX_CHECK_EQ(slices.size(), 1);
+    activeRuns.push_back(run);
+    remainingViews.push_back(slices.front());
+    residentRows += slices.front().num_rows();
+    // Count the whole owning chunk. This deliberately overestimates a paused
+    // suffix and therefore remains a safe resident-byte high-water mark.
+    residentBytes += run->chunkBytes;
+  }
+
+  stats.maxActiveRuns = std::max<uint64_t>(
+      stats.maxActiveRuns, activeRuns.size());
+  stats.maxResidentRows =
+      std::max(stats.maxResidentRows, residentRows);
+  stats.maxResidentBytes =
+      std::max(stats.maxResidentBytes, residentBytes);
+  if (activeRuns.empty()) {
+    finished = true;
+    return nullptr;
+  }
+
+  std::vector<cudf::table_view> safeViews;
+  std::vector<cudf::size_type> consumed(activeRuns.size(), 0);
+  if (activeRuns.size() == 1) {
+    safeViews.push_back(remainingViews.front());
+    consumed.front() = remainingViews.front().num_rows();
+  } else {
+    // Every run is sorted. The minimum current tail is a global safe boundary:
+    // future rows in every run are >= its current tail. Consume only each
+    // run's prefix through that boundary and leave its suffix in the owning
+    // chunk. A leading reader is therefore paused instead of copied into an
+    // ever-growing carry table.
     std::vector<cudf::table_view> boundaryRows;
-    if (mergeCarry_ && mergeCarry_->num_rows() > 0) {
-      mergeViews.push_back(mergeCarry_->view());
+    boundaryRows.reserve(remainingViews.size());
+    for (const auto& view : remainingViews) {
+      auto last = cudf::slice(
+          view, {view.num_rows() - 1, view.num_rows()}, stream);
+      boundaryRows.push_back(last.front());
     }
-    for (auto& run : sortedRuns_) {
-      if (!run.reader || !run.reader->has_next()) {
-        continue;
-      }
-      auto chunk = run.reader->read_chunk();
-      if (chunk.tbl->num_rows() == 0) {
-        continue;
-      }
-      chunks.push_back(std::move(chunk.tbl));
-      mergeViews.push_back(chunks.back()->view());
-      if (run.reader->has_next()) {
-        auto last = cudf::slice(
-            chunks.back()->view(),
-            {chunks.back()->num_rows() - 1, chunks.back()->num_rows()},
-            stream);
-        boundaryRows.push_back(last.front());
-      }
-    }
-    if (mergeViews.empty()) {
-      mergeFinished_ = true;
-      finalBatch = true;
-      return std::exchange(mergeCarry_, nullptr);
-    }
-
-    std::unique_ptr<cudf::table> merged;
-    if (mergeViews.size() == 1) {
-      merged = std::make_unique<cudf::table>(mergeViews.front(), stream, mr);
-    } else {
-      merged = cudf::merge(
-          mergeViews, allKeyIndices_, columnOrders_, nullOrders_, stream, mr);
-    }
-    mergeCarry_.reset();
-    if (boundaryRows.empty()) {
-      mergeFinished_ = true;
-      finalBatch = true;
-      return merged;
-    }
-
     auto boundaryCandidates = cudf::concatenate(boundaryRows, stream, mr);
     auto sortedBoundaries = cudf::sort_by_key(
         boundaryCandidates->view(),
@@ -600,55 +804,293 @@ std::unique_ptr<cudf::table> CudfTopNRowNumber::mergeNextSortedBatch(
         stream,
         mr);
     auto boundary = cudf::slice(sortedBoundaries->view(), {0, 1}, stream);
-    // Future rows are >= each run's current tail. Rows equal to the minimum
-    // tail are therefore safe to emit as well (the sort is not required to be
-    // stable across runs). Keeping them in carry makes low-cardinality keys
-    // grow without bound.
-    auto positions = cudf::upper_bound(
-        merged->view().select(allKeyIndices_),
-        boundary.front().select(allKeyIndices_),
-        columnOrders_,
-        nullOrders_,
-        stream,
-        mr);
-    const auto safeEnd = firstSearchPosition(positions->view(), stream);
-    mergeCarry_ =
-        copyTableSlice(merged->view(), safeEnd, merged->num_rows(), stream, mr);
-    if (safeEnd > 0) {
-      return copyTableSlice(merged->view(), 0, safeEnd, stream, mr);
+
+    for (size_t index = 0; index < remainingViews.size(); ++index) {
+      auto positions = cudf::upper_bound(
+          remainingViews[index].select(allKeyIndices_),
+          boundary.front().select(allKeyIndices_),
+          columnOrders_,
+          nullOrders_,
+          stream,
+          mr);
+      consumed[index] = firstSearchPosition(positions->view(), stream);
+      if (consumed[index] == 0) {
+        continue;
+      }
+      auto safe =
+          cudf::slice(remainingViews[index], {0, consumed[index]}, stream);
+      safeViews.push_back(safe.front());
     }
   }
-  return nullptr;
+
+  VELOX_CHECK(!safeViews.empty(), "Paused Top-N merge made no progress");
+  std::unique_ptr<cudf::table> output = safeViews.size() == 1
+      ? std::make_unique<cudf::table>(safeViews.front(), stream, mr)
+      : cudf::merge(
+            safeViews,
+            allKeyIndices_,
+            columnOrders_,
+            nullOrders_,
+            stream,
+            mr);
+
+  for (size_t index = 0; index < activeRuns.size(); ++index) {
+    activeRuns[index]->chunkOffset += consumed[index];
+  }
+  ++stats.outputBatches;
+  stats.outputRows += output->num_rows();
+  const auto batchBytes =
+      measureTableBytes(output, inputType_, stateStream_);
+  stats.outputBytes += batchBytes;
+  stats.maxOutputBytes = std::max(stats.maxOutputBytes, batchBytes);
+
+  finished = true;
+  for (auto* run : runs) {
+    if ((run->chunk && run->chunkOffset < run->chunk->num_rows()) ||
+        (run->reader && run->reader->has_next())) {
+      finished = false;
+      break;
+    }
+  }
+  return output;
 }
 
-std::unique_ptr<cudf::table> CudfTopNRowNumber::takeCompletePartitions(
-    std::unique_ptr<cudf::table> sorted,
-    bool finalBatch,
-    rmm::cuda_stream_view stream,
-    rmm::device_async_resource_ref mr) {
-  if (partitionCarry_ && partitionCarry_->num_rows() > 0) {
-    if (sorted && sorted->num_rows() > 0) {
-      std::vector<cudf::table_view> pieces{
-          partitionCarry_->view(), sorted->view()};
-      sorted = cudf::concatenate(pieces, stream, mr);
-      partitionCarry_.reset();
-    } else {
-      sorted = std::exchange(partitionCarry_, nullptr);
-    }
+void CudfTopNRowNumber::prepareSpilledOutput() {
+  if (readersInitialized_) {
+    return;
   }
-  if (!sorted || sorted->num_rows() == 0) {
+  VELOX_CHECK_NOT_NULL(compactionPermit_);
+  VELOX_CHECK(
+      compactionPermit_->ready(),
+      "TopN spill compaction started before admission was granted");
+  try {
+    compactSortedRunsForMerge();
+    initializeSortedRunReaders();
+  } catch (...) {
+    cleanupSpillStateAfterFailure("prepareSpilledOutput");
+    throw;
+  }
+}
+
+void CudfTopNRowNumber::compactSortedRunsForMerge() {
+  auto stream = stateStream_;
+  auto mr = get_output_mr();
+  const auto compactionConcurrency = topNCompactionConcurrency();
+  VELOX_CHECK_NOT_NULL(compactionPermit_);
+  VELOX_CHECK(compactionPermit_->ready());
+  logDeviceMemorySnapshot(fmt::format(
+      "operator=CudfTopNRowNumber node={} state=compaction.admission.held "
+      "runs={} concurrency={}",
+      diagnosticNodeId_,
+      sortedRuns_.size(),
+      compactionConcurrency));
+
+  PausedMergeStats compactionStats;
+
+  try {
+    // Stop at two runs. getOutput performs the final merge with the same paused
+    // cursors. compactionPermit_ deliberately remains held until those readers
+    // and all pending output have been drained and cleaned up.
+    while (sortedRuns_.size() > kFinalMergeRuns) {
+      const auto inputRunCount = sortedRuns_.size();
+      std::vector<SortedRun> nextLevel;
+      nextLevel.reserve((sortedRuns_.size() + kMergeFanIn - 1) / kMergeFanIn);
+      std::vector<std::string> obsoletePaths;
+      PausedMergeStats levelStats;
+
+      for (size_t begin = 0; begin < sortedRuns_.size(); begin += kMergeFanIn) {
+        const auto end = std::min(sortedRuns_.size(), begin + kMergeFanIn);
+        if (end - begin == 1) {
+          nextLevel.push_back(std::move(sortedRuns_[begin]));
+          continue;
+        }
+
+        std::vector<SortedRun*> runs;
+        runs.reserve(end - begin);
+        for (size_t index = begin; index < end; ++index) {
+          auto options = cudf::io::parquet_reader_options::builder(
+                             cudf::io::source_info{sortedRuns_[index].path})
+                             .build();
+          auto& run = sortedRuns_[index];
+          run.reader = std::make_unique<cudf::io::chunked_parquet_reader>(
+              mergeChunkBytes.load(), kMergePassBytes, options, stream, mr);
+          run.chunk.reset();
+          run.chunkOffset = 0;
+          run.chunkBytes = 0;
+          runs.push_back(&run);
+        }
+
+        const auto outputPath = fmt::format(
+            "{}/merge-{:06}.parquet", spillDirectory_, spillFileSequence_++);
+        auto writerOptions = cudf::io::chunked_parquet_writer_options::builder(
+                                 cudf::io::sink_info{outputPath})
+                                 .row_group_size_bytes(kSpillRowGroupBytes)
+                                 .build();
+        cudf::io::chunked_parquet_writer writer(writerOptions, stream);
+        bool groupFinished{false};
+        while (!groupFinished) {
+          auto merged = mergeNextPausedBatch(
+              runs, stream, mr, groupFinished, levelStats);
+          if (merged && merged->num_rows() > 0) {
+            writer.write(merged->view());
+          }
+        }
+        writer.close();
+
+        for (size_t index = begin; index < end; ++index) {
+          auto& run = sortedRuns_[index];
+          run.reader.reset();
+          run.chunk.reset();
+          run.chunkOffset = 0;
+          run.chunkBytes = 0;
+          obsoletePaths.push_back(run.path);
+        }
+        nextLevel.push_back({outputPath, nullptr});
+      }
+
+      // Complete all I/O and stream-ordered frees before deleting source runs
+      // and starting the next level. The async allocator can then immediately
+      // reuse the completed level's storage.
+      stream.synchronize();
+      for (const auto& path : obsoletePaths) {
+        std::error_code error;
+        std::filesystem::remove(path, error);
+      }
+      sortedRuns_ = std::move(nextLevel);
+
+      compactionStats.sourceChunks += levelStats.sourceChunks;
+      compactionStats.sourceRows += levelStats.sourceRows;
+      compactionStats.sourceBytes += levelStats.sourceBytes;
+      compactionStats.outputBatches += levelStats.outputBatches;
+      compactionStats.outputRows += levelStats.outputRows;
+      compactionStats.outputBytes += levelStats.outputBytes;
+      compactionStats.maxResidentRows = std::max(
+          compactionStats.maxResidentRows, levelStats.maxResidentRows);
+      compactionStats.maxResidentBytes = std::max(
+          compactionStats.maxResidentBytes, levelStats.maxResidentBytes);
+      compactionStats.maxOutputBytes = std::max(
+          compactionStats.maxOutputBytes, levelStats.maxOutputBytes);
+      compactionStats.maxActiveRuns = std::max(
+          compactionStats.maxActiveRuns, levelStats.maxActiveRuns);
+      logDeviceMemorySnapshot(fmt::format(
+          "operator=CudfTopNRowNumber node={} state=compaction.level.end "
+          "inputRuns={} outputRuns={} sourceChunks={} sourceRows={} sourceBytes={} "
+          "outputBatches={} outputRows={} outputBytes={} maxResidentRows={} "
+          "maxResidentBytes={} maxOutputBytes={} maxActiveRuns={}",
+          diagnosticNodeId_,
+          inputRunCount,
+          sortedRuns_.size(),
+          levelStats.sourceChunks,
+          levelStats.sourceRows,
+          levelStats.sourceBytes,
+          levelStats.outputBatches,
+          levelStats.outputRows,
+          levelStats.outputBytes,
+          levelStats.maxResidentRows,
+          levelStats.maxResidentBytes,
+          levelStats.maxOutputBytes,
+          levelStats.maxActiveRuns));
+    }
+
+    stream.synchronize();
+    logDeviceMemorySnapshot(fmt::format(
+        "operator=CudfTopNRowNumber node={} state=compaction.end.admission-held "
+        "runs={} concurrency={} sourceChunks={} sourceRows={} sourceBytes={} "
+        "outputBatches={} outputRows={} outputBytes={} maxResidentRows={} "
+        "maxResidentBytes={} maxOutputBytes={} maxActiveRuns={}",
+        diagnosticNodeId_,
+        sortedRuns_.size(),
+        compactionConcurrency,
+        compactionStats.sourceChunks,
+        compactionStats.sourceRows,
+        compactionStats.sourceBytes,
+        compactionStats.outputBatches,
+        compactionStats.outputRows,
+        compactionStats.outputBytes,
+        compactionStats.maxResidentRows,
+        compactionStats.maxResidentBytes,
+        compactionStats.maxOutputBytes,
+        compactionStats.maxActiveRuns));
+  } catch (...) {
+    // Local cuDF objects have unwound. Clear member-owned readers/chunks and
+    // drain their async frees before another operator receives this slot.
+    cleanupSpillStateAfterFailure("compaction");
+    throw;
+  }
+}
+
+std::unique_ptr<cudf::table> CudfTopNRowNumber::mergeNextSortedBatch(
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr,
+    bool& finalBatch) {
+  // finalBatch is retained for diagnostics/callers; sorted streaming state no
+  // longer buffers a whole trailing partition.
+  finalBatch = mergeFinished_;
+  if (mergeFinished_) {
     return nullptr;
   }
 
-  auto partitionColumns = sorted->view().select(partitionKeys_);
-  std::vector<cudf::order> orders(
-      partitionKeys_.size(), cudf::order::ASCENDING);
-  std::vector<cudf::null_order> nullOrders(
-      partitionKeys_.size(), cudf::null_order::BEFORE);
-  cudf::size_type completeEnd = sorted->num_rows();
-  if (!finalBatch) {
+  std::vector<SortedRun*> runs;
+  runs.reserve(sortedRuns_.size());
+  for (auto& run : sortedRuns_) {
+    runs.push_back(&run);
+  }
+  auto result = mergeNextPausedBatch(
+      runs, stream, mr, mergeFinished_, outputMergeStats_);
+  finalBatch = mergeFinished_;
+  if (mergeFinished_ && !outputMergeEndLogged_) {
+    logDeviceMemorySnapshot(fmt::format(
+        "operator=CudfTopNRowNumber node={} state=output.merge.end "
+        "runs={} sourceChunks={} sourceRows={} sourceBytes={} outputBatches={} "
+        "outputRows={} outputBytes={} maxResidentRows={} maxResidentBytes={} "
+        "maxOutputBytes={} maxActiveRuns={}",
+        diagnosticNodeId_,
+        sortedRuns_.size(),
+        outputMergeStats_.sourceChunks,
+        outputMergeStats_.sourceRows,
+        outputMergeStats_.sourceBytes,
+        outputMergeStats_.outputBatches,
+        outputMergeStats_.outputRows,
+        outputMergeStats_.outputBytes,
+        outputMergeStats_.maxResidentRows,
+        outputMergeStats_.maxResidentBytes,
+        outputMergeStats_.maxOutputBytes,
+        outputMergeStats_.maxActiveRuns));
+    outputMergeEndLogged_ = true;
+  }
+  return result;
+}
+
+std::unique_ptr<cudf::table> CudfTopNRowNumber::appendGeneratedRank(
+    std::unique_ptr<cudf::table> table,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) const {
+  if (!generateRowNumber_ || !table) {
+    return table;
+  }
+  auto one = cudf::numeric_scalar<int64_t>(1, true, stream, mr);
+  auto rank =
+      cudf::make_column_from_scalar(one, table->num_rows(), stream, mr);
+  auto columns = table->release();
+  columns.push_back(std::move(rank));
+  return std::make_unique<cudf::table>(std::move(columns));
+}
+
+void CudfTopNRowNumber::updateSortedPartitionState(
+    cudf::table_view sorted,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  VELOX_CHECK_GT(sorted.num_rows(), 0);
+
+  cudf::size_type firstRowOfLastPartition{0};
+  if (!partitionKeys_.empty()) {
+    auto partitionColumns = sorted.select(partitionKeys_);
     auto lastPartition = cudf::slice(
-        partitionColumns, {sorted->num_rows() - 1, sorted->num_rows()}, stream);
+        partitionColumns, {sorted.num_rows() - 1, sorted.num_rows()}, stream);
+    std::vector<cudf::order> orders(
+        partitionKeys_.size(), cudf::order::ASCENDING);
+    std::vector<cudf::null_order> nullOrders(
+        partitionKeys_.size(), cudf::null_order::BEFORE);
     auto positions = cudf::lower_bound(
         partitionColumns,
         lastPartition.front(),
@@ -656,78 +1098,299 @@ std::unique_ptr<cudf::table> CudfTopNRowNumber::takeCompletePartitions(
         nullOrders,
         stream,
         mr);
-    completeEnd = firstSearchPosition(positions->view(), stream);
+    firstRowOfLastPartition =
+        firstSearchPosition(positions->view(), stream);
   }
 
-  // Keep each downstream Top-N reduction/gather bounded. Select a partition
-  // boundary at or before the row target so a rank peer group is never split.
-  cudf::size_type emitEnd = completeEnd;
-  if (completeEnd > kMaxCompleteOutputRows) {
-    auto boundaryPartition = cudf::slice(
-        partitionColumns,
-        {kMaxCompleteOutputRows, kMaxCompleteOutputRows + 1},
-        stream);
-    auto positions = cudf::lower_bound(
-        partitionColumns,
-        boundaryPartition.front(),
-        orders,
-        nullOrders,
-        stream,
-        mr);
-    const auto boundary = firstSearchPosition(positions->view(), stream);
-    // A single giant peer group must remain intact for rank semantics.
-    emitEnd = boundary > 0 ? boundary : completeEnd;
+  auto stateRow = cudf::slice(
+      sorted,
+      {firstRowOfLastPartition, firstRowOfLastPartition + 1},
+      stream);
+  VELOX_CHECK_EQ(stateRow.size(), 1);
+  if (partitionKeys_.empty()) {
+    currentPartitionKey_.reset();
+  } else {
+    currentPartitionKey_ = std::make_unique<cudf::table>(
+        stateRow.front().select(partitionKeys_), stream, mr);
   }
+  if (rankFunction_ == core::TopNRowNumberNode::RankFunction::kRowNumber) {
+    currentPeerKey_.reset();
+  } else {
+    currentPeerKey_ = std::make_unique<cudf::table>(
+        stateRow.front().select(allKeyIndices_), stream, mr);
+  }
+  hasCurrentPartition_ = true;
+}
 
-  partitionCarry_ =
-      copyTableSlice(sorted->view(), emitEnd, sorted->num_rows(), stream, mr);
-  if (emitEnd == 0) {
+std::unique_ptr<cudf::table>
+CudfTopNRowNumber::reduceSortedBatchToTopOne(
+    std::unique_ptr<cudf::table> sorted,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  if (!sorted || sorted->num_rows() == 0) {
     return nullptr;
   }
-  return copyTableSlice(sorted->view(), 0, emitEnd, stream, mr);
+
+  const auto sortedView = sorted->view();
+  const auto numRows = sorted->num_rows();
+  cudf::size_type continuationEnd{0};
+  if (hasCurrentPartition_) {
+    if (partitionKeys_.empty()) {
+      // Empty partition keys mean one global partition. Never construct or
+      // search a zero-column cuDF table.
+      continuationEnd = numRows;
+    } else {
+      VELOX_CHECK_NOT_NULL(currentPartitionKey_);
+      auto partitionColumns = sortedView.select(partitionKeys_);
+      std::vector<cudf::order> orders(
+          partitionKeys_.size(), cudf::order::ASCENDING);
+      std::vector<cudf::null_order> nullOrders(
+          partitionKeys_.size(), cudf::null_order::BEFORE);
+      auto positions = cudf::upper_bound(
+          partitionColumns,
+          currentPartitionKey_->view(),
+          orders,
+          nullOrders,
+          stream,
+          mr);
+      continuationEnd = firstSearchPosition(positions->view(), stream);
+    }
+  }
+
+  std::vector<std::unique_ptr<cudf::table>> outputPieces;
+  if (continuationEnd > 0 &&
+      rankFunction_ != core::TopNRowNumberNode::RankFunction::kRowNumber) {
+    VELOX_CHECK_NOT_NULL(currentPeerKey_);
+    auto continuation =
+        cudf::slice(sortedView, {0, continuationEnd}, stream);
+    auto positions = cudf::upper_bound(
+        continuation.front().select(allKeyIndices_),
+        currentPeerKey_->view(),
+        columnOrders_,
+        nullOrders_,
+        stream,
+        mr);
+    const auto peerEnd = firstSearchPosition(positions->view(), stream);
+    if (peerEnd > 0) {
+      outputPieces.push_back(appendGeneratedRank(
+          copyTableSlice(sortedView, 0, peerEnd, stream, mr), stream, mr));
+    }
+  }
+
+  const auto newPartitionBegin = hasCurrentPartition_ ? continuationEnd : 0;
+  if (newPartitionBegin < numRows) {
+    auto newPartitions =
+        cudf::slice(sortedView, {newPartitionBegin, numRows}, stream);
+    auto reduced =
+        rankFunction_ == core::TopNRowNumberNode::RankFunction::kRowNumber
+        ? computeLimitOneRowNumber(newPartitions.front(), stream, mr)
+        : computeLimitOneRankLike(newPartitions.front(), stream, mr);
+    outputPieces.push_back(reduced->release());
+  }
+
+  // Only a batch containing a newly-started partition changes the one-row
+  // state. A batch containing only the continuation of the current partition
+  // retains its original first peer key.
+  if (!hasCurrentPartition_ || newPartitionBegin < numRows) {
+    updateSortedPartitionState(sortedView, stream, mr);
+  }
+
+  if (outputPieces.empty()) {
+    return nullptr;
+  }
+  if (outputPieces.size() == 1) {
+    return std::move(outputPieces.front());
+  }
+  std::vector<cudf::table_view> outputViews;
+  outputViews.reserve(outputPieces.size());
+  for (const auto& piece : outputPieces) {
+    outputViews.push_back(piece->view());
+  }
+  return cudf::concatenate(outputViews, stream, mr);
+}
+
+void CudfTopNRowNumber::setPendingOutput(
+    std::unique_ptr<cudf::table> output) {
+  VELOX_CHECK(!pendingOutput_);
+  if (!output || output->num_rows() == 0) {
+    return;
+  }
+  pendingOutputOffset_ = 0;
+  pendingOutputBytes_ =
+      measureTableBytes(output, outputType_, stateStream_);
+  pendingOutput_ = std::move(output);
+}
+
+CudfVectorPtr CudfTopNRowNumber::takePendingOutput() {
+  if (!pendingOutput_) {
+    return nullptr;
+  }
+  const auto totalRows = pendingOutput_->num_rows();
+  VELOX_CHECK_LT(pendingOutputOffset_, totalRows);
+  const auto remainingRows = totalRows - pendingOutputOffset_;
+  const auto byteLimit = outputChunkBytes.load();
+  cudf::size_type targetRows =
+      std::min(remainingRows, maxOutputRows.load());
+  if (pendingOutputBytes_ > byteLimit) {
+    const auto proportionalRows = static_cast<cudf::size_type>(std::max<uint64_t>(
+        1,
+        static_cast<uint64_t>(totalRows) * byteLimit /
+            pendingOutputBytes_));
+    targetRows = std::min(targetRows, proportionalRows);
+  }
+
+  while (true) {
+    auto chunk = copyTableSlice(
+        pendingOutput_->view(),
+        pendingOutputOffset_,
+        pendingOutputOffset_ + targetRows,
+        stateStream_,
+        get_output_mr());
+    auto output = std::make_shared<CudfVector>(
+        pool(), outputType_, targetRows, std::move(chunk), stateStream_);
+    const auto actualBytes = output->estimateFlatSize();
+    if (actualBytes <= byteLimit || targetRows == 1) {
+      if (actualBytes > byteLimit) {
+        LOG(WARNING) << "CudfTopNRowNumber node=" << diagnosticNodeId_
+                     << " emitted one oversized row bytes=" << actualBytes
+                     << " byteLimit=" << byteLimit;
+      }
+      pendingOutputOffset_ += targetRows;
+      if (pendingOutputOffset_ == totalRows) {
+        pendingOutput_.reset();
+        pendingOutputOffset_ = 0;
+        pendingOutputBytes_ = 0;
+      }
+      return output;
+    }
+
+    const auto proportionalRows = static_cast<cudf::size_type>(
+        std::max<uint64_t>(
+            1,
+            static_cast<uint64_t>(targetRows) * byteLimit / actualBytes));
+    targetRows =
+        std::min<cudf::size_type>(targetRows - 1, proportionalRows);
+  }
 }
 
 CudfVectorPtr CudfTopNRowNumber::computeNextSortedOutput() {
-  auto stream = cudfGlobalStreamPool().get_stream();
+  auto stream = stateStream_;
   auto mr = get_output_mr();
-  while (!mergeFinished_ || mergeCarry_ || partitionCarry_) {
+  if (auto output = takePendingOutput()) {
+    return output;
+  }
+  while (!mergeFinished_) {
     bool finalBatch = false;
     auto sorted = mergeNextSortedBatch(stream, mr, finalBatch);
-    sorted = takeCompletePartitions(std::move(sorted), finalBatch, stream, mr);
-    if (!sorted || sorted->num_rows() == 0) {
-      if (finalBatch) {
-        return nullptr;
-      }
+    (void)finalBatch;
+    auto reduced =
+        reduceSortedBatchToTopOne(std::move(sorted), stream, mr);
+    if (!reduced || reduced->num_rows() == 0) {
       continue;
     }
-    // The merge output is already globally ordered. The existing limit-one
-    // helpers are reused initially for exact rank/tie semantics; they operate
-    // on a bounded complete-partition batch.
-    return rankFunction_ == core::TopNRowNumberNode::RankFunction::kRowNumber
-        ? computeLimitOneRowNumber(sorted->view(), stream, mr)
-        : computeLimitOneRankLike(sorted->view(), stream, mr);
+    setPendingOutput(std::move(reduced));
+    return takePendingOutput();
   }
   return nullptr;
 }
 
-void CudfTopNRowNumber::cleanupSpillFiles() {
-  sortedRuns_.clear();
-  mergeCarry_.reset();
-  partitionCarry_.reset();
-  if (spillDirectory_.empty()) {
-    return;
+void CudfTopNRowNumber::cleanupSpillStateAfterFailure(
+    std::string_view context) noexcept {
+  // A failed synchronization must not jump directly to permit release while
+  // readers or tables are still live. First make a best-effort drain, always
+  // destroy every GPU owner, then drain the deallocations before releasing (or
+  // cancelling) admission. This preserves the original task exception.
+  try {
+    stateStream_.synchronize();
+  } catch (const std::exception& error) {
+    LOG(WARNING) << "CudfTopNRowNumber " << context
+                 << " pre-destruction cleanup failed: " << error.what();
   }
-  std::error_code error;
-  std::filesystem::remove_all(spillDirectory_, error);
-  spillDirectory_.clear();
+
+  inputs_.clear();
+  candidates_.reset();
+  passthroughOutputs_.clear();
+  sortedRuns_.clear();
+  currentPartitionKey_.reset();
+  currentPeerKey_.reset();
+  pendingOutput_.reset();
+  pendingOutputOffset_ = 0;
+  pendingOutputBytes_ = 0;
+  hasCurrentPartition_ = false;
+
+  try {
+    stateStream_.synchronize();
+  } catch (const std::exception& error) {
+    LOG(WARNING) << "CudfTopNRowNumber " << context
+                 << " post-destruction cleanup failed: " << error.what();
+  }
+
+  if (!spillDirectory_.empty()) {
+    std::error_code error;
+    std::filesystem::remove_all(spillDirectory_, error);
+    spillDirectory_.clear();
+  }
+  compactionPermit_.reset();
+}
+
+void CudfTopNRowNumber::cleanupSpillFiles() {
+  // Readers, one-row streaming state, pending output, and Parquet writes all
+  // use stateStream_. Finish their work before destroying owners or releasing
+  // the process-wide admission permit.
+  stateStream_.synchronize();
+  sortedRuns_.clear();
+  currentPartitionKey_.reset();
+  currentPeerKey_.reset();
+  pendingOutput_.reset();
+  pendingOutputOffset_ = 0;
+  pendingOutputBytes_ = 0;
+  hasCurrentPartition_ = false;
+  // Destroying cuDF owners enqueues their deallocations on stateStream_. Wait
+  // for those async frees before admitting the next memory-heavy TopN.
+  stateStream_.synchronize();
+  if (!spillDirectory_.empty()) {
+    std::error_code error;
+    std::filesystem::remove_all(spillDirectory_, error);
+    spillDirectory_.clear();
+  }
+  compactionPermit_.reset();
   ::malloc_trim(0);
 }
 
 void CudfTopNRowNumber::doClose() {
+  // close() also runs while unwinding a failed task. Preserve the original
+  // failure if the CUDA context is already poisoned, but never free live state
+  // before first attempting to drain its stream.
+  try {
+    stateStream_.synchronize();
+  } catch (const std::exception& error) {
+    LOG(WARNING) << "CudfTopNRowNumber state stream cleanup failed: "
+                 << error.what();
+  }
   inputs_.clear();
   candidates_.reset();
   passthroughOutputs_.clear();
-  cleanupSpillFiles();
+  sortedRuns_.clear();
+  currentPartitionKey_.reset();
+  currentPeerKey_.reset();
+  pendingOutput_.reset();
+  pendingOutputOffset_ = 0;
+  pendingOutputBytes_ = 0;
+  hasCurrentPartition_ = false;
+  try {
+    // The resets above enqueue async deallocations. Keep the admission permit
+    // until they have completed so the next TopN cannot overlap this state.
+    stateStream_.synchronize();
+  } catch (const std::exception& error) {
+    LOG(WARNING) << "CudfTopNRowNumber post-destruction cleanup failed: "
+                 << error.what();
+  }
+  if (!spillDirectory_.empty()) {
+    std::error_code error;
+    std::filesystem::remove_all(spillDirectory_, error);
+    spillDirectory_.clear();
+  }
+  compactionPermit_.reset();
   Operator::close();
 }
 
@@ -758,7 +1421,9 @@ CudfVectorPtr CudfTopNRowNumber::computeLimitOneRowNumber(
         mr);
   } else if (
       sortKeys_.size() == 1 &&
-      nullOrders_[partitionKeys_.size()] == cudf::null_order::AFTER) {
+      semanticNullsLast(
+          columnOrders_[partitionKeys_.size()],
+          nullOrders_[partitionKeys_.size()])) {
     auto partitionView = input.select(partitionKeys_);
     cudf::groupby::groupby grouper(partitionView, cudf::null_policy::INCLUDE);
     std::vector<cudf::groupby::aggregation_request> requests(1);
@@ -846,7 +1511,9 @@ CudfVectorPtr CudfTopNRowNumber::computeLimitOneRankLike(
     result = std::make_unique<cudf::table>(input, stream, mr);
   } else if (
       !partitionKeys_.empty() && sortKeys_.size() == 1 &&
-      nullOrders_[partitionKeys_.size()] == cudf::null_order::AFTER) {
+      semanticNullsLast(
+          columnOrders_[partitionKeys_.size()],
+          nullOrders_[partitionKeys_.size()])) {
     // Fast grouped Top-1 for the common single scalar order key. A full sort
     // is unnecessary: compute each partition's best key, then join that key
     // back to the input. The inner join intentionally preserves every peer of

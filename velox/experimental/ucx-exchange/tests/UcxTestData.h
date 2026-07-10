@@ -85,7 +85,8 @@ class BaseTableGenerator {
 
   /// @brief Create a strings column from a vector of host strings.
   static std::unique_ptr<cudf::column> makeStringsColumn(
-      const std::vector<std::string>& hostStrings);
+      const std::vector<std::string>& hostStrings,
+      rmm::cuda_stream_view stream);
 
   /// @brief Create a struct column from child columns.
   static std::unique_ptr<cudf::column> makeStructColumn(
@@ -151,18 +152,18 @@ class UcxTestData : public BaseTableGenerator {
     return strings_;
   }
 
-  std::shared_ptr<std::vector<uint32_t>> getIntegers() {
+  std::shared_ptr<std::vector<int32_t>> getIntegers() {
     return integers_;
   }
 
-  std::shared_ptr<std::vector<float>> getFloats() {
+  std::shared_ptr<std::vector<double>> getFloats() {
     return floats_;
   }
 
   /// @brief Sets the data directly (used for creating partitioned test data).
   void setData(
-      std::shared_ptr<std::vector<uint32_t>> integers,
-      std::shared_ptr<std::vector<float>> floats,
+      std::shared_ptr<std::vector<int32_t>> integers,
+      std::shared_ptr<std::vector<double>> floats,
       std::shared_ptr<std::vector<std::string>> strings) {
     integers_ = std::move(integers);
     floats_ = std::move(floats);
@@ -172,8 +173,8 @@ class UcxTestData : public BaseTableGenerator {
 
  protected:
   std::shared_ptr<std::vector<std::string>> strings_;
-  std::shared_ptr<std::vector<uint32_t>> integers_;
-  std::shared_ptr<std::vector<float>> floats_;
+  std::shared_ptr<std::vector<int32_t>> integers_;
+  std::shared_ptr<std::vector<double>> floats_;
   size_t numRows_ = 0;
 };
 

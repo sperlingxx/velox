@@ -106,10 +106,12 @@ vector_size_t filteredOutputNumRows(
 } // namespace
 
 void CudfHashJoinProbe::doClose() {
-  Operator::close();
+  releaseLocalBuildState();
+  inputs_.clear();
   filterEvaluator_.reset();
   scalars_.clear();
   tree_ = {};
+  Operator::close();
 }
 
 void CudfHashJoinBridge::setHashTable(
@@ -135,6 +137,10 @@ std::optional<CudfHashJoinBridge::hash_type> CudfHashJoinBridge::hashOrFuture(
     VLOG(2) << "Calling CudfHashJoinBridge::hashOrFuture";
   }
   std::lock_guard<std::mutex> l(mutex_);
+  VELOX_CHECK(!cancelled_, "Getting cuDF hash table after join is aborted");
+  VELOX_CHECK(
+      !hashTableReleased_,
+      "Getting cuDF hash table after all probe drivers finished");
   if (hashObject_.has_value()) {
     return hashObject_;
   }
@@ -171,6 +177,58 @@ void CudfHashJoinBridge::setBuildReadyEvent(
 std::shared_ptr<CudaEvent> CudfHashJoinBridge::getBuildReadyEvent() {
   std::lock_guard<std::mutex> l(mutex_);
   return buildReadyEvent_;
+}
+
+void CudfHashJoinBridge::releaseHashTable() {
+  std::optional<hash_type> releasedHashObject;
+  std::shared_ptr<CudaEvent> releasedBuildReadyEvent;
+  bool retainedBeforeRelease{false};
+  {
+    std::lock_guard<std::mutex> l(mutex_);
+    if (hashTableReleased_) {
+      return;
+    }
+    VELOX_CHECK(
+        promises_.empty(),
+        "Cannot release cuDF hash table while probe drivers are waiting for it");
+    retainedBeforeRelease = hashObject_.has_value();
+    releasedHashObject = std::exchange(hashObject_, std::nullopt);
+    buildStream_.reset();
+    releasedBuildReadyEvent = std::move(buildReadyEvent_);
+    hashTableReleased_ = true;
+  }
+
+  common::testutil::TestValue::adjust(
+      "facebook::velox::cudf_velox::CudfHashJoinBridge::releaseHashTable::retainedBeforeRelease",
+      &retainedBeforeRelease);
+  bool retainedAfterRelease{false};
+  common::testutil::TestValue::adjust(
+      "facebook::velox::cudf_velox::CudfHashJoinBridge::releaseHashTable::retainedAfterRelease",
+      &retainedAfterRelease);
+  // Destroy shared owners outside mutex_. Probe-local shared_ptrs keep the
+  // build state alive until each driver's GPU work is complete.
+}
+
+void CudfHashJoinProbe::releaseLocalBuildState() {
+  if (!hashObject_.has_value()) {
+    buildReadyEvent_.reset();
+    buildStream_.reset();
+    return;
+  }
+
+  // Views must be dropped before the columns and tables that back them.
+  cachedExtendedRightViews_.clear();
+  cachedRightPrecomputed_.clear();
+  rightMatchedFlags_.clear();
+  hashObject_.reset();
+  buildReadyEvent_.reset();
+  buildStream_.reset();
+  lastProbeStream_.reset();
+
+  bool retainedAfterRelease = hashObject_.has_value();
+  common::testutil::TestValue::adjust(
+      "facebook::velox::cudf_velox::CudfHashJoinProbe::releaseLocalBuildState::retainedAfterRelease",
+      &retainedAfterRelease);
 }
 
 CudfHashJoinBuild::CudfHashJoinBuild(
@@ -572,15 +630,18 @@ void CudfHashJoinProbe::doAddInput(RowVectorPtr input) {
 
 void CudfHashJoinProbe::doNoMoreInput() {
   Operator::noMoreInput();
-  if (!joinNode_->isRightJoin() && !joinNode_->isRightSemiFilterJoin() &&
-      !joinNode_->isFullJoin()) {
-    return;
-  }
+  VELOX_CHECK(!waitingForProbePeers_);
+  VELOX_CHECK(!probeFinishBarrierComplete_);
+
   std::vector<ContinuePromise> promises;
   std::vector<std::shared_ptr<exec::Driver>> peers;
-  // Only last driver collects all answers
+  // Every join type participates. Besides coordinating right/full mismatch
+  // state, this barrier proves that every probe driver has acquired a local
+  // shared owner and consumed all input before the bridge drops its owner.
   if (!operatorCtx_->task()->allPeersFinished(
           planNodeId(), operatorCtx_->driver(), &future_, promises, peers)) {
+    VELOX_CHECK(future_.valid());
+    waitingForProbePeers_ = true;
     return;
   }
 
@@ -592,6 +653,25 @@ void CudfHashJoinProbe::doNoMoreInput() {
       promise.setValue();
     }
   };
+
+  size_t localBuildOwners = hashObject_.has_value() ? 1 : 0;
+  size_t completedProbeInputs = noMoreInput_ && input_ == nullptr ? 1 : 0;
+  for (auto& peer : peers) {
+    auto* probe = dynamic_cast<CudfHashJoinProbe*>(
+        peer->findOperator(planNodeId()));
+    VELOX_CHECK_NOT_NULL(probe);
+    localBuildOwners += probe->hashObject_.has_value() ? 1 : 0;
+    completedProbeInputs +=
+        probe->noMoreInput_ && probe->input_ == nullptr ? 1 : 0;
+  }
+  common::testutil::TestValue::adjust(
+      "facebook::velox::cudf_velox::CudfHashJoinProbe::doNoMoreInput::localBuildOwnersAtBarrier",
+      &localBuildOwners);
+  common::testutil::TestValue::adjust(
+      "facebook::velox::cudf_velox::CudfHashJoinProbe::doNoMoreInput::completedProbeInputsAtBarrier",
+      &completedProbeInputs);
+  VELOX_CHECK_EQ(localBuildOwners, peers.size() + 1);
+  VELOX_CHECK_EQ(completedProbeInputs, peers.size() + 1);
 
   if (joinNode_->isRightJoin() || joinNode_->isFullJoin()) {
     isLastDriver_ = true;
@@ -654,40 +734,52 @@ void CudfHashJoinProbe::doNoMoreInput() {
       }
       stream.synchronize();
     }
-    return;
+  } else if (joinNode_->isRightSemiFilterJoin()) {
+    // Handling RightSemiFilterJoin: collect results from peers.
+    for (auto& peer : peers) {
+      auto op = peer->findOperator(planNodeId());
+      auto* probe = dynamic_cast<CudfHashJoinProbe*>(op);
+      VELOX_CHECK_NOT_NULL(probe);
+      inputs_.insert(inputs_.end(), probe->inputs_.begin(), probe->inputs_.end());
+    }
+
+    auto stream = cudfGlobalStreamPool().get_stream();
+    // Using output_mr here to allow spilling queued up large tables
+    auto tbl = getConcatenatedTable(
+        std::exchange(inputs_, {}),
+        joinNode_->sources()[1]->outputType(),
+        stream,
+        get_output_mr());
+
+    VELOX_CHECK_NOT_NULL(tbl);
+
+    if (CudfConfig::getInstance().debugEnabled) {
+      VLOG(1) << "Probe table number of columns: " << tbl->num_columns();
+      VLOG(1) << "Probe table number of rows: " << tbl->num_rows();
+    }
+
+    // Store the concatenated table in input_.
+    input_ = std::make_shared<CudfVector>(
+        operatorCtx_->pool(),
+        joinNode_->outputType(),
+        tbl->num_rows(),
+        std::move(tbl),
+        stream);
   }
 
-  // Handling RightSemiFilterJoin
-  // Collect results from peers
-  for (auto& peer : peers) {
-    auto op = peer->findOperator(planNodeId());
-    auto* probe = dynamic_cast<CudfHashJoinProbe*>(op);
-    VELOX_CHECK_NOT_NULL(probe);
-    inputs_.insert(inputs_.end(), probe->inputs_.begin(), probe->inputs_.end());
-  }
+  auto joinBridge = operatorCtx_->task()->getCustomJoinBridge(
+      operatorCtx_->driverCtx()->splitGroupId, planNodeId());
+  auto cudfHashJoinBridge =
+      std::dynamic_pointer_cast<CudfHashJoinBridge>(joinBridge);
+  VELOX_CHECK_NOT_NULL(cudfHashJoinBridge);
+  cudfHashJoinBridge->releaseHashTable();
 
-  auto stream = cudfGlobalStreamPool().get_stream();
-  // Using output_mr here to allow spilling queued up large tables
-  auto tbl = getConcatenatedTable(
-      std::exchange(inputs_, {}),
-      joinNode_->sources()[1]->outputType(),
-      stream,
-      get_output_mr());
-
-  VELOX_CHECK_NOT_NULL(tbl);
-
-  if (CudfConfig::getInstance().debugEnabled) {
-    VLOG(1) << "Probe table number of columns: " << tbl->num_columns();
-    VLOG(1) << "Probe table number of rows: " << tbl->num_rows();
-  }
-
-  // Store the concatenated table in input_
-  input_ = std::make_shared<CudfVector>(
-      operatorCtx_->pool(),
-      joinNode_->outputType(),
-      tbl->num_rows(),
-      std::move(tbl),
-      stream);
+  bool lastProbeRetainsLocalOwner = hashObject_.has_value();
+  common::testutil::TestValue::adjust(
+      "facebook::velox::cudf_velox::CudfHashJoinProbe::doNoMoreInput::lastProbeRetainsLocalOwnerAfterBridgeRelease",
+      &lastProbeRetainsLocalOwner);
+  VELOX_CHECK(lastProbeRetainsLocalOwner);
+  probeFinishBarrierComplete_ = true;
 }
 
 CudfHashJoinProbe::JoinOutput CudfHashJoinProbe::unfilteredOutput(
@@ -2111,6 +2203,21 @@ RowVectorPtr CudfHashJoinProbe::doGetOutput() {
       if (!toConcat.empty()) {
         auto out =
             concatenateTables(std::move(toConcat), stream, get_output_mr());
+        if (buildStream_.has_value()) {
+          // The output gathers from build tables on 'stream'. Make the build
+          // allocation stream wait before the final local shared owner can
+          // enqueue asynchronous deallocation of those tables.
+          cudaEvent_->recordFrom(stream).waitOn(buildStream_.value());
+        }
+        // rightMatchedFlags_ columns may have been replaced on different probe
+        // streams. Drain the final mask/gather work before isFinished() clears
+        // these per-driver owners.
+        stream.synchronize();
+        bool retainsLocalOwner = hashObject_.has_value();
+        common::testutil::TestValue::adjust(
+            "facebook::velox::cudf_velox::CudfHashJoinProbe::doGetOutput::rightUnmatchedOutputRetainsLocalOwner",
+            &retainsLocalOwner);
+        VELOX_CHECK(retainsLocalOwner);
         finished_ = true;
         auto size = outputType_->size() == 0 ? unmatchedRows : out->num_rows();
         if (size == 0) {
@@ -2223,14 +2330,16 @@ bool CudfHashJoinProbe::skipProbeOnEmptyBuild() const {
 }
 
 exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
-  if ((joinNode_->isRightJoin() || joinNode_->isRightSemiFilterJoin() ||
-       joinNode_->isFullJoin()) &&
-      hashObject_.has_value()) {
-    if (!future_.valid()) {
-      return exec::BlockingReason::kNotBlocked;
+  if (waitingForProbePeers_) {
+    if (future_.valid()) {
+      *future = std::move(future_);
+      return exec::BlockingReason::kWaitForJoinProbe;
     }
-    *future = std::move(future_);
-    return exec::BlockingReason::kWaitForJoinProbe;
+    // The driver can only run again after the last peer fulfilled its barrier
+    // promise and released the bridge owner.
+    waitingForProbePeers_ = false;
+    probeFinishBarrierComplete_ = true;
+    return exec::BlockingReason::kNotBlocked;
   }
 
   if (hashObject_.has_value()) {
@@ -2254,6 +2363,11 @@ exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
   hashObject_ = std::move(hashObject);
   buildStream_ = cudfJoinBridge->getBuildStream();
   buildReadyEvent_ = cudfJoinBridge->getBuildReadyEvent();
+  bool acquiredLocalOwner = hashObject_.has_value();
+  common::testutil::TestValue::adjust(
+      "facebook::velox::cudf_velox::CudfHashJoinProbe::isBlocked::acquiredLocalBuildOwner",
+      &acquiredLocalOwner);
+  VELOX_CHECK(acquiredLocalOwner);
 
   // Lazy initialize matched flags only when build side is done
   if (joinNode_->isRightJoin() || joinNode_->isFullJoin()) {
@@ -2333,9 +2447,10 @@ exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
       }
     }
   }
-  if ((joinNode_->isRightJoin() || joinNode_->isRightSemiFilterJoin() ||
-       joinNode_->isFullJoin()) &&
-      future_.valid()) {
+  // Empty-build early finish can enter the peer barrier from noMoreInput()
+  // above while this isBlocked() call is still on the stack.
+  if (waitingForProbePeers_) {
+    VELOX_CHECK(future_.valid());
     *future = std::move(future_);
     return exec::BlockingReason::kWaitForJoinProbe;
   }
@@ -2343,13 +2458,22 @@ exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
 }
 
 bool CudfHashJoinProbe::isFinished() {
-  auto const isFinished = finished_ || (noMoreInput_ && input_ == nullptr);
+  if (waitingForProbePeers_ ||
+      (noMoreInput_ && !probeFinishBarrierComplete_)) {
+    return false;
+  }
 
-  // Release hashObject_ if finished
+  // For RIGHT/FULL, only the last driver must retain its local build owner
+  // until it has produced all unmatched build rows. Peer drivers can finish
+  // immediately after the barrier has merged their match state.
+  const bool needsBuildMismatchOutput =
+      (joinNode_->isRightJoin() || joinNode_->isFullJoin()) && isLastDriver_;
+  auto const isFinished = needsBuildMismatchOutput
+      ? finished_
+      : finished_ || (noMoreInput_ && input_ == nullptr);
+
   if (isFinished) {
-    hashObject_.reset();
-    buildReadyEvent_.reset();
-    buildStream_.reset();
+    releaseLocalBuildState();
   }
   return isFinished;
 }

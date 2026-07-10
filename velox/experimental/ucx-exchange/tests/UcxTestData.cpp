@@ -20,6 +20,7 @@
 #include <cudf/detail/utilities/vector_factories.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/structs/structs_column_view.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 #include <rmm/device_buffer.hpp>
 
 #include <functional>
@@ -53,7 +54,7 @@ std::unique_ptr<cudf::column> BaseTableGenerator::makeNumericColumn(
 
   // Allocate a device buffer of the correct size
   rmm::device_buffer data(
-      numRows * sizeof(T), stream, rmm::mr::get_current_device_resource());
+      numRows * sizeof(T), stream, cudf::get_current_device_resource_ref());
 
   // Copy host -> device
   cudaMemcpyAsync(
@@ -105,7 +106,8 @@ template std::unique_ptr<cudf::column> BaseTableGenerator::makeNumericColumn(
     rmm::cuda_stream_view stream);
 
 std::unique_ptr<cudf::column> BaseTableGenerator::makeStringsColumn(
-    const std::vector<std::string>& hostStrings) {
+    const std::vector<std::string>& hostStrings,
+    rmm::cuda_stream_view stream) {
   auto numRows = hostStrings.size();
 
   // --- Create offsets array ---
@@ -119,13 +121,15 @@ std::unique_ptr<cudf::column> BaseTableGenerator::makeStringsColumn(
   auto offsetsCol = cudf::make_numeric_column(
       cudf::data_type{cudf::type_id::INT32},
       numRows + 1,
-      cudf::mask_state::UNALLOCATED);
+      cudf::mask_state::UNALLOCATED,
+      stream);
 
-  cudaMemcpy(
+  cudaMemcpyAsync(
       offsetsCol->mutable_view().data<int32_t>(),
       hOffsets.data(),
       sizeof(int32_t) * (numRows + 1),
-      cudaMemcpyHostToDevice);
+      cudaMemcpyHostToDevice,
+      stream.value());
 
   // --- Create chars buffer ---
   size_t totalBytes = 0;
@@ -134,19 +138,21 @@ std::unique_ptr<cudf::column> BaseTableGenerator::makeStringsColumn(
 
   rmm::device_buffer charsBuffer(
       totalBytes,
-      cudf::get_default_stream(),
-      rmm::mr::get_current_device_resource());
+      stream,
+      cudf::get_current_device_resource_ref());
 
   std::vector<char> hostConcat;
   hostConcat.reserve(totalBytes);
   for (auto const& s : hostStrings)
     hostConcat.insert(hostConcat.end(), s.begin(), s.end());
 
-  cudaMemcpy(
+  cudaMemcpyAsync(
       charsBuffer.data(),
       hostConcat.data(),
       totalBytes,
-      cudaMemcpyHostToDevice);
+      cudaMemcpyHostToDevice,
+      stream.value());
+  stream.synchronize();
 
   // --- Build strings column ---
   return cudf::make_strings_column(
@@ -263,8 +269,8 @@ void UcxTestData::initialize(
           << "]";
   numRows_ = numRows;
   strings_ = std::make_shared<std::vector<std::string>>();
-  integers_ = std::make_shared<std::vector<uint32_t>>();
-  floats_ = std::make_shared<std::vector<float>>();
+  integers_ = std::make_shared<std::vector<int32_t>>();
+  floats_ = std::make_shared<std::vector<double>>();
 
   std::random_device rd;
   std::mt19937 gen(rd());
@@ -300,7 +306,7 @@ std::unique_ptr<cudf::table> UcxTestData::makeTable(
   columns.push_back(makeNumericColumn(*floats_, stream));
 
   // Column 2: STRING
-  columns.push_back(makeStringsColumn(*strings_));
+  columns.push_back(makeStringsColumn(*strings_, stream));
 
   return std::make_unique<cudf::table>(std::move(columns));
 }
@@ -317,8 +323,8 @@ bool UcxTestData::verifyTable(
   }
 
   // Get the data from the received table
-  auto receivedInts = getColVector<uint32_t>(table.column(0), numRows, stream);
-  auto receivedDoubles = getColVector<float>(table.column(1), numRows, stream);
+  auto receivedInts = getColVector<int32_t>(table.column(0), numRows, stream);
+  auto receivedDoubles = getColVector<double>(table.column(1), numRows, stream);
   auto receivedStrings = getStringCol(table.column(2), numRows, stream);
 
   // Compare with expected data. Use modular indexing because batch
@@ -512,7 +518,7 @@ std::unique_ptr<cudf::table> WideComplexTestTable::makeTable(
   addNumericColumns(columns, stream);
 
   // Add string column
-  columns.push_back(makeStringsColumn(stringData_));
+  columns.push_back(makeStringsColumn(stringData_, stream));
 
   // Add struct column
   std::vector<std::unique_ptr<cudf::column>> structChildren;

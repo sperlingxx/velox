@@ -15,6 +15,7 @@
  */
 
 #include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/cudf/exec/CudfHashJoin.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/expression/PrestoFunctions.h"
 
@@ -333,6 +334,185 @@ DEBUG_ONLY_TEST_F(HashJoinTest, transferBuildInputOwnershipFromSourceDrivers) {
   EXPECT_EQ(sourceDriversChecked.load(), 1);
   EXPECT_EQ(sourceDriversWithRetainedInputs.load(), 0)
       << "Source build drivers retained input batches after transfer";
+}
+
+DEBUG_ONLY_TEST_F(
+    HashJoinTest,
+    releasesBridgeBuildStateAfterAllProbeDriversFinishInput) {
+  constexpr size_t kNumDrivers = 3;
+  std::atomic_size_t acquiredLocalOwners{0};
+  std::atomic_size_t invalidAcquiredOwners{0};
+  std::atomic_size_t ownersAtBarrier{0};
+  std::atomic_size_t completedInputsAtBarrier{0};
+  std::atomic_size_t bridgeReleaseCount{0};
+  std::atomic_size_t invalidBridgeReleaseState{0};
+  std::atomic_size_t lastProbeOwnerChecks{0};
+  std::atomic_size_t invalidLastProbeOwners{0};
+  std::atomic_size_t localOwnerReleaseCount{0};
+  std::atomic_size_t retainedLocalOwnersAfterRelease{0};
+
+  SCOPED_TESTVALUE_SET(
+      "facebook::velox::cudf_velox::CudfHashJoinProbe::isBlocked::acquiredLocalBuildOwner",
+      std::function<void(bool*)>([&](bool* retained) {
+        ++acquiredLocalOwners;
+        if (!*retained) {
+          ++invalidAcquiredOwners;
+        }
+      }));
+  SCOPED_TESTVALUE_SET(
+      "facebook::velox::cudf_velox::CudfHashJoinProbe::doNoMoreInput::localBuildOwnersAtBarrier",
+      std::function<void(size_t*)>(
+          [&](size_t* count) { ownersAtBarrier = *count; }));
+  SCOPED_TESTVALUE_SET(
+      "facebook::velox::cudf_velox::CudfHashJoinProbe::doNoMoreInput::completedProbeInputsAtBarrier",
+      std::function<void(size_t*)>(
+          [&](size_t* count) { completedInputsAtBarrier = *count; }));
+  SCOPED_TESTVALUE_SET(
+      "facebook::velox::cudf_velox::CudfHashJoinBridge::releaseHashTable::retainedBeforeRelease",
+      std::function<void(bool*)>([&](bool* retained) {
+        ++bridgeReleaseCount;
+        if (!*retained) {
+          ++invalidBridgeReleaseState;
+        }
+      }));
+  SCOPED_TESTVALUE_SET(
+      "facebook::velox::cudf_velox::CudfHashJoinBridge::releaseHashTable::retainedAfterRelease",
+      std::function<void(bool*)>([&](bool* retained) {
+        if (*retained) {
+          ++invalidBridgeReleaseState;
+        }
+      }));
+  SCOPED_TESTVALUE_SET(
+      "facebook::velox::cudf_velox::CudfHashJoinProbe::doNoMoreInput::lastProbeRetainsLocalOwnerAfterBridgeRelease",
+      std::function<void(bool*)>([&](bool* retained) {
+        ++lastProbeOwnerChecks;
+        if (!*retained) {
+          ++invalidLastProbeOwners;
+        }
+      }));
+  SCOPED_TESTVALUE_SET(
+      "facebook::velox::cudf_velox::CudfHashJoinProbe::releaseLocalBuildState::retainedAfterRelease",
+      std::function<void(bool*)>([&](bool* retained) {
+        ++localOwnerReleaseCount;
+        if (*retained) {
+          ++retainedLocalOwnersAfterRelease;
+        }
+      }));
+
+  HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+      .injectSpill(false)
+      .numDrivers(
+          kNumDrivers,
+          /*runParallelProbe=*/true,
+          /*runParallelBuild=*/true)
+      .keyTypes({BIGINT()})
+      .probeVectors(64, 4)
+      .buildVectors(32, 3)
+      .referenceQuery(
+          "SELECT t_k0, t_data, u_k0, u_data FROM t, u WHERE t_k0 = u_k0")
+      .run();
+
+  EXPECT_EQ(acquiredLocalOwners.load(), kNumDrivers);
+  EXPECT_EQ(invalidAcquiredOwners.load(), 0);
+  EXPECT_EQ(ownersAtBarrier.load(), kNumDrivers);
+  EXPECT_EQ(completedInputsAtBarrier.load(), kNumDrivers);
+  EXPECT_EQ(bridgeReleaseCount.load(), 1);
+  EXPECT_EQ(invalidBridgeReleaseState.load(), 0);
+  EXPECT_EQ(lastProbeOwnerChecks.load(), 1);
+  EXPECT_EQ(invalidLastProbeOwners.load(), 0);
+  EXPECT_EQ(localOwnerReleaseCount.load(), kNumDrivers);
+  EXPECT_EQ(retainedLocalOwnersAfterRelease.load(), 0);
+}
+
+DEBUG_ONLY_TEST_F(
+    HashJoinTest,
+    rightJoinRetainsLastLocalOwnerThroughUnmatchedOutput) {
+  constexpr size_t kNumDrivers = 3;
+  std::atomic_size_t bridgeReleaseCount{0};
+  std::atomic_size_t unmatchedOutputChecks{0};
+  std::atomic_size_t unmatchedOutputBeforeBridgeRelease{0};
+  std::atomic_size_t unmatchedOutputWithoutLocalOwner{0};
+  std::atomic_size_t localOwnerReleaseCount{0};
+
+  SCOPED_TESTVALUE_SET(
+      "facebook::velox::cudf_velox::CudfHashJoinBridge::releaseHashTable::retainedAfterRelease",
+      std::function<void(bool*)>([&](bool* retained) {
+        ++bridgeReleaseCount;
+        if (*retained) {
+          ++unmatchedOutputBeforeBridgeRelease;
+        }
+      }));
+  SCOPED_TESTVALUE_SET(
+      "facebook::velox::cudf_velox::CudfHashJoinProbe::doGetOutput::rightUnmatchedOutputRetainsLocalOwner",
+      std::function<void(bool*)>([&](bool* retained) {
+        ++unmatchedOutputChecks;
+        if (bridgeReleaseCount.load() == 0) {
+          ++unmatchedOutputBeforeBridgeRelease;
+        }
+        if (!*retained) {
+          ++unmatchedOutputWithoutLocalOwner;
+        }
+      }));
+  SCOPED_TESTVALUE_SET(
+      "facebook::velox::cudf_velox::CudfHashJoinProbe::releaseLocalBuildState::retainedAfterRelease",
+      std::function<void(bool*)>([&](bool* retained) {
+        ++localOwnerReleaseCount;
+        if (*retained) {
+          ++unmatchedOutputWithoutLocalOwner;
+        }
+      }));
+
+  std::vector<RowVectorPtr> probeVectors{
+      makeRowVector(
+          {makeFlatVector<int32_t>({0, 1, 2, 2}),
+           makeFlatVector<int32_t>({10, 11, 12, 13})}),
+      makeRowVector(
+          {makeFlatVector<int32_t>({0, 2}),
+           makeFlatVector<int32_t>({20, 21})})};
+  std::vector<RowVectorPtr> buildVectors{
+      makeRowVector(
+          {makeFlatVector<int32_t>({0, 2, 3, 4}),
+           makeFlatVector<int32_t>({100, 102, 103, 104})})};
+
+  HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+      .injectSpill(false)
+      .numDrivers(
+          kNumDrivers,
+          /*runParallelProbe=*/true,
+          /*runParallelBuild=*/true)
+      .probeKeys({"c0"})
+      .probeVectors(std::move(probeVectors))
+      .buildKeys({"u_c0"})
+      .buildVectors(std::move(buildVectors))
+      .buildProjections({"c0 AS u_c0", "c1 AS u_c1"})
+      .joinType(core::JoinType::kRight)
+      .joinOutputLayout({"c0", "c1", "u_c1"})
+      .referenceQuery(
+          "SELECT t.c0, t.c1, u.c1 FROM t RIGHT JOIN u ON t.c0 = u.c0")
+      .run();
+
+  EXPECT_EQ(bridgeReleaseCount.load(), 1);
+  EXPECT_EQ(unmatchedOutputChecks.load(), 1);
+  EXPECT_EQ(unmatchedOutputBeforeBridgeRelease.load(), 0);
+  EXPECT_EQ(unmatchedOutputWithoutLocalOwner.load(), 0);
+  EXPECT_EQ(localOwnerReleaseCount.load(), kNumDrivers);
+}
+
+TEST_F(HashJoinTest, hashJoinBridgeCancellationWakesProbeWaiter) {
+  cudf_velox::CudfHashJoinBridge bridge;
+  bridge.start();
+
+  auto future = ContinueFuture::makeEmpty();
+  EXPECT_FALSE(bridge.hashOrFuture(&future).has_value());
+  ASSERT_TRUE(future.valid());
+
+  bridge.cancel();
+  future.wait();
+
+  auto lateFuture = ContinueFuture::makeEmpty();
+  VELOX_ASSERT_THROW(
+      bridge.hashOrFuture(&lateFuture),
+      "Getting cuDF hash table after join is aborted");
 }
 
 TEST_P(MultiThreadedHashJoinTest, normalizedKey) {

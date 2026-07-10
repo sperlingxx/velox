@@ -174,6 +174,53 @@ void releaseRecvHostBytes(int64_t bytes) {
 }
 } // namespace
 
+namespace detail {
+
+void copyPageableHostToDevice(
+    void* destination,
+    const void* source,
+    size_t bytes,
+    rmm::cuda_stream_view stream) {
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+      destination, source, bytes, cudaMemcpyHostToDevice, stream.value()));
+  // The source is a reusable pageable vector. Keep both its lifetime and the
+  // device buffer's readiness unambiguous: do not return it to UCX or publish
+  // the packed table until the H2D DMA has completed on the owning stream.
+  stream.synchronize();
+}
+
+std::unique_ptr<rmm::device_buffer> cloneDeviceBufferAcrossStreams(
+    const rmm::device_buffer& source,
+    rmm::cuda_stream_view producerStream,
+    rmm::cuda_stream_view cloneStream) {
+  // Construct both events before enqueueing the copy. Event construction may
+  // throw; doing it first leaves no in-flight read of source to protect.
+  cudf_velox::CudaEvent producerReady(cudaEventDisableTiming);
+  cudf_velox::CudaEvent cloneComplete(cudaEventDisableTiming);
+
+  try {
+    // The clone must not read until all producer work that populated the
+    // packed buffer is complete.
+    producerReady.recordFrom(producerStream).waitOn(cloneStream);
+
+    auto clone = std::make_unique<rmm::device_buffer>(
+        source.data(), source.size(), cloneStream);
+
+    // The shared source buffer remains bound to producerStream for async
+    // deallocation. Make that stream wait for the D2D read before the caller
+    // can drop the last shared owner and enqueue cudaFreeAsync there.
+    cloneComplete.recordFrom(cloneStream).waitOn(producerStream);
+    return clone;
+  } catch (...) {
+    // A constructor or fence failure after the D2D copy was submitted must
+    // not let source unwind while cloneStream can still be reading it.
+    cloneStream.synchronize();
+    throw;
+  }
+}
+
+} // namespace detail
+
 VELOX_DEFINE_EMBEDDED_ENUM_NAME(
     UcxExchangeSource,
     ReceiverState,
@@ -910,11 +957,11 @@ void UcxExchangeSource::onData(ucs_status_t status, std::shared_ptr<void> arg) {
         std::static_pointer_cast<DataAndMetadata>(arg);
 
     if (ptr->hostData != nullptr) {
-      CUDF_CUDA_TRY(cudaMemcpy(
+      detail::copyPageableHostToDevice(
           ptr->dataBuf->data(),
           ptr->hostData->data(),
           ptr->metadata.dataSizeBytes,
-          cudaMemcpyHostToDevice));
+          ptr->stream);
       ptr->hostData.reset();
       if (reservedGlobalHostReceiveBytes_ > 0) {
         releaseRecvHostBytes(reservedGlobalHostReceiveBytes_);
@@ -1130,8 +1177,8 @@ void UcxExchangeSource::onIntraNodeData(
   cudf::packed_columns packedCols(
       sharedPage ? std::make_unique<std::vector<uint8_t>>(*data->metadata)
                  : std::move(data->metadata),
-      sharedPage ? std::make_unique<rmm::device_buffer>(
-                       data->gpu_data->data(), data->gpu_data->size(), stream)
+      sharedPage ? detail::cloneDeviceBufferAcrossStreams(
+                       *data->gpu_data, producerStream, stream)
                  : std::move(data->gpu_data));
 
   // Unpack to get the table_view and create a packed_table

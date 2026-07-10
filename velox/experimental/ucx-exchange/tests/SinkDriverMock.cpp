@@ -55,12 +55,12 @@ SinkDriverMock::SinkDriverMock(
   }
 }
 
-void SinkDriverMock::updateDataValidity(const cudf::table_view& tab) {
+void SinkDriverMock::updateDataValidity(
+    const cudf::table_view& tab,
+    rmm::cuda_stream_view stream) {
   if (!referenceData_) {
     return; // No reference data to check against
   }
-
-  auto stream = rmm::cuda_stream_default;
 
   // Use the polymorphic verifyTable method
   // Note: For chunk-based verification, we use startRow=0 since each chunk
@@ -99,7 +99,7 @@ void SinkDriverMock::receiveAllData(UcxExchange* hybridExchange) {
         numChunksReceived_.fetch_add(1);
         // If we have Reference data check the received data is the same
         if (referenceData_)
-          updateDataValidity(cudfRes->getTableView());
+          updateDataValidity(cudfRes->getTableView(), cudfRes->stream());
       }
     }
     if (hybridExchange->isFinished()) {

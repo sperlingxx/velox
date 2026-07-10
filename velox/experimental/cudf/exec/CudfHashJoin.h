@@ -76,6 +76,12 @@ class CudfHashJoinBridge : public exec::JoinBridge {
 
   std::shared_ptr<CudaEvent> getBuildReadyEvent();
 
+  /// Drops the bridge's ownership of the completed build state after every
+  /// probe driver has acquired its own shared owners and reached the probe
+  /// completion barrier. Probe-local owners keep the state alive until pending
+  /// GPU work and any build-side mismatch output have completed.
+  void releaseHashTable();
+
  private:
   /** @brief Hash tables and join objects transferred from build to probe
    * operators */
@@ -84,6 +90,8 @@ class CudfHashJoinBridge : public exec::JoinBridge {
   std::optional<rmm::cuda_stream_view> buildStream_;
   /** @brief Event recorded after build-side CUDA work is ready for probes */
   std::shared_ptr<CudaEvent> buildReadyEvent_;
+  /** @brief Prevents a late probe from waiting forever after normal release. */
+  bool hashTableReleased_{false};
 };
 
 /**
@@ -178,6 +186,10 @@ class CudfHashJoinProbe : public CudfOperatorBase {
  private:
   void waitForBuildReady(rmm::cuda_stream_view stream);
 
+  /// Releases this probe driver's shared build owners. This never waits for
+  /// peer drivers and is safe to call from close() during cancellation.
+  void releaseLocalBuildState();
+
   std::shared_ptr<const core::HashJoinNode> joinNode_;
   /** @brief Hash tables and join objects received from build operator */
   std::optional<hash_type> hashObject_;
@@ -205,7 +217,14 @@ class CudfHashJoinProbe : public CudfOperatorBase {
 
   // Batched probe inputs needed for right join
   std::vector<CudfVectorPtr> inputs_;
+  /// Future returned by Task::allPeersFinished for probe completion.
   ContinueFuture future_{ContinueFuture::makeEmpty()};
+  /// True while this driver is asynchronously waiting at the probe completion
+  /// barrier. Kept separately from future_ because isBlocked() moves future_.
+  bool waitingForProbePeers_{false};
+  /// Set only after the last probe driver has released the bridge owner, or
+  /// after a waiting peer resumes from that release.
+  bool probeFinishBarrierComplete_{false};
 
   /** @brief Column indices for join keys in left (probe) table */
   std::vector<cudf::size_type> leftKeyIndices_;

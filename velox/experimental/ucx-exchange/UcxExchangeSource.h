@@ -38,6 +38,28 @@
 
 namespace facebook::velox::ucx_exchange {
 
+namespace detail {
+
+/// Copies a pageable host staging buffer into a device buffer on the stream
+/// that will own and consume the resulting packed table. The copy is complete
+/// before this function returns, so the caller may immediately reuse the host
+/// buffer.
+void copyPageableHostToDevice(
+    void* destination,
+    const void* source,
+    size_t bytes,
+    rmm::cuda_stream_view stream);
+
+/// Clones a device buffer onto cloneStream while preserving the lifetime of
+/// the source buffer, whose stream-ordered deallocation remains associated
+/// with producerStream.
+std::unique_ptr<rmm::device_buffer> cloneDeviceBufferAcrossStreams(
+    const rmm::device_buffer& source,
+    rmm::cuda_stream_view producerStream,
+    rmm::cuda_stream_view cloneStream);
+
+} // namespace detail
+
 struct UcxExchangeMetrics {
   UcxExchangeMetrics()
       : numPackedColumns_(RuntimeMetric(RuntimeCounter::Unit::kNone)),
