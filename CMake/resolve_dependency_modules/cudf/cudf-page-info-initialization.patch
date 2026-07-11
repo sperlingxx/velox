@@ -1,0 +1,135 @@
+--- a/cpp/src/io/parquet/page_hdr.cu
++++ b/cpp/src/io/parquet/page_hdr.cu
+@@ -2 +2 @@
+- * SPDX-FileCopyrightText: Copyright (c) 2018-2026, NVIDIA CORPORATION.
++ * SPDX-FileCopyrightText: Copyright (c) 2018-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+@@ -18,0 +19 @@
++#include <cuda/std/cstring>
+@@ -515,24 +516,5 @@
+-  // this computation is only valid for flat schemas. for nested schemas,
+-  // they will be recomputed in the preprocess step by examining repetition and
+-  // definition levels
+-  bs->page.chunk_row            = 0;
+-  bs->page.num_rows             = 0;
+-  bs->page.is_num_rows_adjusted = false;
+-  bs->page.skipped_values       = -1;
+-  bs->page.skipped_leaf_values  = 0;
+-  bs->page.str_bytes            = 0;
+-  bs->page.str_bytes_from_index = 0;
+-  bs->page.num_valids           = 0;
+-  bs->page.start_val            = 0;
+-  bs->page.end_val              = 0;
+-  bs->page.has_page_index       = false;
+-  bs->page.temp_string_size     = 0;
+-  bs->page.temp_string_buf      = nullptr;
+-  bs->page.kernel_mask          = decode_kernel_mask::NONE;
+-  bs->page.flags                = 0;
+-  bs->page.str_bytes_all        = 0;
+-  // zero out V2 info
+-  bs->page.is_compressed                     = true;
+-  bs->page.num_nulls                         = 0;
+-  bs->page.lvl_bytes[level_type::DEFINITION] = 0;
+-  bs->page.lvl_bytes[level_type::REPETITION] = 0;
++  cuda::std::memset(&bs->page, 0, sizeof(bs->page));
++  // Apply non-zero defaults
++  bs->page.skipped_values = -1;
++  bs->page.is_compressed  = true;
++  bs->page.kernel_mask    = decode_kernel_mask::NONE;
+@@ -579,2 +561,4 @@
+-    bs->base = bs->cur      = bs->ck.compressed_data;
+-    bs->end                 = bs->base + bs->ck.compressed_size;
++    bs->base = bs->cur = bs->ck.compressed_data;
++    bs->end            = bs->base + bs->ck.compressed_size;
++    // Clear page header info before writing known fields
++    zero_out_page_header_info(bs);
+@@ -583 +566,0 @@
+-    zero_out_page_header_info(bs);
+@@ -794,0 +778,3 @@
++    // Clear page header info before writing known fields
++    zero_out_page_header_info(&bs);
++
+@@ -797,3 +782,0 @@
+-
+-    // Zero out the rest of the page header info
+-    zero_out_page_header_info(&bs);
+--- a/cpp/src/io/parquet/parquet_gpu.hpp
++++ b/cpp/src/io/parquet/parquet_gpu.hpp
+@@ -2 +2 @@
+- * SPDX-FileCopyrightText: Copyright (c) 2018-2026, NVIDIA CORPORATION.
++ * SPDX-FileCopyrightText: Copyright (c) 2018-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+@@ -305,0 +306,13 @@
++  size_t str_offset;   // offset into string data for this page
++  // nesting information (input/output) for each page. this array contains
++  // input column nesting information, output column nesting information and
++  // mappings between the two. the length of the array, nesting_info_size is
++  // max(num_output_nesting_levels, max_definition_levels + 1)
++  PageNestingInfo* nesting;
++  PageNestingDecodeInfo* nesting_decode;
++  // level decode buffers
++  uint8_t* lvl_decode_buf[level_type::NUM_LEVEL_TYPES];  // NOLINT
++  // temporary space for decoding DELTA_BYTE_ARRAY encoded strings
++  int64_t temp_string_size;
++  uint8_t* temp_string_buf;
++
+@@ -320,4 +333,2 @@
+-  int32_t chunk_row;          // starting row of this page relative to the start of the chunk
+-  int32_t num_rows;           // number of rows in this page
+-  bool is_num_rows_adjusted;  // Flag to indicate if the number of rows of this page have been
+-                              // adjusted to compensate for the list row size estimates.
++  int32_t chunk_row;  // starting row of this page relative to the start of the chunk
++  int32_t num_rows;   // number of rows in this page
+@@ -331,6 +341,0 @@
+-  uint8_t flags;           // PAGEINFO_FLAGS_XXX
+-  Encoding encoding;       // Encoding for data or dictionary page
+-  Encoding definition_level_encoding;  // Encoding used for definition levels (data page)
+-  Encoding repetition_level_encoding;  // Encoding used for repetition levels (data page)
+-  bool is_compressed;                  // Whether the page is compressed (V2 header)
+-
+@@ -351 +355,0 @@
+-  size_t str_offset;      // offset into string data for this page
+@@ -355,6 +358,0 @@
+-  bool has_page_index;    // true if str_bytes, num_valids, etc are derivable from page indexes
+-
+-  // nesting information (input/output) for each page. this array contains
+-  // input column nesting information, output column nesting information and
+-  // mappings between the two. the length of the array, nesting_info_size is
+-  // max(num_output_nesting_levels, max_definition_levels + 1)
+@@ -363,5 +360,0 @@
+-  PageNestingInfo* nesting;
+-  PageNestingDecodeInfo* nesting_decode;
+-
+-  // level decode buffers
+-  uint8_t* lvl_decode_buf[level_type::NUM_LEVEL_TYPES];  // NOLINT
+@@ -371,7 +363,0 @@
+-
+-  // temporary space for decoding DELTA_BYTE_ARRAY encoded strings
+-  int64_t temp_string_size;
+-  uint8_t* temp_string_buf;
+-
+-  decode_kernel_mask kernel_mask;
+-
+@@ -380,0 +367,10 @@
++  decode_kernel_mask kernel_mask;
++
++  bool is_num_rows_adjusted;  // Flag to indicate if the number of rows of this page have been
++                              // adjusted to compensate for the list row size estimates.
++  uint8_t flags;              // PAGEINFO_FLAGS_XXX
++  Encoding encoding;          // Encoding for data or dictionary page
++  Encoding definition_level_encoding;  // Encoding used for definition levels (data page)
++  Encoding repetition_level_encoding;  // Encoding used for repetition levels (data page)
++  bool is_compressed;                  // Whether the page is compressed (V2 header)
++  bool has_page_index;  // true if str_bytes, num_valids, etc are derivable from page indexes
+--- a/cpp/src/io/parquet/reader_impl_preprocess.cu
++++ b/cpp/src/io/parquet/reader_impl_preprocess.cu
+@@ -2 +2 @@
+- * SPDX-FileCopyrightText: Copyright (c) 2022-2026, NVIDIA CORPORATION.
++ * SPDX-FileCopyrightText: Copyright (c) 2022-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+@@ -17,0 +18 @@
++#include <cudf/utilities/error.hpp>
+@@ -563 +564,5 @@
+-  rmm::device_uvector<PageInfo> unsorted_pages(total_pages, _stream);
++
++  // Zero out the vector before `decode_page_headers` as it may not write every byte of the buffer,
++  // and`sort_pages` copies `PageInfo` as whole objects.
++  auto unsorted_pages = cudf::detail::make_zeroed_device_uvector_async<PageInfo>(
++    total_pages, _stream, cudf::get_current_device_resource_ref());

@@ -130,12 +130,37 @@ block(SCOPE_FOR VARIABLES)
     UPDATE_DISCONNECTED 1
   )
 
+  set(CUDF_PATCH_DRIVER "${CMAKE_CURRENT_LIST_DIR}/cudf/apply-cudf-patches.cmake")
+  set(CUDF_EMPTY_DICTIONARY_PATCH "${CMAKE_CURRENT_LIST_DIR}/cudf/cudf-empty-dictionary-page.patch")
+  set(CUDF_PAGE_INFO_PATCH "${CMAKE_CURRENT_LIST_DIR}/cudf/cudf-page-info-initialization.patch")
+  set_property(
+    DIRECTORY
+    APPEND
+    PROPERTY CMAKE_CONFIGURE_DEPENDS
+             "${CUDF_PATCH_DRIVER}"
+             "${CUDF_EMPTY_DICTIONARY_PATCH}"
+             "${CUDF_PAGE_INFO_PATCH}"
+  )
+  file(SHA256 "${CUDF_PATCH_DRIVER}" CUDF_PATCH_DRIVER_SHA256)
+  file(SHA256 "${CUDF_EMPTY_DICTIONARY_PATCH}" CUDF_EMPTY_DICTIONARY_PATCH_SHA256)
+  file(SHA256 "${CUDF_PAGE_INFO_PATCH}" CUDF_PAGE_INFO_PATCH_SHA256)
+  string(
+    SHA256
+    CUDF_PATCH_SET_SHA256
+    "${CUDF_PATCH_DRIVER_SHA256};${CUDF_EMPTY_DICTIONARY_PATCH_SHA256};${CUDF_PAGE_INFO_PATCH_SHA256}"
+  )
+
   FetchContent_Declare(
     cudf
     URL ${VELOX_cudf_SOURCE_URL}
     URL_HASH ${VELOX_cudf_BUILD_SHA256_CHECKSUM}
     SOURCE_SUBDIR
     cpp
+    # Backport rapidsai/cudf#22777 and #22957 until the pin contains both fixes.
+    # The content hash makes ExternalProject invalidate its patch stamp.
+    PATCH_COMMAND
+      ${CMAKE_COMMAND} -DSOURCE_DIR=<SOURCE_DIR> -DPATCH_SET_SHA256=${CUDF_PATCH_SET_SHA256} -P
+      "${CUDF_PATCH_DRIVER}"
     UPDATE_DISCONNECTED 1
   )
 

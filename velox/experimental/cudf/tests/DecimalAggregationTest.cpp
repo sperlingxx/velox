@@ -21,6 +21,7 @@
 
 #include "velox/common/base/tests/GTestUtils.h"
 #include "velox/common/file/FileSystems.h"
+#include "velox/exec/PlanNodeStats.h"
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
 #include "velox/exec/tests/utils/OperatorTestBase.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
@@ -240,6 +241,23 @@ class CudfDecimalTest : public exec::test::OperatorTestBase {
     unregisterCudf();
     exec::test::OperatorTestBase::TearDown();
   }
+};
+
+class ScopedGroupbyStreamingCapacity {
+ public:
+  explicit ScopedGroupbyStreamingCapacity(int32_t capacity)
+      : previousCapacity_(
+            CudfConfig::getInstance().groupbyStreamingMaxDistinctKeys) {
+    CudfConfig::getInstance().groupbyStreamingMaxDistinctKeys = capacity;
+  }
+
+  ~ScopedGroupbyStreamingCapacity() {
+    CudfConfig::getInstance().groupbyStreamingMaxDistinctKeys =
+        previousCapacity_;
+  }
+
+ private:
+  const int32_t previousCapacity_;
 };
 
 TEST_F(CudfDecimalTest, decimalAvgDecimalInput) {
@@ -717,6 +735,70 @@ TEST_F(CudfDecimalTest, decimalSumPartialFinalVarbinary) {
 
   facebook::velox::exec::test::AssertQueryBuilder(plan, duckDbQueryRunner_)
       .assertResults("SELECT k, sum(d) AS s FROM tmp GROUP BY k");
+}
+
+TEST_F(
+    CudfDecimalTest,
+    decimalFinalStreamingProbeReleasesMaterializedColumns) {
+  ScopedGroupbyStreamingCapacity streamingCapacity(4096);
+  auto input1 = makeRowVector(
+      {"k", "d"},
+      {
+          makeFlatVector<int32_t>({1, 1, 2}),
+          makeFlatVector<int64_t>({12345, -2500, 10000}, DECIMAL(12, 2)),
+      });
+  auto input2 = makeRowVector(
+      {"k", "d"},
+      {
+          makeFlatVector<int32_t>({2, 2, 3}),
+          makeFlatVector<int64_t>({200, -300, 700}, DECIMAL(12, 2)),
+      });
+  auto input3 = makeRowVector(
+      {"k", "d"},
+      {
+          makeFlatVector<int32_t>({1, 3, 4}),
+          makeFlatVector<int64_t>({100, -250, 900}, DECIMAL(12, 2)),
+      });
+  std::vector<RowVectorPtr> vectors = {input1, input2, input3};
+  auto expected = makeRowVector(
+      {"k", "s", "a"},
+      {
+          makeFlatVector<int32_t>({1, 2, 3, 4}),
+          makeFlatVector<int128_t>(
+              {static_cast<int128_t>(9945),
+               static_cast<int128_t>(9900),
+               static_cast<int128_t>(450),
+               static_cast<int128_t>(900)},
+              DECIMAL(38, 2)),
+          makeFlatVector<int64_t>({3315, 3300, 225, 900}, DECIMAL(12, 2)),
+      });
+
+  core::PlanNodeId partialAggId;
+  core::PlanNodeId finalAggId;
+  auto plan = exec::test::PlanBuilder()
+                  .values(vectors)
+                  .partialAggregation(
+                      {"k"}, {"sum(d) AS s", "avg(d) AS a"})
+                  .capturePlanNodeId(partialAggId)
+                  .finalAggregation()
+                  .capturePlanNodeId(finalAggId)
+                  .planNode();
+  auto task = exec::test::AssertQueryBuilder(plan)
+                  .config(core::QueryConfig::kMaxPartialAggregationMemory, 1)
+                  .assertResults(expected);
+
+  const auto planStats = exec::toPlanStats(task->taskStats());
+  EXPECT_GT(
+      planStats.at(partialAggId)
+          .customStats.at("flushRowCount")
+          .sum,
+      0);
+  const auto& finalStats = planStats.at(finalAggId).customStats;
+  EXPECT_EQ(
+      finalStats.at("cudfFinalStreamingFallbackProbeColumnsReleased").sum,
+      3);
+  EXPECT_GT(finalStats.at("cudfFinalAggregationInputRuns").sum, 1);
+  EXPECT_EQ(finalStats.count("cudfFinalStreamingBatches"), 0);
 }
 
 TEST_F(CudfDecimalTest, decimalPartialSumVarbinaryToVeloxRoundTrip) {

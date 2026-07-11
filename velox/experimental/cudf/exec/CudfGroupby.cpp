@@ -74,6 +74,8 @@ constexpr const char* kFinalStreamingDistinctKeys =
     "cudfFinalStreamingDistinctKeys";
 constexpr const char* kFinalStreamingOutputRows =
     "cudfFinalStreamingOutputRows";
+constexpr const char* kFinalStreamingFallbackProbeColumnsReleased =
+    "cudfFinalStreamingFallbackProbeColumnsReleased";
 
 size_t aggregationRunLevel(uint64_t representedRows) {
   VELOX_CHECK_GT(representedRows, 0);
@@ -114,6 +116,12 @@ uint64_t addRepresentedRows(uint64_t left, uint64_t right) {
       }                                                                   \
       request.aggregations.push_back(                                     \
           cudf::make_##name##_aggregation<cudf::groupby_aggregation>());  \
+    }                                                                     \
+                                                                          \
+    size_t releaseRequestState() override {                               \
+      const size_t released = constant_input == nullptr ? 0 : 1;          \
+      constant_input.reset();                                             \
+      return released;                                                    \
     }                                                                     \
                                                                           \
     std::unique_ptr<cudf::column> makeOutputColumn(                       \
@@ -282,6 +290,16 @@ struct GroupbyDecimalSumAggregator : GroupbyAggregator {
     }
   }
 
+  size_t releaseRequestState() override {
+    const size_t released = static_cast<size_t>(decodedSum_ != nullptr) +
+        static_cast<size_t>(decodedCount_ != nullptr) +
+        static_cast<size_t>(castedInput_ != nullptr);
+    decodedSum_.reset();
+    decodedCount_.reset();
+    castedInput_.reset();
+    return released;
+  }
+
   std::unique_ptr<cudf::column> makeOutputColumn(
       std::vector<cudf::groupby::aggregation_result>& results,
       rmm::cuda_stream_view stream,
@@ -349,6 +367,16 @@ struct GroupbyDecimalAvgAggregator : GroupbyAggregator {
           sumIdx_,
           castedInput_);
     }
+  }
+
+  size_t releaseRequestState() override {
+    const size_t released = static_cast<size_t>(decodedSum_ != nullptr) +
+        static_cast<size_t>(decodedCount_ != nullptr) +
+        static_cast<size_t>(castedInput_ != nullptr);
+    decodedSum_.reset();
+    decodedCount_.reset();
+    castedInput_.reset();
+    return released;
   }
 
   std::unique_ptr<cudf::column> makeOutputColumn(
@@ -1223,6 +1251,24 @@ void CudfGroupby::computeFinalGroupbyStreaming(CudfVectorPtr tbl) {
   if (finalAggregationMode_ == FinalAggregationMode::kUndecided) {
     if (!allRequestsSupported) {
       finalAggregationMode_ = FinalAggregationMode::kLevelled;
+      // The support probe above may have decoded page-sized intermediate
+      // columns (for example decimal SUM/AVG) into aggregator-owned request
+      // state. None of these views or aggregations are used by the levelled
+      // path. Drop all view holders first, then release the owning columns
+      // before the first levelled run is materialized.
+      streamingRequests.clear();
+      regularRequests.clear();
+      packedColumns.clear();
+      size_t releasedColumns = 0;
+      for (auto& aggregator : aggregators_) {
+        releasedColumns += aggregator->releaseRequestState();
+      }
+      if (releasedColumns > 0) {
+        auto lockedStats = stats_.wlock();
+        lockedStats->addRuntimeStat(
+            kFinalStreamingFallbackProbeColumnsReleased,
+            RuntimeCounter(static_cast<int64_t>(releasedColumns)));
+      }
       addLevelledRun();
       return;
     }

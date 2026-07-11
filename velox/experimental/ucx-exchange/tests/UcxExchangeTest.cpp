@@ -1586,15 +1586,22 @@ TEST(UcxExchangeSourceStreamOrderingTest, cloneWaitsForProducer) {
   auto payload = variableStringPayload();
   rmm::cuda_stream producerStream(rmm::cuda_stream::flags::non_blocking);
   rmm::cuda_stream cloneStream(rmm::cuda_stream::flags::non_blocking);
+  rmm::device_buffer staged(payload.size(), producerStream.view());
   rmm::device_buffer source(payload.size(), producerStream.view());
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+      staged.data(),
+      payload.data(),
+      payload.size(),
+      cudaMemcpyHostToDevice,
+      producerStream.value()));
   producerStream.synchronize();
 
   StreamGate producerGate(producerStream.view());
   CUDF_CUDA_TRY(cudaMemcpyAsync(
       source.data(),
-      payload.data(),
+      staged.data(),
       payload.size(),
-      cudaMemcpyHostToDevice,
+      cudaMemcpyDeviceToDevice,
       producerStream.value()));
 
   auto clone = detail::cloneDeviceBufferAcrossStreams(

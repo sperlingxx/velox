@@ -19,11 +19,14 @@
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnectorSplit.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveDataSource.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveTableHandle.h"
+#include "velox/experimental/cudf/connectors/hive/CudfSplitReaderHelpers.h"
+#include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/expression/SubfieldFiltersToAst.h"
 #include "velox/experimental/cudf/tests/utils/CudfHiveConnectorTestBase.h"
 
 #include "velox/common/base/Fs.h"
 #include "velox/common/base/tests/GTestUtils.h"
+#include "velox/common/file/File.h"
 #include "velox/common/file/tests/FaultyFile.h"
 #include "velox/common/file/tests/FaultyFileSystem.h"
 #include "velox/common/memory/MemoryArbitrator.h"
@@ -44,8 +47,26 @@
 #include "velox/type/tests/SubfieldFiltersBuilder.h"
 
 #include <cudf/io/parquet.hpp>
+#include <cudf/utilities/error.hpp>
 
 #include <fmt/ranges.h>
+#include <folly/ScopeGuard.h>
+#include <folly/executors/CPUThreadPoolExecutor.h>
+#include <folly/synchronization/Baton.h>
+
+#include <rmm/cuda_stream.hpp>
+#include <rmm/device_buffer.hpp>
+#include <rmm/mr/per_device_resource.hpp>
+
+#include <cuda_runtime_api.h>
+
+#include <atomic>
+#include <chrono>
+#include <cstring>
+#include <future>
+#include <stdexcept>
+#include <thread>
+#include <tuple>
 
 using namespace facebook::velox;
 using namespace facebook::velox::common::testutil;
@@ -87,6 +108,327 @@ StatsFilterMetrics readParquetWithStatsFilter(
       result.metadata.num_input_row_groups,
       result.metadata.num_row_groups_after_stats_filter,
       result.tbl->num_rows()};
+}
+
+class ExecutorBufferedInput final : public dwio::common::BufferedInput {
+ public:
+  ExecutorBufferedInput(
+      std::shared_ptr<ReadFile> readFile,
+      memory::MemoryPool& pool,
+      folly::Executor* executor)
+      : BufferedInput(std::move(readFile), pool), executor_(executor) {}
+
+  folly::Executor* executor() const override {
+    return executor_;
+  }
+
+ private:
+  folly::Executor* const executor_;
+};
+
+class PinnedHostAllocation final {
+ public:
+  explicit PinnedHostAllocation(size_t size) : size_(size) {
+    if (size_ > 0) {
+      CUDF_CUDA_TRY(
+          cudaMallocHost(reinterpret_cast<void**>(&data_), size_));
+    }
+  }
+
+  ~PinnedHostAllocation() {
+    if (data_ != nullptr) {
+      (void)cudaFreeHost(data_);
+    }
+  }
+
+  PinnedHostAllocation(const PinnedHostAllocation&) = delete;
+  PinnedHostAllocation& operator=(const PinnedHostAllocation&) = delete;
+
+  size_t size() const {
+    return size_;
+  }
+
+  uint8_t* data() {
+    return data_;
+  }
+
+ private:
+  uint8_t* data_{nullptr};
+  const size_t size_;
+};
+
+class HostDataView final : public cudf::io::datasource::buffer {
+ public:
+  HostDataView(const uint8_t* data, size_t size) : data_(data), size_(size) {}
+
+  size_t size() const override {
+    return size_;
+  }
+
+  const uint8_t* data() const override {
+    return data_;
+  }
+
+ private:
+  const uint8_t* const data_;
+  const size_t size_;
+};
+
+class PinnedBufferedInputDataSource final
+    : public facebook::velox::cudf_velox::connector::hive::
+          BufferedInputDataSource {
+ public:
+  PinnedBufferedInputDataSource(
+      std::shared_ptr<dwio::common::BufferedInput> input,
+      std::string data,
+      folly::Baton<>* hostReadComplete)
+      : BufferedInputDataSource(std::move(input)),
+        buffer_(data.size()),
+        hostReadComplete_(hostReadComplete) {
+    if (!data.empty()) {
+      std::memcpy(buffer_.data(), data.data(), data.size());
+    }
+  }
+
+  using BufferedInputDataSource::host_read;
+
+  std::unique_ptr<cudf::io::datasource::buffer> host_read(
+      size_t offset,
+      size_t size) override {
+    VELOX_CHECK_EQ(offset, 0);
+    VELOX_CHECK_EQ(size, buffer_.size());
+    hostReadComplete_->post();
+    return std::make_unique<HostDataView>(buffer_.data(), buffer_.size());
+  }
+
+ private:
+  PinnedHostAllocation buffer_;
+  folly::Baton<>* const hostReadComplete_;
+};
+
+class ThrowingBufferedInputDataSource final
+    : public facebook::velox::cudf_velox::connector::hive::
+          BufferedInputDataSource {
+ public:
+  explicit ThrowingBufferedInputDataSource(
+      std::shared_ptr<dwio::common::BufferedInput> input)
+      : BufferedInputDataSource(std::move(input)) {}
+
+  using BufferedInputDataSource::host_read;
+
+  std::unique_ptr<cudf::io::datasource::buffer> host_read(
+      size_t /*offset*/,
+      size_t /*size*/) override {
+    throw std::runtime_error("injected host read failure");
+  }
+};
+
+class BlockingHostDataSource final : public cudf::io::datasource {
+ public:
+  explicit BlockingHostDataSource(std::string data) : buffer_(data.size()) {
+    if (!data.empty()) {
+      std::memcpy(buffer_.data(), data.data(), data.size());
+    }
+  }
+
+  size_t size() const override {
+    return buffer_.size();
+  }
+
+  std::unique_ptr<cudf::io::datasource::buffer> host_read(
+      size_t offset,
+      size_t size) override {
+    VELOX_CHECK_LE(offset + size, buffer_.size());
+    hostReadStarted_.post();
+    allowHostRead_.wait();
+    return std::make_unique<HostDataView>(buffer_.data() + offset, size);
+  }
+
+  size_t host_read(size_t offset, size_t size, uint8_t* dst) override {
+    VELOX_CHECK_LE(offset + size, buffer_.size());
+    std::memcpy(dst, buffer_.data() + offset, size);
+    return size;
+  }
+
+  bool waitForHostRead(std::chrono::seconds timeout) {
+    return hostReadStarted_.try_wait_for(timeout);
+  }
+
+  void allowHostRead() {
+    allowHostRead_.post();
+  }
+
+ private:
+  PinnedHostAllocation buffer_;
+  folly::Baton<> hostReadStarted_;
+  folly::Baton<> allowHostRead_;
+};
+
+struct BatchedLoadState {
+  explicit BatchedLoadState(cudaStream_t stream) : stream(stream) {}
+
+  const cudaStream_t stream;
+  folly::Baton<> firstCopyComplete;
+  folly::Baton<> releaseFirstCopy;
+  std::atomic<int32_t> secondReadAttempts{0};
+  std::atomic<bool> firstCopyObserved{false};
+};
+
+void CUDART_CB observeFirstCopy(void* opaque) {
+  auto* state = static_cast<BatchedLoadState*>(opaque);
+  state->firstCopyComplete.post();
+  state->releaseFirstCopy.wait();
+}
+
+class BatchedLoadBufferedInput final : public dwio::common::BufferedInput {
+ public:
+  BatchedLoadBufferedInput(
+      memory::MemoryPool& pool,
+      std::string firstRange,
+      BatchedLoadState* state)
+      : BufferedInput(
+            std::make_shared<InMemoryReadFile>(
+                std::string(firstRange.size() * 2, 'x')),
+            pool),
+        firstRange_(std::move(firstRange)),
+        state_(state) {}
+
+  std::unique_ptr<dwio::common::SeekableInputStream> enqueue(
+      common::Region region,
+      const dwio::common::StreamIdentifier* /*sid*/) override {
+    VELOX_CHECK_EQ(region.length, firstRange_.size());
+    if (enqueueCount_++ == 0) {
+      return std::make_unique<dwio::common::SeekableArrayInputStream>(
+          firstRange_.data(), firstRange_.size());
+    }
+
+    VELOX_CHECK_EQ(enqueueCount_, 2);
+    return std::make_unique<dwio::common::SeekableArrayInputStream>(
+        [state = state_]() -> std::tuple<const char*, uint64_t> {
+          ++state->secondReadAttempts;
+          CUDF_CUDA_TRY(cudaLaunchHostFunc(
+              state->stream, observeFirstCopy, state));
+          throw std::runtime_error("injected second range failure");
+        });
+  }
+
+  void load(const dwio::common::LogType /*logType*/) override {}
+
+ private:
+  const std::string firstRange_;
+  BatchedLoadState* const state_;
+  int32_t enqueueCount_{0};
+};
+
+class ThrowOnSecondEnqueueBufferedInput final
+    : public dwio::common::BufferedInput {
+ public:
+  ThrowOnSecondEnqueueBufferedInput(
+      memory::MemoryPool& pool,
+      size_t rangeSize)
+      : BufferedInput(
+            std::make_shared<InMemoryReadFile>(
+                std::string(rangeSize * 2, 'x')),
+            pool),
+        rangeSize_(rangeSize) {}
+
+  std::unique_ptr<dwio::common::SeekableInputStream> enqueue(
+      common::Region region,
+      const dwio::common::StreamIdentifier* /*sid*/) override {
+    VELOX_CHECK_EQ(region.length, rangeSize_);
+    if (enqueueAttempts_++ == 0) {
+      return std::make_unique<dwio::common::SeekableArrayInputStream>(
+          [this]() -> std::tuple<const char*, uint64_t> {
+            ++firstReadAttempts_;
+            throw std::runtime_error("stale first range read");
+          });
+    }
+
+    throw std::runtime_error("injected second enqueue failure");
+  }
+
+  void load(const dwio::common::LogType /*logType*/) override {}
+
+  int32_t enqueueAttempts() const {
+    return enqueueAttempts_;
+  }
+
+  int32_t firstReadAttempts() const {
+    return firstReadAttempts_;
+  }
+
+ private:
+  const size_t rangeSize_;
+  int32_t enqueueAttempts_{0};
+  int32_t firstReadAttempts_{0};
+};
+
+class GatedDeviceReadDataSource final : public cudf::io::datasource {
+ public:
+  explicit GatedDeviceReadDataSource(size_t rangeSize)
+      : rangeSize_(rangeSize) {}
+
+  size_t size() const override {
+    return rangeSize_ * 3;
+  }
+
+  std::unique_ptr<cudf::io::datasource::buffer> host_read(
+      size_t /*offset*/,
+      size_t /*size*/) override {
+    VELOX_FAIL("Unexpected host read");
+  }
+
+  size_t host_read(
+      size_t /*offset*/,
+      size_t /*size*/,
+      uint8_t* /*dst*/) override {
+    VELOX_FAIL("Unexpected host read");
+  }
+
+  bool supports_device_read() const override {
+    return true;
+  }
+
+  std::future<size_t> device_read_async(
+      size_t /*offset*/,
+      size_t size,
+      uint8_t* /*dst*/,
+      rmm::cuda_stream_view /*stream*/) override {
+    if (deviceReadAttempts_++ == 0) {
+      VELOX_CHECK_EQ(size, rangeSize_);
+      firstReadScheduled_.post();
+      return firstReadPromise_.get_future();
+    }
+
+    secondReadScheduled_.post();
+    throw std::runtime_error("injected second device read failure");
+  }
+
+  bool waitForFirstRead(std::chrono::seconds timeout) {
+    return firstReadScheduled_.try_wait_for(timeout);
+  }
+
+  bool waitForSecondRead(std::chrono::seconds timeout) {
+    return secondReadScheduled_.try_wait_for(timeout);
+  }
+
+  void releaseFirstRead() {
+    if (!firstReadReleased_.exchange(true)) {
+      firstReadPromise_.set_value(rangeSize_);
+    }
+  }
+
+ private:
+  const size_t rangeSize_;
+  std::promise<size_t> firstReadPromise_;
+  folly::Baton<> firstReadScheduled_;
+  folly::Baton<> secondReadScheduled_;
+  std::atomic<int32_t> deviceReadAttempts_{0};
+  std::atomic<bool> firstReadReleased_{false};
+};
+
+void CUDART_CB waitForBaton(void* baton) {
+  static_cast<folly::Baton<>*>(baton)->wait();
 }
 } // namespace
 
@@ -334,6 +676,261 @@ INSTANTIATE_TEST_SUITE_P(
     [](const testing::TestParamInfo<bool>& info) {
       return info.param ? "BufferedInput" : "FileDataSource";
     });
+
+TEST_F(TableScanTest, bufferedInputDeviceReadAsyncWaitsForDeviceCopy) {
+  constexpr size_t kDataSize = 4 << 10;
+  std::string expected(kDataSize, '\0');
+  for (size_t i = 0; i < expected.size(); ++i) {
+    expected[i] = static_cast<char>(i % 251);
+  }
+
+  folly::CPUThreadPoolExecutor executor(1);
+  auto input = std::make_shared<ExecutorBufferedInput>(
+      std::make_shared<InMemoryReadFile>(std::string(expected)),
+      *pool_,
+      &executor);
+  folly::Baton<> hostReadComplete;
+  PinnedBufferedInputDataSource dataSource(
+      std::move(input), expected, &hostReadComplete);
+
+  rmm::cuda_stream gateStream(rmm::cuda_stream::flags::non_blocking);
+  rmm::cuda_stream copyStream(rmm::cuda_stream::flags::non_blocking);
+  rmm::device_buffer destination(expected.size(), copyStream);
+  CudaEvent copyGate(cudaEventDisableTiming);
+  folly::Baton<> releaseCopy;
+  std::future<size_t> future;
+  bool copyReleased = false;
+  auto cleanupGuard = folly::makeGuard([&] {
+    if (!copyReleased) {
+      releaseCopy.post();
+    }
+    if (future.valid()) {
+      future.wait();
+    }
+    copyStream.synchronize_no_throw();
+    gateStream.synchronize_no_throw();
+  });
+
+  CUDF_CUDA_TRY(
+      cudaLaunchHostFunc(gateStream.value(), waitForBaton, &releaseCopy));
+  copyGate.recordFrom(gateStream);
+  copyGate.waitOn(copyStream);
+
+  future = dataSource.device_read_async(
+      0,
+      expected.size(),
+      static_cast<uint8_t*>(destination.data()),
+      copyStream);
+  ASSERT_TRUE(hostReadComplete.try_wait_for(std::chrono::seconds(5)));
+  EXPECT_EQ(
+      future.wait_for(std::chrono::milliseconds(500)),
+      std::future_status::timeout);
+
+  releaseCopy.post();
+  copyReleased = true;
+  ASSERT_EQ(future.get(), expected.size());
+
+  std::string actual(expected.size(), '\0');
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+      actual.data(),
+      destination.data(),
+      actual.size(),
+      cudaMemcpyDeviceToHost,
+      copyStream.value()));
+  copyStream.synchronize();
+  EXPECT_EQ(actual, expected);
+}
+
+TEST_F(TableScanTest, bufferedInputDeviceReadAsyncPropagatesException) {
+  folly::CPUThreadPoolExecutor executor(1);
+  auto input = std::make_shared<ExecutorBufferedInput>(
+      std::make_shared<InMemoryReadFile>(std::string("x")),
+      *pool_,
+      &executor);
+  ThrowingBufferedInputDataSource dataSource(std::move(input));
+  rmm::cuda_stream stream(rmm::cuda_stream::flags::non_blocking);
+
+  auto future = dataSource.device_read_async(0, 1, nullptr, stream);
+  EXPECT_THROW(future.get(), std::runtime_error);
+}
+
+TEST_F(TableScanTest, bufferedInputFetchClearsPendingLoadsAfterFailure) {
+  constexpr size_t kRangeSize = 4 << 10;
+  std::string firstRange(kRangeSize, '\0');
+  for (size_t i = 0; i < firstRange.size(); ++i) {
+    firstRange[i] = static_cast<char>(i % 251);
+  }
+
+  rmm::cuda_stream stream(rmm::cuda_stream::flags::non_blocking);
+  BatchedLoadState state(stream.value());
+  auto input = std::make_shared<BatchedLoadBufferedInput>(
+      *pool_, firstRange, &state);
+  auto dataSource = std::make_shared<
+      facebook::velox::cudf_velox::connector::hive::
+          BufferedInputDataSource>(std::move(input));
+  std::vector<cudf::io::text::byte_range_info> ranges{
+      {0, kRangeSize}, {kRangeSize, kRangeSize}};
+
+  auto [deviceBuffers, deviceSpans, loadFuture] =
+      facebook::velox::cudf_velox::connector::hive::fetchByteRangesAsync(
+          dataSource,
+          cudf::host_span<const cudf::io::text::byte_range_info>(
+              ranges.data(), ranges.size()),
+          stream,
+          rmm::mr::get_current_device_resource_ref());
+
+  std::thread releaseThread([&] {
+    const auto observed =
+        state.firstCopyComplete.try_wait_for(std::chrono::seconds(5));
+    state.firstCopyObserved.store(observed);
+    state.releaseFirstCopy.post();
+  });
+  EXPECT_THROW(loadFuture.get(), std::runtime_error);
+  releaseThread.join();
+
+  ASSERT_TRUE(state.firstCopyObserved.load());
+  ASSERT_EQ(deviceBuffers.size(), 1);
+  ASSERT_EQ(deviceSpans.size(), 2);
+  std::string actual(firstRange.size(), '\0');
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+      actual.data(),
+      deviceSpans[0].data(),
+      actual.size(),
+      cudaMemcpyDeviceToHost,
+      stream.value()));
+  stream.synchronize();
+  EXPECT_EQ(actual, firstRange);
+
+  EXPECT_NO_THROW(dataSource->load(stream));
+  EXPECT_EQ(state.secondReadAttempts.load(), 1);
+}
+
+TEST_F(
+    TableScanTest,
+    bufferedInputFetchClearsPendingLoadsAfterEnqueueFailure) {
+  constexpr size_t kRangeSize = 4 << 10;
+  rmm::cuda_stream stream(rmm::cuda_stream::flags::non_blocking);
+  auto input = std::make_shared<ThrowOnSecondEnqueueBufferedInput>(
+      *pool_, kRangeSize);
+  auto dataSource = std::make_shared<
+      facebook::velox::cudf_velox::connector::hive::
+          BufferedInputDataSource>(input);
+  std::vector<cudf::io::text::byte_range_info> ranges{
+      {0, kRangeSize}, {kRangeSize, kRangeSize}};
+
+  EXPECT_THROW(
+      (void)facebook::velox::cudf_velox::connector::hive::
+          fetchByteRangesAsync(
+              dataSource,
+              cudf::host_span<const cudf::io::text::byte_range_info>(
+                  ranges.data(), ranges.size()),
+              stream,
+              rmm::mr::get_current_device_resource_ref()),
+      std::runtime_error);
+  ASSERT_EQ(input->enqueueAttempts(), 2);
+  ASSERT_EQ(input->firstReadAttempts(), 0);
+
+  EXPECT_NO_THROW(dataSource->load(stream));
+  EXPECT_EQ(input->firstReadAttempts(), 0);
+}
+
+TEST_F(TableScanTest, genericHostFetchWaitsForDeviceCopy) {
+  constexpr size_t kDataSize = 4 << 10;
+  std::string expected(kDataSize, '\0');
+  for (size_t i = 0; i < expected.size(); ++i) {
+    expected[i] = static_cast<char>(i % 251);
+  }
+
+  rmm::cuda_stream stream(rmm::cuda_stream::flags::non_blocking);
+  auto dataSource = std::make_shared<BlockingHostDataSource>(expected);
+  std::vector<cudf::io::text::byte_range_info> ranges{{0, kDataSize}};
+  auto [deviceBuffers, deviceSpans, loadFuture] =
+      facebook::velox::cudf_velox::connector::hive::fetchByteRangesAsync(
+          dataSource,
+          cudf::host_span<const cudf::io::text::byte_range_info>(
+              ranges.data(), ranges.size()),
+          stream,
+          rmm::mr::get_current_device_resource_ref());
+
+  folly::Baton<> releaseCopy;
+  bool hostReadAllowed = false;
+  bool copyReleased = false;
+  auto cleanupGuard = folly::makeGuard([&] {
+    if (!hostReadAllowed) {
+      dataSource->allowHostRead();
+    }
+    if (!copyReleased) {
+      releaseCopy.post();
+    }
+    stream.synchronize_no_throw();
+  });
+
+  EXPECT_TRUE(dataSource->waitForHostRead(std::chrono::seconds(5)));
+  CUDF_CUDA_TRY(
+      cudaLaunchHostFunc(stream.value(), waitForBaton, &releaseCopy));
+  dataSource->allowHostRead();
+  hostReadAllowed = true;
+
+  auto completion = std::async(
+      std::launch::async,
+      [loadFuture = std::move(loadFuture)]() mutable { loadFuture.get(); });
+  EXPECT_EQ(
+      completion.wait_for(std::chrono::milliseconds(500)),
+      std::future_status::timeout);
+
+  releaseCopy.post();
+  copyReleased = true;
+  EXPECT_NO_THROW(completion.get());
+
+  ASSERT_EQ(deviceBuffers.size(), 1);
+  ASSERT_EQ(deviceSpans.size(), 1);
+  std::string actual(expected.size(), '\0');
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+      actual.data(),
+      deviceSpans[0].data(),
+      actual.size(),
+      cudaMemcpyDeviceToHost,
+      stream.value()));
+  stream.synchronize();
+  EXPECT_EQ(actual, expected);
+}
+
+TEST_F(
+    TableScanTest,
+    genericDeviceFetchDrainsStartedReadAfterScheduleFailure) {
+  constexpr size_t kRangeSize = 4 << 10;
+  rmm::cuda_stream stream(rmm::cuda_stream::flags::non_blocking);
+  auto dataSource =
+      std::make_shared<GatedDeviceReadDataSource>(kRangeSize);
+  std::vector<cudf::io::text::byte_range_info> ranges{
+      {0, kRangeSize}, {2 * kRangeSize, kRangeSize}};
+
+  std::future<void> fetchAttempt;
+  auto cleanupGuard = folly::makeGuard([&] {
+    dataSource->releaseFirstRead();
+    if (fetchAttempt.valid()) {
+      fetchAttempt.wait();
+    }
+  });
+  fetchAttempt = std::async(std::launch::async, [&] {
+    (void)facebook::velox::cudf_velox::connector::hive::
+        fetchByteRangesAsync(
+            dataSource,
+            cudf::host_span<const cudf::io::text::byte_range_info>(
+                ranges.data(), ranges.size()),
+            stream,
+            rmm::mr::get_current_device_resource_ref());
+  });
+
+  ASSERT_TRUE(dataSource->waitForFirstRead(std::chrono::seconds(5)));
+  ASSERT_TRUE(dataSource->waitForSecondRead(std::chrono::seconds(5)));
+  EXPECT_EQ(
+      fetchAttempt.wait_for(std::chrono::milliseconds(500)),
+      std::future_status::timeout);
+
+  dataSource->releaseFirstRead();
+  EXPECT_THROW(fetchAttempt.get(), std::runtime_error);
+}
 
 TEST_F(TableScanTest, directBufferInputRawInputBytes) {
   constexpr int kSize = 10;

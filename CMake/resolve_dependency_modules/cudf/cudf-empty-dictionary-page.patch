@@ -1,0 +1,26 @@
+diff --git a/cpp/src/io/parquet/page_hdr.cu b/cpp/src/io/parquet/page_hdr.cu
+--- a/cpp/src/io/parquet/page_hdr.cu
++++ b/cpp/src/io/parquet/page_hdr.cu
+@@ -493,0 +494,13 @@
++/**
++ * @brief Parse and validate a page header from a byte stream
++ *
++ * @param bs Byte stream
++ * @return True if the page header is parsed and has a valid compressed size
++ */
++inline __device__ bool parse_valid_page_header(byte_stream_s* bs)
++{
++  return parse_page_header_fn{}(bs) and
++         (bs->page.compressed_page_size > 0 or
++          (bs->page.compressed_page_size == 0 and bs->page_type == PageType::DICTIONARY_PAGE));
++}
++
+@@ -601 +614 @@
+-      if (parse_page_header_fn{}(bs) and bs->page.compressed_page_size > 0) {
++      if (parse_valid_page_header(bs)) {
+@@ -702 +715 @@
+-      if (parse_page_header_fn{}(bs) and bs->page.compressed_page_size > 0) {
++      if (parse_valid_page_header(bs)) {
+@@ -792 +805 @@
+-    if (not parse_page_header_fn{}(&bs) or bs.page.compressed_page_size <= 0) {
++    if (not parse_valid_page_header(&bs)) {

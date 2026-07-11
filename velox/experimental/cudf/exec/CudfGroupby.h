@@ -35,6 +35,14 @@ struct GroupbyAggregator {
       std::vector<cudf::groupby::aggregation_request>& requests,
       rmm::cuda_stream_view stream) = 0;
 
+  // Releases columns materialized solely to back views in the most recently
+  // built request. This is normally handled when the next request replaces
+  // the state, but an unsupported streaming probe must release it before
+  // switching to levelled aggregation.
+  virtual size_t releaseRequestState() {
+    return 0;
+  }
+
   virtual std::unique_ptr<cudf::column> makeOutputColumn(
       std::vector<cudf::groupby::aggregation_result>& results,
       rmm::cuda_stream_view stream,

@@ -69,16 +69,28 @@ class BufferedInputDataSource : public cudf::io::datasource {
   // Pass a device buffer to copy to after load.
   void enqueueForDevice(uint64_t offset, uint64_t size, uint8_t* dst);
 
+  // Starts a new pending device-load batch and reserves all entries up front.
+  void prepareDeviceLoadBatch(size_t count);
+
+  // Drops destination-bearing state when batch construction fails.
+  void discardPendingDeviceLoads() noexcept;
+
   // loads and copies to device.
   void load(rmm::cuda_stream_view stream);
 
  private:
+  struct PendingDeviceLoad {
+    uint8_t* destination;
+    uint64_t size;
+    std::shared_ptr<facebook::velox::dwio::common::SeekableInputStream>
+        inputStream;
+  };
+
   void readContiguous(size_t offset, size_t size, uint8_t* dst);
 
   std::shared_ptr<facebook::velox::dwio::common::BufferedInput> input_;
   const size_t fileSize_;
-  std::vector<std::function<void(rmm::cuda_stream_view stream)>>
-      pendingDeviceLoads_;
+  std::vector<PendingDeviceLoad> pendingDeviceLoads_;
 };
 
 /**

@@ -182,17 +182,19 @@ std::optional<std::unique_ptr<cudf::table>> CudfSplitReader::readNextChunk(
             rowGroupIndices, readerOptions_);
 
     // Fetch column chunk byte ranges
-    nvtxRangePush("fetchByteRanges");
+    auto ioData = [&]() {
+      nvtx3::scoped_range fetchRange{"fetchByteRanges"};
 
-    // Tuple containing a vector of device buffers, a vector of device spans
-    // for each input byte range, and a future to wait for all reads to
-    // complete
-    auto ioData = fetchByteRangesAsync(
-        dataSource_, columnChunkByteRanges, stream_, get_temp_mr());
+      // Tuple containing device buffers, byte-range spans, and a future for
+      // all reads.
+      auto data = fetchByteRangesAsync(
+          dataSource_, columnChunkByteRanges, stream_, get_temp_mr());
 
-    // Wait for all pending reads to complete
-    std::get<2>(ioData).wait();
-    nvtxRangePop();
+      // get(), rather than wait(), propagates asynchronous datasource failures
+      // before cuDF attempts to parse or decompress incomplete input bytes.
+      std::get<2>(data).get();
+      return data;
+    }();
 
     // Save state for hybrid scan reader for future calls to `next()`
     hybridScanState_->columnChunkBuffers_ = std::move(std::get<0>(ioData));
