@@ -299,10 +299,10 @@ std::unique_ptr<cudf::table> UcxTestData::makeTable(
     rmm::cuda_stream_view stream) {
   std::vector<std::unique_ptr<cudf::column>> columns;
 
-  // Column 0: INT32 (integers)
+  // Column 0: INT32 (integers) - matches kTestColumnTypes INTEGER()
   columns.push_back(makeNumericColumn(*integers_, stream));
 
-  // Column 1: FLOAT32
+  // Column 1: FLOAT64 - matches kTestColumnTypes DOUBLE()
   columns.push_back(makeNumericColumn(*floats_, stream));
 
   // Column 2: STRING

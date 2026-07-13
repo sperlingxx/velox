@@ -103,19 +103,6 @@ UcxPartitionedOutput::UcxPartitionedOutput(
       pipelineId_(ctx->pipelineId),
       driverId_(ctx->driverId),
       targetRowsPerChunk_(targetRowsPerUcxChunk(ctx->queryConfig())) {
-  if (driverId_ == 0) {
-    const auto numDrivers = ctx->task->numOutputDrivers();
-    sharedQueueManager()->initializeTask(
-        ctx->task,
-        planNode->kind(),
-        static_cast<int>(numPartitions_),
-        numDrivers);
-    VLOG(2) << "UcxPartitionedOutput initialized queue task="
-            << ctx->task->taskId() << " destinations=" << numPartitions_
-            << " drivers=" << numDrivers
-            << " kind=" << core::PartitionedOutputNode::toName(planNode->kind())
-            << " targetRowsPerChunk=" << targetRowsPerChunk_;
-  }
   this->initPartitionKeys(planNode);
   auto sources = planNode->sources();
   std::vector<std::string> inNames, outNames;

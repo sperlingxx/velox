@@ -173,6 +173,7 @@ class UcxTestData : public BaseTableGenerator {
 
  protected:
   std::shared_ptr<std::vector<std::string>> strings_;
+  // Must match kTestColumnTypes: INTEGER() -> INT32, DOUBLE() -> FLOAT64.
   std::shared_ptr<std::vector<int32_t>> integers_;
   std::shared_ptr<std::vector<double>> floats_;
   size_t numRows_ = 0;
