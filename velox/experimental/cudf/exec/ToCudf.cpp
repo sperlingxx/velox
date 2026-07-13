@@ -557,23 +557,6 @@ void CudfConfig::initialize(
   if (config.find(kCudfTopNBatchSize) != config.end()) {
     topNBatchSize = folly::to<int32_t>(config[kCudfTopNBatchSize]);
   }
-  if (config.find(kCudfTopNCompactionConcurrency) != config.end()) {
-    const auto value =
-        folly::to<int64_t>(config[kCudfTopNCompactionConcurrency]);
-    VELOX_USER_CHECK_GE(
-        value,
-        0,
-        "{} must be between 0 and {}",
-        kCudfTopNCompactionConcurrency,
-        std::numeric_limits<int32_t>::max());
-    VELOX_USER_CHECK_LE(
-        value,
-        std::numeric_limits<int32_t>::max(),
-        "{} must be between 0 and {}",
-        kCudfTopNCompactionConcurrency,
-        std::numeric_limits<int32_t>::max());
-    topNCompactionConcurrency = static_cast<int32_t>(value);
-  }
   if (config.find(kUcxExchange) != config.end()) {
     exchange = folly::to<bool>(config[kUcxExchange]);
   }

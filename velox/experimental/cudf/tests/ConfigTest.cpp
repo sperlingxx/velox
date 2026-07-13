@@ -30,8 +30,7 @@ TEST(ConfigTest, CudfConfig) {
       {CudfConfig::kCudfMemoryPercent, "25"},
       {CudfConfig::kCudfFunctionNamePrefix, "presto"},
       {CudfConfig::kCudfAllowCpuFallback, "false"},
-      {CudfConfig::kCudfGroupbyStreamingMaxDistinctKeys, "16777216"},
-      {CudfConfig::kCudfTopNCompactionConcurrency, "7"}};
+      {CudfConfig::kCudfGroupbyStreamingMaxDistinctKeys, "16777216"}};
 
   CudfConfig config;
   config.initialize(std::move(options));
@@ -42,7 +41,6 @@ TEST(ConfigTest, CudfConfig) {
   ASSERT_EQ(config.functionNamePrefix, "presto");
   ASSERT_EQ(config.allowCpuFallback, false);
   ASSERT_EQ(config.groupbyStreamingMaxDistinctKeys, 16777216);
-  ASSERT_EQ(config.topNCompactionConcurrency, 7);
 }
 
 TEST(ConfigTest, GroupbyStreamingMaxDistinctKeysRange) {
@@ -66,29 +64,4 @@ TEST(ConfigTest, GroupbyStreamingMaxDistinctKeysRange) {
       {{CudfConfig::kCudfGroupbyStreamingMaxDistinctKeys, "2147483648"}}));
 }
 
-TEST(ConfigTest, TopNCompactionConcurrencyRange) {
-  CudfConfig defaultConfig;
-  ASSERT_EQ(defaultConfig.topNCompactionConcurrency, 2);
-
-  CudfConfig unlimitedConfig;
-  unlimitedConfig.initialize(
-      {{CudfConfig::kCudfTopNCompactionConcurrency, "0"}});
-  ASSERT_EQ(unlimitedConfig.topNCompactionConcurrency, 0);
-
-  CudfConfig maxConfig;
-  maxConfig.initialize({
-      {CudfConfig::kCudfTopNCompactionConcurrency,
-       std::to_string(std::numeric_limits<int32_t>::max())}});
-  ASSERT_EQ(
-      maxConfig.topNCompactionConcurrency,
-      std::numeric_limits<int32_t>::max());
-
-  CudfConfig negativeConfig;
-  EXPECT_ANY_THROW(negativeConfig.initialize(
-      {{CudfConfig::kCudfTopNCompactionConcurrency, "-1"}}));
-
-  CudfConfig overflowConfig;
-  EXPECT_ANY_THROW(overflowConfig.initialize(
-      {{CudfConfig::kCudfTopNCompactionConcurrency, "2147483648"}}));
-}
 } // namespace facebook::velox::cudf_velox::test
