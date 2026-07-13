@@ -353,7 +353,8 @@ TEST_F(UcxOutputQueueManagerTest, v1RepeatedFetchAdvancesQueue) {
 
   auto first = fetchV1Data(taskId, destination);
   ASSERT_NE(first.data, nullptr);
-  EXPECT_EQ(first.remainingBytes.size(), 1);
+  // Count-only flow leaves remainingBytes empty; advancement is via later fetches.
+  EXPECT_TRUE(first.remainingBytes.empty());
 
   auto second = fetchV1Data(taskId, destination);
   ASSERT_NE(second.data, nullptr);
@@ -382,7 +383,8 @@ TEST_F(UcxOutputQueueManagerTest, v2FetchesSequencesZeroAndOne) {
   auto first = fetchV2Data(taskId, destination, maxBytes, 0);
   ASSERT_NE(first.data, nullptr);
   EXPECT_EQ(first.sequence, 0);
-  EXPECT_EQ(first.remainingBytes.size(), 1);
+  // Count-only flow leaves remainingBytes empty; advancement is via sequence fetches.
+  EXPECT_TRUE(first.remainingBytes.empty());
 
   auto second = fetchV2Data(taskId, destination, maxBytes, 1);
   ASSERT_NE(second.data, nullptr);
@@ -419,7 +421,8 @@ TEST_F(UcxOutputQueueManagerTest, v2OversizeRequestReturnsOneChunk) {
   ASSERT_NE(first.data, nullptr);
   EXPECT_EQ(first.sequence, 0);
   EXPECT_EQ(first.data->gpu_data->size(), firstBytes);
-  EXPECT_EQ(first.remainingBytes.size(), 1);
+  // Count-only flow leaves remainingBytes empty; chunking is checked via size/sequence.
+  EXPECT_TRUE(first.remainingBytes.empty());
 
   auto second =
       fetchV2Data(taskId, destination, std::numeric_limits<uint64_t>::max(), 1);

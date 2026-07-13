@@ -281,21 +281,19 @@ std::unique_ptr<cudf::table> makeTable(
     const std::string& name = rowType->nameOf(i);
     const auto& type = rowType->childAt(i);
 
-    cudf::type_id cudfType;
     std::unique_ptr<cudf::column> col;
 
     switch (type->kind()) {
       case TypeKind::INTEGER: {
-        cudfType = cudf::type_id::INT32;
-        std::vector<uint32_t> values(numRows);
+        // Host vector element type must match Velox INTEGER -> cuDF INT32.
+        std::vector<int32_t> values(numRows);
         col = make_numeric_column_from_vector(values);
         break;
       }
       case TypeKind::DOUBLE: {
-        cudfType = cudf::type_id::FLOAT64;
-        std::vector<float> values(numRows);
+        // Host vector element type must match Velox DOUBLE -> cuDF FLOAT64.
+        std::vector<double> values(numRows);
         col = make_numeric_column_from_vector(values);
-
         break;
       }
       case TypeKind::VARCHAR: {

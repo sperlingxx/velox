@@ -263,8 +263,8 @@ void UcxTestData::initialize(
           << "]";
   numRows_ = numRows;
   strings_ = std::make_shared<std::vector<std::string>>();
-  integers_ = std::make_shared<std::vector<uint32_t>>();
-  floats_ = std::make_shared<std::vector<float>>();
+  integers_ = std::make_shared<std::vector<int32_t>>();
+  floats_ = std::make_shared<std::vector<double>>();
 
   std::random_device rd;
   std::mt19937 gen(rd());
@@ -293,10 +293,10 @@ std::unique_ptr<cudf::table> UcxTestData::makeTable(
     rmm::cuda_stream_view stream) {
   std::vector<std::unique_ptr<cudf::column>> columns;
 
-  // Column 0: INT32 (integers)
+  // Column 0: INT32 (integers) - matches kTestColumnTypes INTEGER()
   columns.push_back(makeNumericColumn(*integers_, stream));
 
-  // Column 1: FLOAT32
+  // Column 1: FLOAT64 - matches kTestColumnTypes DOUBLE()
   columns.push_back(makeNumericColumn(*floats_, stream));
 
   // Column 2: STRING
@@ -317,8 +317,8 @@ bool UcxTestData::verifyTable(
   }
 
   // Get the data from the received table
-  auto receivedInts = getColVector<uint32_t>(table.column(0), numRows, stream);
-  auto receivedDoubles = getColVector<float>(table.column(1), numRows, stream);
+  auto receivedInts = getColVector<int32_t>(table.column(0), numRows, stream);
+  auto receivedDoubles = getColVector<double>(table.column(1), numRows, stream);
   auto receivedStrings = getStringCol(table.column(2), numRows, stream);
 
   // Compare with expected data. Use modular indexing because batch

@@ -151,18 +151,18 @@ class UcxTestData : public BaseTableGenerator {
     return strings_;
   }
 
-  std::shared_ptr<std::vector<uint32_t>> getIntegers() {
+  std::shared_ptr<std::vector<int32_t>> getIntegers() {
     return integers_;
   }
 
-  std::shared_ptr<std::vector<float>> getFloats() {
+  std::shared_ptr<std::vector<double>> getFloats() {
     return floats_;
   }
 
   /// @brief Sets the data directly (used for creating partitioned test data).
   void setData(
-      std::shared_ptr<std::vector<uint32_t>> integers,
-      std::shared_ptr<std::vector<float>> floats,
+      std::shared_ptr<std::vector<int32_t>> integers,
+      std::shared_ptr<std::vector<double>> floats,
       std::shared_ptr<std::vector<std::string>> strings) {
     integers_ = std::move(integers);
     floats_ = std::move(floats);
@@ -172,8 +172,9 @@ class UcxTestData : public BaseTableGenerator {
 
  protected:
   std::shared_ptr<std::vector<std::string>> strings_;
-  std::shared_ptr<std::vector<uint32_t>> integers_;
-  std::shared_ptr<std::vector<float>> floats_;
+  // Must match kTestColumnTypes: INTEGER() -> INT32, DOUBLE() -> FLOAT64.
+  std::shared_ptr<std::vector<int32_t>> integers_;
+  std::shared_ptr<std::vector<double>> floats_;
   size_t numRows_ = 0;
 };
 
