@@ -683,8 +683,14 @@ class OrderByAdapter : public OperatorAdapter {
       const exec::Operator* /*op*/,
       const core::PlanNodePtr& planNode,
       exec::DriverCtx* /*ctx*/) const override {
-    return std::dynamic_pointer_cast<const core::OrderByNode>(planNode) !=
-        nullptr;
+    const auto orderByNode =
+        std::dynamic_pointer_cast<const core::OrderByNode>(planNode);
+    if (!CudfOrderBy::isSupported(orderByNode)) {
+      LOG_FALLBACK(
+          "OrderBy external spill schema or sorting key is not supported");
+      return false;
+    }
+    return true;
   }
 
   bool acceptsGpuInput() const override {
@@ -1345,11 +1351,22 @@ class MergeExchangeAdapter : public OperatorAdapter {
     const bool isUcx = mergeExchangeNode &&
         mergeExchangeNode->transportType() ==
             core::ExchangeNode::TransportType::kUcx;
+    const bool orderBySupported = mergeExchangeNode &&
+        CudfOrderBy::isSupported(
+            mergeExchangeNode->outputType(),
+            mergeExchangeNode->sortingKeys());
     LOG(WARNING) << "CudfMergeExchangeAdapter: canRunOnGPU node="
                  << (mergeExchangeNode ? mergeExchangeNode->id() : "<null>")
                  << " isUcx=" << isUcx
+                 << " orderBySupported=" << orderBySupported
                  << " exchangeEnabled=" << CudfConfig::getInstance().exchange;
-    return CudfConfig::getInstance().exchange && mergeExchangeNode && isUcx;
+    if (!orderBySupported) {
+      LOG_FALLBACK(
+          "MergeExchange OrderBy spill schema or sorting key is not "
+          "supported");
+    }
+    return CudfConfig::getInstance().exchange && mergeExchangeNode && isUcx &&
+        orderBySupported;
   }
 
   bool acceptsGpuInput() const override {
