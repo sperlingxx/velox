@@ -51,6 +51,10 @@ struct CudfConfig {
       "cudf.concat_optimization_enabled"};
   static constexpr const char* kCudfGroupbyStreamingMaxDistinctKeys{
       "cudf.groupby_streaming_max_distinct_keys"};
+  static constexpr const char* kCudfOrderBySortedRunBytes{
+      "cudf.order_by_sorted_run_bytes"};
+  static constexpr const char* kCudfOrderByMergeFanIn{
+      "cudf.order_by_merge_fan_in"};
   static constexpr const char* kCudfTimestampUnit{"cudf.timestamp_unit"};
   // The value could be either spark or presto.
   static constexpr const char* kCudfFunctionEngine{"cudf.function_engine"};
@@ -136,6 +140,13 @@ struct CudfConfig {
   /// the all-GPU levelled aggregation path and does not construct streaming
   /// state.
   int32_t groupbyStreamingMaxDistinctKeys{0};
+
+  /// Approximate bytes buffered before OrderBy spills an independently sorted
+  /// run.
+  uint64_t orderBySortedRunBytes{256ULL << 20};
+
+  /// Number of sorted runs compacted by one OrderBy merge group.
+  int32_t orderByMergeFanIn{8};
 
   /// Minimum rows to accumulate before GPU-side concatenation in
   /// `CudfBatchConcat` (default 100k).

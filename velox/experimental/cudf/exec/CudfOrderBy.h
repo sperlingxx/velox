@@ -100,7 +100,8 @@ class CudfOrderBy : public CudfOperatorBase {
       uint64_t sortedRunBytes,
       uint64_t mergeChunkBytes,
       uint64_t outputChunkBytes,
-      cudf::size_type maxOutputRows);
+      cudf::size_type maxOutputRows,
+      size_t mergeFanIn = 2);
   static void testingResetMemoryLimits();
   static uint64_t testingMaxActiveRuns();
   static uint64_t testingSourceChunks();
@@ -139,6 +140,8 @@ class CudfOrderBy : public CudfOperatorBase {
   std::vector<cudf::size_type> sortKeys_;
   std::vector<cudf::order> columnOrder_;
   std::vector<cudf::null_order> nullOrder_;
+  const uint64_t sortedRunBytes_;
+  const size_t mergeFanIn_;
   uint64_t bufferedBytes_{0};
   std::vector<SortedRun> sortedRuns_;
   std::string spillDirectory_;

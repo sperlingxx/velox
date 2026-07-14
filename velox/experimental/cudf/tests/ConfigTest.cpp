@@ -30,7 +30,9 @@ TEST(ConfigTest, CudfConfig) {
       {CudfConfig::kCudfMemoryPercent, "25"},
       {CudfConfig::kCudfFunctionNamePrefix, "presto"},
       {CudfConfig::kCudfAllowCpuFallback, "false"},
-      {CudfConfig::kCudfGroupbyStreamingMaxDistinctKeys, "16777216"}};
+      {CudfConfig::kCudfGroupbyStreamingMaxDistinctKeys, "16777216"},
+      {CudfConfig::kCudfOrderBySortedRunBytes, "67108864"},
+      {CudfConfig::kCudfOrderByMergeFanIn, "7"}};
 
   CudfConfig config;
   config.initialize(std::move(options));
@@ -41,6 +43,26 @@ TEST(ConfigTest, CudfConfig) {
   ASSERT_EQ(config.functionNamePrefix, "presto");
   ASSERT_EQ(config.allowCpuFallback, false);
   ASSERT_EQ(config.groupbyStreamingMaxDistinctKeys, 16777216);
+  ASSERT_EQ(config.orderBySortedRunBytes, 67108864);
+  ASSERT_EQ(config.orderByMergeFanIn, 7);
+}
+
+TEST(ConfigTest, OrderByBounds) {
+  CudfConfig defaultConfig;
+  EXPECT_EQ(defaultConfig.orderBySortedRunBytes, 256ULL << 20);
+  EXPECT_EQ(defaultConfig.orderByMergeFanIn, 8);
+
+  CudfConfig zeroRunBytes;
+  EXPECT_ANY_THROW(zeroRunBytes.initialize(
+      {{CudfConfig::kCudfOrderBySortedRunBytes, "0"}}));
+
+  CudfConfig lowFanIn;
+  EXPECT_ANY_THROW(lowFanIn.initialize(
+      {{CudfConfig::kCudfOrderByMergeFanIn, "1"}}));
+
+  CudfConfig highFanIn;
+  EXPECT_ANY_THROW(highFanIn.initialize(
+      {{CudfConfig::kCudfOrderByMergeFanIn, "65"}}));
 }
 
 TEST(ConfigTest, GroupbyStreamingMaxDistinctKeysRange) {

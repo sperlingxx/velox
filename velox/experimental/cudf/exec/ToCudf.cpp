@@ -532,6 +532,21 @@ void CudfConfig::initialize(
         std::numeric_limits<int32_t>::max());
     groupbyStreamingMaxDistinctKeys = static_cast<int32_t>(value);
   }
+  if (config.find(kCudfOrderBySortedRunBytes) != config.end()) {
+    const auto value =
+        folly::to<int64_t>(config[kCudfOrderBySortedRunBytes]);
+    VELOX_USER_CHECK_GT(
+        value, 0, "{} must be positive", kCudfOrderBySortedRunBytes);
+    orderBySortedRunBytes = static_cast<uint64_t>(value);
+  }
+  if (config.find(kCudfOrderByMergeFanIn) != config.end()) {
+    const auto value = folly::to<int32_t>(config[kCudfOrderByMergeFanIn]);
+    VELOX_USER_CHECK_GE(
+        value, 2, "{} must be between 2 and 64", kCudfOrderByMergeFanIn);
+    VELOX_USER_CHECK_LE(
+        value, 64, "{} must be between 2 and 64", kCudfOrderByMergeFanIn);
+    orderByMergeFanIn = value;
+  }
   if (config.find(kCudfFunctionNamePrefix) != config.end()) {
     functionNamePrefix = config[kCudfFunctionNamePrefix];
   }

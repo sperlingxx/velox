@@ -39,17 +39,16 @@
 namespace facebook::velox::cudf_velox {
 namespace {
 
-constexpr uint64_t kSortedRunBytes = 128ULL << 20;
 constexpr uint64_t kMergeChunkBytes = 32ULL << 20;
 constexpr uint64_t kMergePassBytes = 128ULL << 20;
 constexpr uint64_t kSpillRowGroupBytes = 64ULL << 20;
 constexpr uint64_t kOutputChunkBytes = 32ULL << 20;
-constexpr size_t kMergeFanIn = 2;
 constexpr size_t kFinalMergeRuns = 2;
 constexpr cudf::size_type kMaxOutputRows = 262144;
 
 std::atomic<uint64_t> orderBySpillDirectorySequence{0};
-std::atomic<uint64_t> sortedRunBytes{kSortedRunBytes};
+std::atomic<uint64_t> testingSortedRunBytes{0};
+std::atomic<size_t> testingMergeFanIn{0};
 std::atomic<uint64_t> mergeChunkBytes{kMergeChunkBytes};
 std::atomic<uint64_t> outputChunkBytes{kOutputChunkBytes};
 std::atomic<cudf::size_type> maxOutputRows{kMaxOutputRows};
@@ -197,12 +196,15 @@ void CudfOrderBy::testingSetMemoryLimits(
     uint64_t runBytes,
     uint64_t chunkBytes,
     uint64_t outputBytes,
-    cudf::size_type outputRows) {
+    cudf::size_type outputRows,
+    size_t fanIn) {
   VELOX_CHECK_GT(runBytes, 0);
   VELOX_CHECK_GT(chunkBytes, 0);
   VELOX_CHECK_GT(outputBytes, 0);
   VELOX_CHECK_GT(outputRows, 0);
-  sortedRunBytes.store(runBytes);
+  VELOX_CHECK_GE(fanIn, 2);
+  testingSortedRunBytes.store(runBytes);
+  testingMergeFanIn.store(fanIn);
   mergeChunkBytes.store(chunkBytes);
   outputChunkBytes.store(outputBytes);
   maxOutputRows.store(outputRows);
@@ -210,7 +212,8 @@ void CudfOrderBy::testingSetMemoryLimits(
 }
 
 void CudfOrderBy::testingResetMemoryLimits() {
-  sortedRunBytes.store(kSortedRunBytes);
+  testingSortedRunBytes.store(0);
+  testingMergeFanIn.store(0);
   mergeChunkBytes.store(kMergeChunkBytes);
   outputChunkBytes.store(kOutputChunkBytes);
   maxOutputRows.store(kMaxOutputRows);
@@ -252,7 +255,16 @@ CudfOrderBy::CudfOrderBy(
           std::nullopt,
           orderByNode),
       orderByNode_(orderByNode),
-      stateStream_(cudfGlobalStreamPool().get_stream()) {
+      stateStream_(cudfGlobalStreamPool().get_stream()),
+      sortedRunBytes_(
+          testingSortedRunBytes.load() > 0
+              ? testingSortedRunBytes.load()
+              : CudfConfig::getInstance().orderBySortedRunBytes),
+      mergeFanIn_(
+          testingMergeFanIn.load() > 0
+              ? testingMergeFanIn.load()
+              : static_cast<size_t>(
+                    CudfConfig::getInstance().orderByMergeFanIn)) {
   VELOX_CHECK(
       isSupported(orderByNode),
       "CudfOrderBy received an unsupported external-spill schema or sorting "
@@ -300,7 +312,7 @@ void CudfOrderBy::doAddInput(RowVectorPtr input) {
 
     bufferedBytes_ += cudfInput->estimateFlatSize();
     inputs_.push_back(std::move(cudfInput));
-    if (bufferedBytes_ >= sortedRunBytes.load()) {
+    if (bufferedBytes_ >= sortedRunBytes_) {
       spillSortedRun();
     }
   } catch (...) {
@@ -396,11 +408,14 @@ void CudfOrderBy::spillSortedRun() {
 
   logDeviceMemorySnapshot(fmt::format(
       "operator=CudfOrderBy node={} state=sortRun.concatenate.begin "
-      "bufferedBytes={} bufferedInputs={} existingRuns={}",
+      "bufferedBytes={} bufferedInputs={} existingRuns={} "
+      "sortedRunBytes={} mergeFanIn={}",
       orderByNode_->id(),
       bufferedBytes_,
       inputs_.size(),
-      sortedRuns_.size()));
+      sortedRuns_.size(),
+      sortedRunBytes_,
+      mergeFanIn_));
   auto input = getConcatenatedTable(
       std::exchange(inputs_, {}), outputType_, stateStream_, get_output_mr());
   bufferedBytes_ = 0;
@@ -536,8 +551,8 @@ std::unique_ptr<cudf::table> CudfOrderBy::mergeNextPausedBatch(
   updateAtomicMax(observedMaxActiveRuns, activeRuns.size());
   VELOX_CHECK_LE(
       activeRuns.size(),
-      kMergeFanIn,
-      "CudfOrderBy opened more readers than its fixed merge fan-in");
+      mergeFanIn_,
+      "CudfOrderBy opened more readers than its configured merge fan-in");
 
   if (activeRuns.empty()) {
     finished = true;
@@ -621,12 +636,12 @@ void CudfOrderBy::compactSortedRunsForMerge() {
   while (sortedRuns_.size() > kFinalMergeRuns) {
     const auto inputRunCount = sortedRuns_.size();
     std::vector<SortedRun> nextLevel;
-    nextLevel.reserve((sortedRuns_.size() + kMergeFanIn - 1) / kMergeFanIn);
+    nextLevel.reserve((sortedRuns_.size() + mergeFanIn_ - 1) / mergeFanIn_);
     std::vector<std::string> obsoletePaths;
     MergeStats levelStats;
 
-    for (size_t begin = 0; begin < sortedRuns_.size(); begin += kMergeFanIn) {
-      const auto end = std::min(sortedRuns_.size(), begin + kMergeFanIn);
+    for (size_t begin = 0; begin < sortedRuns_.size(); begin += mergeFanIn_) {
+      const auto end = std::min(sortedRuns_.size(), begin + mergeFanIn_);
       if (end - begin == 1) {
         nextLevel.push_back(std::move(sortedRuns_[begin]));
         continue;
