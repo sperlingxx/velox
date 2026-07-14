@@ -22,8 +22,10 @@
 
 #include <cudf/io/parquet.hpp>
 #include <cudf/types.hpp>
+#include <rmm/cuda_stream_view.hpp>
 
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace facebook::velox::cudf_velox {
@@ -47,7 +49,7 @@ class CudfWindow : public CudfOperatorBase {
       const std::shared_ptr<const core::WindowNode>& windowNode);
 
   bool needsInput() const override {
-    return !noMoreInput_;
+    return !noMoreInput_ && pendingOutput_ == nullptr;
   }
 
   exec::BlockingReason isBlocked(ContinueFuture* /*future*/) override {
@@ -55,7 +57,7 @@ class CudfWindow : public CudfOperatorBase {
   }
 
   bool isFinished() override {
-    return finished_;
+    return finished_ && pendingOutput_ == nullptr;
   }
 
  protected:
@@ -102,7 +104,28 @@ class CudfWindow : public CudfOperatorBase {
       std::unique_ptr<cudf::table> input,
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr,
-      bool inputAlreadySorted = false) const;
+      bool inputAlreadySorted = false);
+
+  std::unique_ptr<cudf::column> fixRankLikeColumn(
+      std::unique_ptr<cudf::column> localResult,
+      std::string_view functionName,
+      cudf::table_view sortedInput,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const;
+
+  void updateRankLikeState(
+      cudf::table_view sortedInput,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr);
+
+  cudf::size_type continuingPrefixSize(
+      cudf::table_view sortedInput,
+      const std::vector<cudf::size_type>& channels,
+      const std::unique_ptr<cudf::table>& previousKey,
+      const std::vector<cudf::order>& orders,
+      const std::vector<cudf::null_order>& nullOrders,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const;
 
   void spillSortedRun();
   void initializeSortedRunReaders();
@@ -125,7 +148,12 @@ class CudfWindow : public CudfOperatorBase {
 
   const std::shared_ptr<const core::WindowNode> windowNode_;
   const RowTypePtr inputType_;
+  // Only partitioned rank-like windows whose child guarantees ordering use
+  // the bounded cross-batch fixer. Other Window shapes retain legacy behavior.
+  const bool rankLikeStreaming_;
+  const rmm::cuda_stream_view stateStream_;
   std::vector<CudfVectorPtr> inputs_;
+  CudfVectorPtr pendingOutput_;
   uint64_t bufferedBytes_{0};
   uint64_t nextDiagnosticBufferedBytes_{512ULL << 20};
   std::vector<SortedRun> sortedRuns_;
@@ -142,6 +170,14 @@ class CudfWindow : public CudfOperatorBase {
   std::vector<cudf::size_type> sortKeyChannels_;
   std::vector<cudf::order> sortOrders_;
   std::vector<cudf::null_order> sortNullOrders_;
+
+  // Minimal running-window state. No rows from the trailing partition are
+  // retained between batches.
+  bool hasRankLikeState_{false};
+  std::unique_ptr<cudf::table> previousPartitionKey_;
+  std::unique_ptr<cudf::table> previousOrderKey_;
+  int64_t previousPartitionRows_{0};
+  int64_t previousRank_{0};
 };
 
 } // namespace facebook::velox::cudf_velox
