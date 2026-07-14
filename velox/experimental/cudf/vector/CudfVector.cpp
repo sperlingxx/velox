@@ -15,7 +15,7 @@
  */
 
 #include "velox/experimental/cudf/CudfNoDefaults.h"
-#include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
+#include "velox/experimental/cudf/CudfTypeUtils.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
 #include "velox/buffer/Buffer.h"

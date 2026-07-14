@@ -14,4 +14,11 @@
 
 add_library(velox_cudf_vector CudfVector.cpp)
 
-target_link_libraries(velox_cudf_vector cudf::cudf velox_common_base velox_exception velox_vector)
+target_link_libraries(
+  velox_cudf_vector
+  cudf::cudf
+  velox_common_base
+  velox_cudf_common
+  velox_exception
+  velox_vector
+)

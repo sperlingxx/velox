@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+add_library(velox_cudf_common CudfConfig.cpp CudfTypeUtils.cpp)
+
+target_link_libraries(
+  velox_cudf_common
+  PUBLIC cudf::cudf velox_type
+  PRIVATE Folly::folly velox_exception
+)
+
 add_subdirectory(connectors)
 add_subdirectory(exec)
 add_subdirectory(expression)

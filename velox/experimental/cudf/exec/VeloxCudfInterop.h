@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "velox/experimental/cudf/CudfTypeUtils.h"
+
 #include "velox/common/memory/Memory.h"
 #include "velox/vector/ComplexVector.h"
 
@@ -25,8 +27,6 @@
 #include <rmm/cuda_stream_view.hpp>
 
 namespace facebook::velox::cudf_velox {
-
-cudf::data_type veloxToCudfDataType(const TypePtr& type);
 
 namespace with_arrow {
 
