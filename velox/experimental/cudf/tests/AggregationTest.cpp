@@ -16,17 +16,46 @@
 
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/AggregationRegistry.h"
+#include "velox/experimental/cudf/exec/CudfGroupby.h"
+#include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/PrestoAggregateFunctions.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
+#include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
+#include "velox/experimental/cudf/tests/utils/CudfStreamTestUtils.h"
+#include "velox/experimental/cudf/vector/CudfVector.h"
 
 #include "velox/dwio/common/tests/utils/BatchMaker.h"
+#include "velox/exec/Driver.h"
 #include "velox/exec/PlanNodeStats.h"
+#include "velox/exec/Task.h"
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
 #include "velox/exec/tests/utils/OperatorTestBase.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
 #include "velox/type/Timestamp.h"
 
+#include <cudf/contiguous_split.hpp>
+
+#include <rmm/cuda_stream.hpp>
+#include <rmm/resource_ref.hpp>
+
 #include <cmath>
+
+namespace facebook::velox::cudf_velox::test {
+
+class CudfGroupbyTestHelper {
+ public:
+  static rmm::cuda_stream_view stateStream(const CudfGroupby& groupby) {
+    return groupby.stateStream_;
+  }
+
+  static void prepareInputForStateStream(
+      CudfGroupby& groupby,
+      const CudfVectorPtr& input) {
+    groupby.prepareInputForStateStream(input);
+  }
+};
+
+} // namespace facebook::velox::cudf_velox::test
 
 namespace facebook::velox::exec::test {
 
@@ -1020,12 +1049,78 @@ class FinalAggregationStreamingTest : public AggregationTest {
     EXPECT_EQ(finalStats.count("cudfFinalAggregationInputRuns"), 0);
   }
 
-  // All three tests have at most 1,000 input rows. Keep the capacity small so
-  // they exercise persistent streaming state without changing the singleton
-  // for any other test. The member destructor restores the prior value even
-  // when a fatal assertion or exception exits a test early.
+  // These tests have at most 1,000 input rows. Keep the capacity small so they
+  // exercise persistent streaming state without changing the singleton for
+  // any other test. The member destructor restores the prior value even when
+  // a fatal assertion or exception exits a test early.
   ScopedStreamingCapacity streamingCapacity_{4096};
 };
+
+TEST_F(
+    FinalAggregationStreamingTest,
+    finalAggregationRebindsPackedInputWithMatchingLogicalStream) {
+  auto rawInput = makeRowVector(
+      {makeFlatVector<int64_t>({1, 2}),
+       makeFlatVector<int64_t>({10, 20})});
+  auto plan = PlanBuilder()
+                  .values({rawInput})
+                  .partialAggregation({"c0"}, {"count(c1)"})
+                  .finalAggregation()
+                  .planNode();
+  auto finalNode =
+      std::dynamic_pointer_cast<const core::AggregationNode>(plan);
+  ASSERT_NE(finalNode, nullptr);
+
+  auto task = Task::create(
+      "final-aggregation-packed-input-stream",
+      core::PlanFragment{plan},
+      0,
+      core::QueryCtx::create(executor_.get()),
+      Task::ExecutionMode::kParallel);
+  DriverCtx driverCtx(task, 0, 0, 0, 0);
+  cudf_velox::CudfGroupby groupby(1, &driverCtx, finalNode);
+  const auto stateStream =
+      cudf_velox::test::CudfGroupbyTestHelper::stateStream(groupby);
+
+  rmm::cuda_stream allocationStream{rmm::cuda_stream::flags::non_blocking};
+  ASSERT_NE(allocationStream.value(), stateStream.value());
+  const auto inputType = finalNode->sources()[0]->outputType();
+  auto intermediateInput = makeRowVector(
+      inputType->names(),
+      {makeFlatVector<int64_t>({1, 2}),
+       makeFlatVector<int64_t>({3, 4})});
+  auto table = cudf_velox::with_arrow::toCudfTable(
+      intermediateInput,
+      pool(),
+      allocationStream.view(),
+      cudf_velox::get_output_mr());
+
+  cudf_velox::test::RecordingAsyncDeviceResource recordingResource{
+      /*deferDeallocations=*/true};
+  auto packedColumns = cudf::pack(
+      table->view(),
+      allocationStream.view(),
+      rmm::to_device_async_resource_ref_checked(&recordingResource));
+  allocationStream.synchronize();
+  auto packedView = cudf::unpack(packedColumns);
+  auto packedTable = std::make_unique<cudf::packed_table>(
+      cudf::packed_table{packedView, std::move(packedColumns)});
+  auto packedInput = std::make_shared<cudf_velox::CudfVector>(
+      pool(),
+      inputType,
+      packedTable->table.num_rows(),
+      std::move(packedTable),
+      stateStream);
+  recordingResource.reset();
+
+  cudf_velox::test::CudfGroupbyTestHelper::prepareInputForStateStream(
+      groupby, packedInput);
+  packedInput.reset();
+  stateStream.synchronize();
+  EXPECT_GT(recordingResource.deallocationCount(), 0);
+  EXPECT_EQ(recordingResource.lastDeallocationStream(), stateStream.value());
+  recordingResource.releaseDeferred();
+}
 
 TEST_F(FinalAggregationStreamingTest, finalAggregationStreamsOnAddInput) {
   auto vectors = {

@@ -24,6 +24,10 @@
 
 namespace facebook::velox::cudf_velox {
 
+namespace test {
+class CudfGroupbyTestHelper;
+}
+
 struct GroupbyAggregator {
   core::AggregationNode::Step step;
   uint32_t inputIndex;
@@ -131,6 +135,8 @@ class CudfGroupby : public CudfOperatorBase {
 
   CudfVectorPtr releaseAndResetBufferedResult();
 
+  void prepareInputForStateStream(const CudfVectorPtr& input);
+
   void computePartialGroupbyStreaming(CudfVectorPtr tbl);
   void computeFinalGroupbyStreaming(CudfVectorPtr tbl);
   void computeSingleGroupbyStreaming(CudfVectorPtr tbl);
@@ -195,6 +201,8 @@ class CudfGroupby : public CudfOperatorBase {
   std::vector<std::optional<FinalAggregationRun>> finalRunLevels_;
   uint64_t finalInputRunCount_{0};
   uint64_t finalRunMergeCount_{0};
+
+  friend class test::CudfGroupbyTestHelper;
 };
 
 } // namespace facebook::velox::cudf_velox

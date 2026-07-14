@@ -1621,6 +1621,20 @@ void CudfGroupby::computeSingleGroupbyStreaming(CudfVectorPtr tbl) {
   }
 }
 
+void CudfGroupby::prepareInputForStateStream(const CudfVectorPtr& input) {
+  const auto inputStream = input->stream();
+  if (inputStream.value() != stateStream_.value()) {
+    cudf::detail::join_streams(
+        std::vector<rmm::cuda_stream_view>{inputStream}, stateStream_);
+  }
+  // Rebind before taking a view: rebindStream may rebuild an owned table, and
+  // a packed buffer can retain a different deallocation stream even when the
+  // vector's logical stream already equals stateStream_.
+  VELOX_CHECK(
+      input->rebindStream(stateStream_),
+      "CudfGroupby cannot rebind its input to the state stream");
+}
+
 void CudfGroupby::doAddInput(RowVectorPtr input) {
   if (input->size() == 0) {
     return;
@@ -1631,15 +1645,8 @@ void CudfGroupby::doAddInput(RowVectorPtr input) {
   VELOX_CHECK_NOT_NULL(cudfInput);
   input.reset();
 
-  const auto inputStream = cudfInput->stream();
-  if (inputStream.value() != stateStream_.value()) {
-    cudf::detail::join_streams(
-        std::vector<rmm::cuda_stream_view>{inputStream}, stateStream_);
-    // Rebind before taking a view: rebindStream may rebuild the owned table.
-    // Destruction is then queued after all state-stream work using this input.
-    VELOX_CHECK(
-        cudfInput->rebindStream(stateStream_),
-        "CudfGroupby cannot rebind its input to the state stream");
+  if (!isPartialOutput_ && !isSingleStep_) {
+    prepareInputForStateStream(cudfInput);
   }
 
   if (streamingEnabled_) {
