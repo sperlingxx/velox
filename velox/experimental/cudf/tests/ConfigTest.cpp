@@ -18,6 +18,8 @@
 
 #include <gtest/gtest.h>
 
+#include <limits>
+
 namespace facebook::velox::cudf_velox::test {
 
 TEST(ConfigTest, CudfConfig) {
@@ -27,7 +29,8 @@ TEST(ConfigTest, CudfConfig) {
       {CudfConfig::kCudfMemoryResource, "arena"},
       {CudfConfig::kCudfMemoryPercent, "25"},
       {CudfConfig::kCudfFunctionNamePrefix, "presto"},
-      {CudfConfig::kCudfAllowCpuFallback, "false"}};
+      {CudfConfig::kCudfAllowCpuFallback, "false"},
+      {CudfConfig::kCudfGroupbyStreamingMaxDistinctKeys, "16777216"}};
 
   CudfConfig config;
   config.initialize(std::move(options));
@@ -37,5 +40,28 @@ TEST(ConfigTest, CudfConfig) {
   ASSERT_EQ(config.memoryPercent, 25);
   ASSERT_EQ(config.functionNamePrefix, "presto");
   ASSERT_EQ(config.allowCpuFallback, false);
+  ASSERT_EQ(config.groupbyStreamingMaxDistinctKeys, 16777216);
 }
+
+TEST(ConfigTest, GroupbyStreamingMaxDistinctKeysRange) {
+  CudfConfig defaultConfig;
+  ASSERT_EQ(defaultConfig.groupbyStreamingMaxDistinctKeys, 0);
+
+  CudfConfig maxConfig;
+  maxConfig.initialize({
+      {CudfConfig::kCudfGroupbyStreamingMaxDistinctKeys,
+       std::to_string(std::numeric_limits<int32_t>::max())}});
+  ASSERT_EQ(
+      maxConfig.groupbyStreamingMaxDistinctKeys,
+      std::numeric_limits<int32_t>::max());
+
+  CudfConfig negativeConfig;
+  EXPECT_ANY_THROW(negativeConfig.initialize(
+      {{CudfConfig::kCudfGroupbyStreamingMaxDistinctKeys, "-1"}}));
+
+  CudfConfig overflowConfig;
+  EXPECT_ANY_THROW(overflowConfig.initialize(
+      {{CudfConfig::kCudfGroupbyStreamingMaxDistinctKeys, "2147483648"}}));
+}
+
 } // namespace facebook::velox::cudf_velox::test

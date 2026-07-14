@@ -49,6 +49,8 @@ struct CudfConfig {
       "cudf.batch_size_max_threshold"};
   static constexpr const char* kCudfConcatOptimizationEnabled{
       "cudf.concat_optimization_enabled"};
+  static constexpr const char* kCudfGroupbyStreamingMaxDistinctKeys{
+      "cudf.groupby_streaming_max_distinct_keys"};
   static constexpr const char* kCudfTimestampUnit{"cudf.timestamp_unit"};
   // The value could be either spark or presto.
   static constexpr const char* kCudfFunctionEngine{"cudf.function_engine"};
@@ -129,6 +131,11 @@ struct CudfConfig {
   /// This batch size is determined by batchSizeMinThreshold and
   /// batchSizeMaxThreshold
   bool concatOptimizationEnabled{false};
+
+  /// Maximum distinct keys retained by FINAL streaming groupby. Zero keeps
+  /// the all-GPU levelled aggregation path and does not construct streaming
+  /// state.
+  int32_t groupbyStreamingMaxDistinctKeys{0};
 
   /// Minimum rows to accumulate before GPU-side concatenation in
   /// `CudfBatchConcat` (default 100k).

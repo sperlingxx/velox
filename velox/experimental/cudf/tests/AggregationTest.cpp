@@ -990,7 +990,44 @@ TEST_F(AggregationTest, partialAggregationMemoryLimit) {
           .customStats.count("flushRowCount"));
 }
 
-TEST_F(AggregationTest, finalAggregationStreamsOnAddInput) {
+class FinalAggregationStreamingTest : public AggregationTest {
+ protected:
+  class ScopedStreamingCapacity {
+   public:
+    explicit ScopedStreamingCapacity(int32_t capacity)
+        : previousCapacity_(
+              cudf_velox::CudfConfig::getInstance()
+                  .groupbyStreamingMaxDistinctKeys) {
+      cudf_velox::CudfConfig::getInstance()
+          .groupbyStreamingMaxDistinctKeys = capacity;
+    }
+
+    ~ScopedStreamingCapacity() {
+      cudf_velox::CudfConfig::getInstance()
+          .groupbyStreamingMaxDistinctKeys = previousCapacity_;
+    }
+
+   private:
+    const int32_t previousCapacity_;
+  };
+
+  template <typename Stats>
+  void assertStreamingFinalStats(const Stats& finalStats) {
+    EXPECT_GT(finalStats.at("cudfFinalStreamingBatches").sum, 1);
+    EXPECT_GT(finalStats.at("cudfFinalStreamingInputRows").sum, 0);
+    EXPECT_GT(finalStats.at("cudfFinalStreamingDistinctKeys").sum, 0);
+    EXPECT_GT(finalStats.at("cudfFinalStreamingOutputRows").sum, 0);
+    EXPECT_EQ(finalStats.count("cudfFinalAggregationInputRuns"), 0);
+  }
+
+  // All three tests have at most 1,000 input rows. Keep the capacity small so
+  // they exercise persistent streaming state without changing the singleton
+  // for any other test. The member destructor restores the prior value even
+  // when a fatal assertion or exception exits a test early.
+  ScopedStreamingCapacity streamingCapacity_{4096};
+};
+
+TEST_F(FinalAggregationStreamingTest, finalAggregationStreamsOnAddInput) {
   auto vectors = {
       makeRowVector({makeFlatVector<int32_t>(
           100, [](auto row) { return row; }, nullEvery(5))}),
@@ -1022,9 +1059,10 @@ TEST_F(AggregationTest, finalAggregationStreamsOnAddInput) {
   const auto planStats = toPlanStats(task->taskStats());
   EXPECT_GT(planStats.at(partialAggId).customStats.at("flushRowCount").sum, 0);
   EXPECT_GT(planStats.at(finalAggId).outputRows, 0);
+  assertStreamingFinalStats(planStats.at(finalAggId).customStats);
 }
 
-TEST_F(AggregationTest, finalAggregationStreamingMixedAggs) {
+TEST_F(FinalAggregationStreamingTest, finalAggregationStreamingMixedAggs) {
   auto vectors = makeVectors(rowType_, 10, 100);
   createDuckDbTable(vectors);
 
@@ -1046,9 +1084,10 @@ TEST_F(AggregationTest, finalAggregationStreamingMixedAggs) {
 
   const auto planStats = toPlanStats(task->taskStats());
   EXPECT_GT(planStats.at(finalAggId).outputRows, 0);
+  assertStreamingFinalStats(planStats.at(finalAggId).customStats);
 }
 
-TEST_F(AggregationTest, finalAggregationStreamingMultiKey) {
+TEST_F(FinalAggregationStreamingTest, finalAggregationStreamingMultiKey) {
   auto vectors = makeVectors(rowType_, 10, 100);
   createDuckDbTable(vectors);
 
@@ -1070,6 +1109,7 @@ TEST_F(AggregationTest, finalAggregationStreamingMultiKey) {
 
   const auto planStats = toPlanStats(task->taskStats());
   EXPECT_GT(planStats.at(finalAggId).outputRows, 0);
+  assertStreamingFinalStats(planStats.at(finalAggId).customStats);
 }
 
 class EmptyInputAggregationTest : public AggregationTest {

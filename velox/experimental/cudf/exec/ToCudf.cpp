@@ -43,6 +43,8 @@
 #include "velox/exec/PartitionedOutput.h"
 #include "velox/exec/Values.h"
 
+#include <limits>
+
 #include <cudf/detail/nvtx/ranges.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
@@ -512,6 +514,23 @@ void CudfConfig::initialize(
   if (config.find(kCudfConcatOptimizationEnabled) != config.end()) {
     concatOptimizationEnabled =
         folly::to<bool>(config[kCudfConcatOptimizationEnabled]);
+  }
+  if (config.find(kCudfGroupbyStreamingMaxDistinctKeys) != config.end()) {
+    const auto value =
+        folly::to<int64_t>(config[kCudfGroupbyStreamingMaxDistinctKeys]);
+    VELOX_USER_CHECK_GE(
+        value,
+        0,
+        "{} must be between 0 and {}",
+        kCudfGroupbyStreamingMaxDistinctKeys,
+        std::numeric_limits<int32_t>::max());
+    VELOX_USER_CHECK_LE(
+        value,
+        std::numeric_limits<int32_t>::max(),
+        "{} must be between 0 and {}",
+        kCudfGroupbyStreamingMaxDistinctKeys,
+        std::numeric_limits<int32_t>::max());
+    groupbyStreamingMaxDistinctKeys = static_cast<int32_t>(value);
   }
   if (config.find(kCudfFunctionNamePrefix) != config.end()) {
     functionNamePrefix = config[kCudfFunctionNamePrefix];
