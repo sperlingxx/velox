@@ -33,8 +33,6 @@
 #include <rmm/cuda_stream_pool.hpp>
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
-#include <rmm/mr/cuda_memory_resource.hpp>
-#include <rmm/mr/pool_memory_resource.hpp>
 
 namespace facebook::velox::ucx_exchange {
 
@@ -122,9 +120,9 @@ class UcxExchangeSource
   // consumption. Without a byte bound these buffers (one UcxExchangeSource per
   // producer peer) scale O(#peers) and collectively exhaust the GPU at 4 peers
   // (OOM at concurrentGpuTasks=2, deadlock at =1). Remote receives use a
-  // dedicated fresh cudaMalloc resource so UCX writes cannot race with
-  // stream-ordered reuse in the cuDF compute pool. Read once; env-overridable
-  // via
+  // receive-only resource matching the configured cuDF resource type, then
+  // fence before exposing a stream-ordered allocation to UCX. Read once;
+  // env-overridable via
   // GLUTEN_UCX_MAX_INFLIGHT_RECV_BYTES (default 8 GiB).
   static int64_t maxInFlightRecvBytes();
 
