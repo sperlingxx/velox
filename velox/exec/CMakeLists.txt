@@ -243,6 +243,10 @@ velox_link_libraries(
   velox_vector
 )
 
+if(VELOX_ENABLE_CUDF)
+  velox_link_libraries(velox_exec cudf::cudf)
+endif()
+
 if(VELOX_ENABLE_GEO)
   velox_compile_definitions(velox_exec PRIVATE VELOX_ENABLE_GEO)
   velox_link_libraries(velox_exec velox_common_geospatial_serde)
