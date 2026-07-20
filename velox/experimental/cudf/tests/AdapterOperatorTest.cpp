@@ -252,6 +252,42 @@ TEST_F(AdapterOperatorTest, streamingRankProducesOutputBeforeNoMoreInput) {
   values.close();
 }
 
+TEST_F(AdapterOperatorTest, streamingRankClosesWithPendingOutput) {
+  auto data = makeRowVector(
+      {"k", "o"},
+      {makeFlatVector<int64_t>({1, 1}), makeFlatVector<int64_t>({0, 1})});
+  auto plan =
+      PlanBuilder()
+          .values({data})
+          .streamingWindow({"rank() over (partition by k order by o) as rnk"})
+          .planNode();
+  auto windowNode = std::dynamic_pointer_cast<const core::WindowNode>(plan);
+  ASSERT_NE(windowNode, nullptr);
+  auto valuesNode = std::dynamic_pointer_cast<const core::ValuesNode>(
+      windowNode->sources()[0]);
+  ASSERT_NE(valuesNode, nullptr);
+
+  auto task = Task::create(
+      "streaming-rank-closes-with-pending-output",
+      core::PlanFragment{plan},
+      0,
+      core::QueryCtx::create(driverExecutor_.get()),
+      Task::ExecutionMode::kParallel);
+  auto driver = Driver::testingCreate(
+      std::make_unique<DriverCtx>(task, 0, 0, kUngroupedGroupId, 0));
+  cudf_velox::CudfValues values(0, driver->driverCtx(), valuesNode);
+  cudf_velox::CudfWindow window(1, driver->driverCtx(), windowNode);
+  values.initialize();
+  window.initialize();
+
+  auto input = values.getOutput();
+  ASSERT_NE(input, nullptr);
+  window.addInput(std::move(input));
+  EXPECT_FALSE(window.needsInput());
+  EXPECT_NO_THROW(window.close());
+  values.close();
+}
+
 TEST_F(AdapterOperatorTest, streamingRankThreeBatchDescendingNullTie) {
   std::vector<RowVectorPtr> data{
       makeRowVector(

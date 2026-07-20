@@ -152,10 +152,9 @@ class CudfHashJoinProbe : public CudfOperatorBase {
   /// Supported types:
   /// - Inner, Left, Right, Full joins
   /// - Left/Right Semi Filter joins
-  /// - Left Semi Project join (excluding null-aware join with filter)
+  /// - Left/Right Semi Project joins (null-aware right semi project with a
+  ///   filter is rejected by HashJoinNode validation)
   /// - Anti join (non-null-aware, or null-aware without filter)
-  /// Note: Right Semi Project, and null-aware left semi-project join with
-  /// filter not yet supported.
   static bool isSupportedJoinType(core::JoinType joinType) {
     return joinType == core::JoinType::kInner ||
         joinType == core::JoinType::kLeft ||
@@ -164,6 +163,7 @@ class CudfHashJoinProbe : public CudfOperatorBase {
         joinType == core::JoinType::kLeftSemiProject ||
         joinType == core::JoinType::kRight ||
         joinType == core::JoinType::kRightSemiFilter ||
+        joinType == core::JoinType::kRightSemiProject ||
         joinType == core::JoinType::kFull;
   }
 
@@ -226,6 +226,12 @@ class CudfHashJoinProbe : public CudfOperatorBase {
   /// nullability.
   bool buildSideHasNullKeys_{false};
 
+  /// Whether this probe driver has seen any non-empty probe input and whether
+  /// any such input has a null join key. These are reduced across drivers at
+  /// the end-of-probe barrier for null-aware RIGHT SEMI PROJECT joins.
+  bool probeSideHasRows_{false};
+  bool probeSideHasNullKeys_{false};
+
   // Copied from HashProbe.h
   // Indicates whether to skip probe input data processing or not. It only
   // applies for a specific set of join types (see skipProbeOnEmptyBuild()), and
@@ -245,8 +251,8 @@ class CudfHashJoinProbe : public CudfOperatorBase {
   // Streaming right join state
   // Per-build-table flags indicating whether a build row has had at least one
   // left match.
-  /** @brief Flags tracking which build rows have been matched (for right joins)
-   */
+  /** @brief Flags tracking which build rows have been matched for right/full
+   * and right-semi-project joins. */
   std::vector<std::unique_ptr<cudf::column>> rightMatchedFlags_;
 
   /// Cached precomputed columns for right (build) tables
@@ -254,17 +260,24 @@ class CudfHashJoinProbe : public CudfOperatorBase {
   /// Cached extended views for right tables (original + precomputed columns)
   std::vector<cudf::table_view> cachedExtendedRightViews_;
 
-  // For Right joins, only one driver collects the unmatched rows mask and
-  // emits. This value is set true only for that driver. See noMoreInput
+  // For right/full and right-semi-project joins, only one driver combines the
+  // build-row match masks and emits build-side output. This value is set true
+  // only for that driver. See noMoreInput().
   bool isLastDriver_{false};
 
+  /// Next build table to emit for RIGHT SEMI PROJECT. Build tables are emitted
+  /// one at a time so the multi-table path does not concatenate past the cuDF
+  /// size_type limit.
+  size_t nextBuildOutputIndex_{0};
+
   /// CUDA stream used during the last getOutput() probe operation. Set only
-  /// for right/full joins, and only for drivers that process at least one probe
-  /// batch. Used in noMoreInput() to synchronize GPU streams across drivers
-  /// before combining rightMatchedFlags_. Drivers with no probe input are safe
-  /// to skip: the driver loop guarantees all addInput batches are consumed by
-  /// getOutput() before noMoreInput() fires, and unset flags remain in their
-  /// host-synchronized all-false init state with no pending GPU work.
+  /// for right/full/right-semi-project joins, and only for drivers that process
+  /// at least one probe batch. Used in noMoreInput() to synchronize GPU streams
+  /// across drivers before combining rightMatchedFlags_. Drivers with no probe
+  /// input are safe to skip: the driver loop guarantees all addInput batches
+  /// are consumed by getOutput() before noMoreInput() fires, and unset flags
+  /// remain in their host-synchronized all-false init state with no pending GPU
+  /// work.
   std::optional<rmm::cuda_stream_view> lastProbeStream_;
 
   static constexpr auto oobPolicy = cudf::out_of_bounds_policy::NULLIFY;
@@ -341,6 +354,17 @@ class CudfHashJoinProbe : public CudfOperatorBase {
   std::vector<JoinOutput> rightSemiFilterJoin(
       cudf::table_view leftTableView,
       rmm::cuda_stream_view stream);
+  /**
+   * @brief Accumulates per-build-row matches for a right semi project join.
+   * This produces no rows while probing; the build rows and match column are
+   * emitted after all probe drivers reach the end-of-input barrier.
+   */
+  std::vector<JoinOutput> rightSemiProjectJoin(
+      cudf::table_view leftTableView,
+      rmm::cuda_stream_view stream);
+
+  /// Emits the next build-side batch for RIGHT SEMI PROJECT.
+  RowVectorPtr rightSemiProjectOutput(rmm::cuda_stream_view stream);
   /**
    * @brief Performs anti join between probe table and all build tables.
    * @param leftTableView Probe-side table view to join

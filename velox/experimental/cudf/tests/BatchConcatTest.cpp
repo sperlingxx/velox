@@ -41,10 +41,14 @@ class CudfBatchConcatTest : public OperatorTestBase {
     OperatorTestBase::TearDown();
   }
 
-  void updateCudfConfig(int32_t min, std::optional<int32_t> max) {
+  void updateCudfConfig(
+      int32_t min,
+      std::optional<int32_t> max,
+      uint64_t minBytes = 0) {
     auto& config = CudfConfig::getInstance();
     config.batchSizeMinThreshold = min;
     config.batchSizeMaxThreshold = max;
+    config.batchSizeMinThresholdBytes = minBytes;
   }
 
   template <typename T>
@@ -62,23 +66,6 @@ class CudfBatchConcatTest : public OperatorTestBase {
       sources.push_back(PlanBuilder(generator).values({vec}).planNode());
     }
     return PlanBuilder(generator).localPartitionRoundRobin(sources).planNode();
-  }
-
-  // Returns the per-operator-type stats for CudfBatchConcat within the given
-  // plan node, or nullptr if CudfBatchConcat wasn't inserted for that node.
-  const PlanNodeStats* getConcatStats(
-      const std::shared_ptr<Task>& task,
-      const core::PlanNodeId& aggNodeId) {
-    auto planStats = toPlanStats(task->taskStats());
-    auto nodeIt = planStats.find(aggNodeId);
-    if (nodeIt == planStats.end()) {
-      return nullptr;
-    }
-    auto opIt = nodeIt->second.operatorStats.find("CudfBatchConcat");
-    if (opIt == nodeIt->second.operatorStats.end()) {
-      return nullptr;
-    }
-    return opIt->second.get();
   }
 };
 
@@ -124,6 +111,46 @@ TEST_F(CudfBatchConcatTest, concatReducesBatchesBeforeAggregation) {
       << "CudfBatchConcat should have received all 6 input batches";
   EXPECT_LT(concatStats.outputVectors, concatStats.inputVectors)
       << "CudfBatchConcat should produce fewer output batches than input";
+}
+
+TEST_F(CudfBatchConcatTest, concatFlushesAtByteThreshold) {
+  // Keep the row threshold out of reach. Six 10-row BIGINT batches are
+  // coalesced based only on their cumulative byte size.
+  updateCudfConfig(
+      /*min=*/std::numeric_limits<int32_t>::max(),
+      /*max=*/std::nullopt,
+      /*minBytes=*/100);
+  CudfConfig::getInstance().concatOptimizationEnabled = true;
+
+  std::vector<RowVectorPtr> vectors;
+  for (int i = 0; i < 6; ++i) {
+    vectors.push_back(makeRowVector({makeFlatSequence<int64_t>(i * 10, 10)}));
+  }
+  createDuckDbTable(vectors);
+
+  auto generator = std::make_shared<core::PlanNodeIdGenerator>();
+  core::PlanNodeId aggNodeId;
+  auto plan = PlanBuilder(generator)
+                  .addNode([&](auto, auto) {
+                    return createFragmentedSource(vectors, generator);
+                  })
+                  .singleAggregation({}, {"sum(c0)"})
+                  .capturePlanNodeId(aggNodeId)
+                  .planNode();
+
+  auto task = AssertQueryBuilder(duckDbQueryRunner_)
+                  .plan(plan)
+                  .maxDrivers(1)
+                  .assertResults("SELECT sum(c0) FROM tmp");
+
+  const auto planStats = toPlanStats(task->taskStats());
+  const auto& nodeStats = planStats.at(aggNodeId);
+  const auto concatIt = nodeStats.operatorStats.find("CudfBatchConcat");
+  ASSERT_NE(concatIt, nodeStats.operatorStats.end());
+  const auto& concatStats = *concatIt->second;
+  EXPECT_EQ(concatStats.inputVectors, 6);
+  EXPECT_GT(concatStats.outputVectors, 1);
+  EXPECT_LT(concatStats.outputVectors, concatStats.inputVectors);
 }
 
 // Verifies that CudfBatchConcat is not inserted when the optimization is

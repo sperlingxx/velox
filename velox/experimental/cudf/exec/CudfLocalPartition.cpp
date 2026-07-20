@@ -70,7 +70,11 @@ CudfLocalPartition::CudfLocalPartition(
           planNode),
       queues_{
           ctx->task->getLocalExchangeQueues(ctx->splitGroupId, planNode->id())},
-      numPartitions_{queues_.size()} {
+      numPartitions_{queues_.size()},
+      hashSeed_{
+          planNode->id().find("_keyed_final_local_hash") != std::string::npos
+              ? cudf::DEFAULT_HASH_SEED ^ 0x9e3779b9U
+              : cudf::DEFAULT_HASH_SEED} {
   // Following is IMO a hacky way to get the partition key indices. It is to
   // workaround the fact that the partition spec constructs the hash function
   // directly and has no public methods to get the partition key indices.
@@ -119,6 +123,11 @@ CudfLocalPartition::CudfLocalPartition(
       }
     }
     partitionFunctionType_ = PartitionFunctionType::kHash;
+    if (hashSeed_ != cudf::DEFAULT_HASH_SEED) {
+      LOG(WARNING) << "CudfLocalPartition: decorrelated keyed-FINAL hash "
+                   << "planNode=" << planNode->id()
+                   << " partitions=" << numPartitions_ << " seed=" << hashSeed_;
+    }
   } else if (
       dynamic_cast<const exec::RoundRobinPartitionFunctionSpec*>(
           &planNode->partitionFunctionSpec()) &&
@@ -210,7 +219,7 @@ void CudfLocalPartition::doAddInput(RowVectorPtr input) {
             partitionKeyIndices,
             numPartitions_,
             cudf::hash_id::HASH_MURMUR3,
-            cudf::DEFAULT_HASH_SEED,
+            hashSeed_,
             stream,
             get_temp_mr());
       } else if (

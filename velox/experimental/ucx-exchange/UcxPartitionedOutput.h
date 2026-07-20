@@ -15,6 +15,8 @@
  */
 #pragma once
 
+#include <optional>
+
 #include "velox/exec/Operator.h"
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
@@ -47,18 +49,16 @@ class UcxPartitionedOutput : public exec::Operator,
   /// a non-blocked state, otherwise blocked.
   RowVectorPtr getOutput() override;
 
-  /// always true but the caller will check isBlocked before adding input, hence
-  /// the blocked state does not accumulate input.
+  /// Do not accept another input while a large input is being partitioned a
+  /// window at a time. The driver calls getOutput() to resume that work.
   bool needsInput() const override {
-    return true;
+    return !noMoreInput_ && !hasActiveFlush();
   }
 
-  // the operator is blocked if the queues are full, we are ignoring this so
-  // always return kNotBlocked
+  /// Moves the shared output queue's backpressure future to the Driver.
   exec::BlockingReason isBlocked(ContinueFuture* future) override;
 
-  // The operaor is finished when the queue manager say the queues have all been
-  // drained ?
+  /// Finished after all input windows have been enqueued and EOS published.
   bool isFinished() override;
 
  private:
@@ -101,8 +101,12 @@ class UcxPartitionedOutput : public exec::Operator,
 
   const int pipelineId_;
   const int driverId_;
+  /// Partial aggregation may need a large transient allocation to produce its
+  /// next batch. Do not retain one of its oversized outputs across a queue
+  /// wait; scan/join producers keep normal mid-source backpressure.
+  const bool sourceNeedsOwnerBoundaryBackpressure_;
 
-  exec::BlockingReason blockingReason_;
+  exec::BlockingReason blockingReason_{exec::BlockingReason::kNotBlocked};
   ContinueFuture future_;
 
   bool finished_{false};
@@ -113,14 +117,55 @@ class UcxPartitionedOutput : public exec::Operator,
   std::vector<uint32_t> remap_;
 
   /// Concatenates pending inputs and partitions/enqueues the merged result.
+  /// Each invocation advances at most one hash-partition residency window (or
+  /// one SINGLE chunk), allowing the Driver to observe queue backpressure in
+  /// between windows.
   void flushPending();
+
+  /// Moves pending inputs into resumable flush state. For multiple inputs,
+  /// owns the concatenated table; for one input, activeInputs_ owns the vector
+  /// referenced by the active table view.
+  void preparePendingFlush();
+
+  /// Processes and enqueues one resumable work unit from the active flush.
+  void advanceActiveFlush();
+
+  /// Checks task-wide output queue pressure immediately after a work unit.
+  void updateBackpressure();
+
+  bool hasActiveFlush() const;
+  cudf::table_view activeTableView();
+  void clearActiveFlush();
 
   /// Accumulated CudfVectors awaiting flush.
   std::vector<cudf_velox::CudfVectorPtr> pendingInputs_;
   /// Total rows across pendingInputs_.
   int64_t pendingRows_{0};
+  /// Source GPU bytes across pendingInputs_, captured before owners are freed.
+  uint64_t pendingFlatBytes_{0};
+
+  /// Ownership and cursor for a flush that yielded between partition windows.
+  std::vector<cudf_velox::CudfVectorPtr> activeInputs_;
+  std::unique_ptr<cudf::table> activeMergedTable_;
+  std::optional<rmm::cuda_stream_view> activeStream_;
+  uint64_t activeSourceFlatBytes_{0};
+  cudf::size_type activeNextRow_{0};
+  cudf::size_type activeRowsPerWindow_{0};
+  /// A source larger than the task queue cap must not remain pinned while the
+  /// producer is blocked. Such an oversized, multi-window source is drained
+  /// before observing backpressure so its owner can be released promptly.
+  bool activeDrainBeforeBackpressure_{false};
+  /// Task-wide queue byte cap. Normal window sizing uses device headroom;
+  /// this supplies only the emergency schema-width fallback under pressure.
+  const uint64_t maxOutputBufferSize_;
   /// Configured row threshold for flushing (from QueryConfig).
   const int64_t targetRowsPerChunk_;
+  /// Configured byte threshold for flushing and destination chunking.
+  const uint64_t targetBytesPerChunk_;
+  /// Optional libcudf hash_partition safety limit. Zero disables slicing.
+  const int64_t hashPartitionInputBatchRows_;
+  /// Source-row window for recombining safely sliced hash output.
+  const int64_t hashPartitionWindowRows_;
 };
 
 } // namespace facebook::velox::ucx_exchange

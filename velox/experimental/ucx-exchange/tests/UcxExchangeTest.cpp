@@ -23,6 +23,7 @@
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 #include <folly/Executor.h>
+#include <folly/ScopeGuard.h>
 #include <folly/synchronization/EventCount.h>
 #include <gtest/gtest-param-test.h>
 #include <gtest/gtest.h>
@@ -30,12 +31,14 @@
 #include <chrono>
 #include <future>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <vector>
 #include "velox/common/memory/MemoryPool.h"
 #include "velox/core/QueryConfig.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
 #include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/ucx-exchange/Communicator.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeProtocol.h"
 #include "velox/experimental/ucx-exchange/UcxOutputQueueManager.h"
@@ -847,6 +850,16 @@ TEST_P(UcxExchangeTest, sharedClientSurvivesOneExchangeClose) {
     GTEST_SKIP() << "sharedClientSurvivesOneExchangeClose: runs only once";
   }
 
+  // This test isolates ownership of a client shared by two operators. Avoid
+  // coupling that contract to loopback UCX TCP behavior by using the
+  // same-process transfer registry for the data path.
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  const bool origIntraNode = config.intraNodeExchange;
+  config.intraNodeExchange = true;
+  SCOPE_EXIT {
+    config.intraNodeExchange = origIntraNode;
+  };
+
   const std::string taskPrefix = getUniqueTaskPrefix();
   const std::string srcTaskId = taskPrefix + "sharedClientSrc";
   const std::string sinkTaskId = taskPrefix + "sharedClientSink";
@@ -1197,6 +1210,16 @@ TEST_P(UcxExchangeTest, batchAccumulationTest) {
     }
   }
 
+  // This test exercises accumulation and chunk-boundary semantics, not the
+  // UCX TCP transport. Use the same-process registry so loopback transport
+  // failures cannot mask row-count, integrity, or chunk-count regressions.
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  const bool origIntraNode = config.intraNodeExchange;
+  config.intraNodeExchange = true;
+  SCOPE_EXIT {
+    config.intraNodeExchange = origIntraNode;
+  };
+
   const int kTargetRows = UcxPartitionedOutput::kDefaultTargetRowsPerChunk;
 
   // --- Scenario 1: Small chunks that SHOULD be accumulated ---
@@ -1483,6 +1506,204 @@ TEST_P(UcxExchangeTest, batchAccumulationTest) {
 
     queueManager_->removeTask(srcTaskId);
   }
+
+  // --- Scenario 5: Byte-only threshold via QueryConfig ---
+  {
+    const int numChunks = 20;
+    // Use a one-row repeated pattern so validation remains independent of
+    // byte-based output slice boundaries.
+    const int numRowsPerChunk = 1;
+    const int numPartitions = 1;
+    const int numDrivers = 1;
+    const std::string taskPrefix = getUniqueTaskPrefix();
+    const std::string srcTaskId = taskPrefix + "sourceTask0";
+
+    auto dataToSend = std::make_shared<UcxTestData>();
+    dataToSend->initialize(numRowsPerChunk);
+
+    std::unordered_map<std::string, std::string> extraConfig{
+        {core::QueryConfig::kUcxPartitionedOutputBatchRows, "0"},
+        {core::QueryConfig::kUcxPartitionedOutputBatchBytes, "256"}};
+    auto srcTask = createPartitionedOutputTask(
+        srcTaskId,
+        pool_,
+        UcxTestData::kTestRowType,
+        numPartitions,
+        {},
+        FOUR_GBYTES,
+        extraConfig);
+    queueManager_->initializeTask(
+        srcTask,
+        core::PartitionedOutputNode::Kind::kPartitioned,
+        numPartitions,
+        numDrivers);
+
+    auto sourceDriver = std::make_shared<SourceDriverMock>(
+        srcTask, numDrivers, numChunks, numRowsPerChunk, dataToSend);
+    const std::string sinkTaskId = taskPrefix + "sinkTask0";
+    core::PlanNodeId exchangeNodeId;
+    auto sinkTask = createExchangeTask(
+        sinkTaskId, UcxTestData::kTestRowType, 0, exchangeNodeId);
+    auto sinkDriver =
+        std::make_shared<SinkDriverMock>(sinkTask, numDrivers, dataToSend);
+    std::vector<exec::Split> splits{remoteSplit(srcTaskId, 0)};
+    sinkDriver->addSplits(splits);
+
+    sourceDriver->run();
+    sinkDriver->run();
+    sourceDriver->joinThreads();
+    sinkDriver->joinThreads();
+
+    EXPECT_EQ(
+        sinkDriver->numRows(),
+        static_cast<size_t>(numChunks) * numRowsPerChunk);
+    EXPECT_TRUE(sinkDriver->dataIsValid());
+    EXPECT_GT(sinkDriver->numChunksReceived(), 1);
+    EXPECT_LT(
+        sinkDriver->numChunksReceived(), static_cast<uint64_t>(numChunks));
+    queueManager_->removeTask(srcTaskId);
+  }
+}
+
+// Regression test for resumable hash output. With no consumer, each producer
+// must stop after its first configured residency window instead of enqueueing
+// every remaining window from a single addInput(). Starting the consumers then
+// verifies that saved cursors resume and EOS is delivered. Pressure-aware
+// sizing keeps this full window while device headroom is healthy.
+TEST_P(UcxExchangeTest, hashWindowBackpressureIsResumable) {
+  ExchangeTestParams p = GetParam();
+  if (p.numSrcDrivers != 1 || p.numDstDrivers != 1 || p.numPartitions != 1 ||
+      p.numChunks != 100 || p.numUpstreamTasks != 1 ||
+      p.tableType != TableType::NARROW) {
+    GTEST_SKIP() << "hashWindowBackpressureIsResumable: runs only once";
+  }
+
+  // The behavior under test is producer-side queue backpressure and cursor
+  // resumption. Use the deterministic same-process transport so loopback UCX
+  // TCP failures cannot mask that contract.
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  const bool origIntraNode = config.intraNodeExchange;
+  config.intraNodeExchange = true;
+  SCOPE_EXIT {
+    config.intraNodeExchange = origIntraNode;
+  };
+
+  const auto headroom = cudf_velox::captureDeviceAllocationHeadroom();
+  ASSERT_TRUE(headroom.cudaValid);
+  auto admission =
+      cudf_velox::tryAcquireDeviceMemoryAdmission(headroom.device, 96, 128);
+  ASSERT_TRUE(admission.has_value());
+  EXPECT_EQ(
+      cudf_velox::deviceMemoryAdmissionReservedBytes(headroom.device), 96);
+  EXPECT_FALSE(
+      cudf_velox::tryAcquireDeviceMemoryAdmission(headroom.device, 64, 128));
+  admission.reset();
+  EXPECT_EQ(cudf_velox::deviceMemoryAdmissionReservedBytes(headroom.device), 0);
+
+  constexpr int kRowsPerDriver = 300;
+  constexpr int kWindowRows = 200;
+  constexpr int kHashCallRows = 20;
+  constexpr int kNumPartitions = 2;
+  constexpr int kNumDrivers = 2;
+  // One source fits in the queue cap, but the first window from both drivers
+  // exceeds it. This exercises the ordinary resumable path; oversized
+  // multi-window sources intentionally drain before observing backpressure.
+  constexpr uint64_t kQueueCapacityRows = kRowsPerDriver;
+  const std::string taskPrefix = getUniqueTaskPrefix();
+  const std::string srcTaskId = taskPrefix + "sourceTask0";
+  auto rowType = WideTestTable::kRowType;
+  auto tableGenerator = std::make_shared<WideTestTable>();
+  tableGenerator->initialize(kRowsPerDriver);
+
+  uint64_t averageRowBytes;
+  {
+    auto sizingVector = makeCudfVector(
+        pool_.get(),
+        kRowsPerDriver,
+        rowType,
+        tableGenerator,
+        cudf::get_default_stream());
+    const auto flatBytes = sizingVector->estimateFlatSize();
+    averageRowBytes = flatBytes / kRowsPerDriver +
+        static_cast<uint64_t>(flatBytes % kRowsPerDriver != 0);
+  }
+  cudf::get_default_stream().synchronize();
+  ASSERT_GT(averageRowBytes, 0);
+  const auto maxOutputBufferBytes = averageRowBytes * kQueueCapacityRows;
+
+  std::unordered_map<std::string, std::string> extraConfig{
+      {core::QueryConfig::kUcxPartitionedOutputBatchRows,
+       std::to_string(kRowsPerDriver)},
+      {core::QueryConfig::kUcxHashPartitionInputBatchRows,
+       std::to_string(kHashCallRows)},
+      {core::QueryConfig::kUcxHashPartitionWindowRows,
+       std::to_string(kWindowRows)}};
+  auto srcTask = createPartitionedOutputTask(
+      srcTaskId,
+      pool_,
+      rowType,
+      kNumPartitions,
+      {"int32_col"},
+      maxOutputBufferBytes,
+      extraConfig);
+  queueManager_->initializeTask(
+      srcTask,
+      core::PartitionedOutputNode::Kind::kPartitioned,
+      kNumPartitions,
+      kNumDrivers);
+
+  auto sourceDriver = std::make_shared<SourceDriverMock>(
+      srcTask, kNumDrivers, 1, kRowsPerDriver, tableGenerator);
+  sourceDriver->run();
+
+  // Do not start a consumer yet. Once the first adaptive window reaches the
+  // byte cap, SourceDriverMock must be waiting on the shared queue future.
+  bool sawFirstWindow = false;
+  std::optional<exec::OutputBuffer::Stats> blockedStats;
+  for (int attempt = 0; attempt < 200; ++attempt) {
+    blockedStats = queueManager_->stats(srcTaskId);
+    if (blockedStats &&
+        blockedStats->totalRowsSent == kNumDrivers * kWindowRows) {
+      sawFirstWindow = true;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  EXPECT_TRUE(sawFirstWindow);
+  if (blockedStats) {
+    EXPECT_EQ(blockedStats->totalRowsSent, kNumDrivers * kWindowRows)
+        << "producers crossed the one-window-per-driver backpressure bound";
+  }
+
+  std::vector<std::shared_ptr<SinkDriverMock>> sinkDrivers;
+  for (int partition = 0; partition < kNumPartitions; ++partition) {
+    core::PlanNodeId exchangeNodeId;
+    auto sinkTask = createExchangeTask(
+        taskPrefix + "sinkTask" + std::to_string(partition),
+        rowType,
+        partition,
+        exchangeNodeId);
+    auto sinkDriver = std::make_shared<SinkDriverMock>(sinkTask, 1);
+    std::vector<exec::Split> splits;
+    splits.push_back(remoteSplit(srcTaskId, partition));
+    sinkDriver->addSplits(splits);
+    sinkDriver->run();
+    sinkDrivers.push_back(std::move(sinkDriver));
+  }
+
+  sourceDriver->joinThreads();
+  uint64_t receivedRows = 0;
+  for (auto& sinkDriver : sinkDrivers) {
+    sinkDriver->joinThreads();
+    receivedRows += sinkDriver->numRows();
+  }
+  EXPECT_EQ(receivedRows, kNumDrivers * kRowsPerDriver);
+
+  auto finalStats = queueManager_->stats(srcTaskId);
+  ASSERT_TRUE(finalStats.has_value());
+  EXPECT_TRUE(finalStats->noMoreData);
+  EXPECT_EQ(finalStats->totalRowsSent, kNumDrivers * kRowsPerDriver);
+  queueManager_->removeTask(srcTaskId);
 }
 
 // Regression test: aborting a source task while UCXX tagRecv requests are

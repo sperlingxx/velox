@@ -33,16 +33,19 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace facebook::velox::cudf_velox {
 
 /// GPU-accelerated Window operator using cuDF.
 ///
-/// Incoming GPU batches are stored in addInput(). Small inputs are concatenated
-/// and sorted when noMoreInput() is called. Large, unsorted, partitioned inputs
-/// are written as sorted runs and merged into complete-partition batches before
-/// window evaluation.
+/// Partitioned row_number/rank windows with an inputsSorted contract are
+/// evaluated and emitted one input batch at a time while retaining only the
+/// partition/order boundary state. Other windows store incoming GPU batches in
+/// addInput(). Small inputs are concatenated and sorted when noMoreInput() is
+/// called. Large, unsorted, partitioned inputs are written as sorted runs and
+/// merged into complete-partition batches before window evaluation.
 ///
 /// inputsSorted fast path: when WindowNode::inputsSorted() is true, this
 /// operator skips stable_sorted_order and the full-table gather (see
@@ -54,9 +57,9 @@ namespace facebook::velox::cudf_velox {
 /// sortOrders_/nullOrders_). Rank grouping with partition keys also assumes
 /// that partition-key ordering when constructing the groupby grouper.
 ///
-/// Memory: the sorted path peaks at roughly concat output plus gather copy plus
-/// window result columns. Batch-wise / streaming evaluation would require a
-/// larger redesign.
+/// Memory: the buffered sorted path peaks at roughly concat output plus gather
+/// copy plus window result columns. The narrow rank-like streaming path is
+/// bounded by one input/output batch and constant-size boundary state.
 ///
 /// Rank-like functions (row_number, rank, dense_rank) use
 /// cudf::groupby::scan with cudf::make_rank_aggregation.
@@ -83,7 +86,7 @@ class CudfWindow : public CudfOperatorBase {
       size_t numArgs);
 
   bool needsInput() const override {
-    return !noMoreInput_;
+    return !noMoreInput_ && pendingOutput_ == nullptr;
   }
 
   exec::BlockingReason isBlocked(ContinueFuture* /*future*/) override {
@@ -116,6 +119,39 @@ class CudfWindow : public CudfOperatorBase {
   RowVectorPtr computeNextSortedOutput();
   RowVectorPtr computeOutput();
   void cleanupSpillFiles() noexcept;
+
+  std::unique_ptr<cudf::column> computeStreamingRowNumberColumn(
+      const cudf::table_view& sortedInput,
+      const TypePtr& expectedType,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const;
+
+  std::unique_ptr<cudf::column> computeStreamingRankColumn(
+      const cudf::table_view& sortedInput,
+      const TypePtr& expectedType,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const;
+
+  std::unique_ptr<cudf::column> fixRankLikeColumn(
+      std::unique_ptr<cudf::column> localResult,
+      std::string_view functionName,
+      const cudf::table_view& sortedInput,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const;
+
+  void updateRankLikeState(
+      const cudf::table_view& sortedInput,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr);
+
+  cudf::size_type continuingPrefixSize(
+      const cudf::table_view& sortedInput,
+      const std::vector<cudf::size_type>& indices,
+      const std::unique_ptr<cudf::table>& previousKey,
+      const std::vector<cudf::order>& orders,
+      const std::vector<cudf::null_order>& nullOrders,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const;
 
   // Compute row_number/rank/dense_rank via cudf::groupby::scan or cudf::scan.
   void computeRankColumnsBatch(
@@ -168,6 +204,8 @@ class CudfWindow : public CudfOperatorBase {
 
   std::shared_ptr<const core::WindowNode> windowNode_;
   const RowTypePtr inputRowType_;
+  const bool rankLikeStreaming_;
+  const rmm::cuda_stream_view stateStream_;
 
   std::vector<cudf::size_type> partitionKeyIndices_;
   std::vector<cudf::size_type> sortKeyIndices_;
@@ -175,6 +213,7 @@ class CudfWindow : public CudfOperatorBase {
   std::vector<cudf::null_order> nullOrders_;
 
   std::vector<CudfVectorPtr> inputBatches_;
+  RowVectorPtr pendingOutput_;
   const uint64_t sortedRunBytes_;
   uint64_t bufferedBytes_{0};
   std::vector<SortedRun> sortedRuns_;
@@ -191,6 +230,12 @@ class CudfWindow : public CudfOperatorBase {
   cudf::size_type logicalRowCount_{0};
   rmm::cuda_stream_view stream_{};
   bool streamAcquired_{false};
+
+  bool hasRankLikeState_{false};
+  std::unique_ptr<cudf::table> previousPartitionKey_;
+  std::unique_ptr<cudf::table> previousOrderKey_;
+  int64_t previousPartitionRows_{0};
+  int64_t previousRank_{0};
 
   bool finished_ = false;
 };

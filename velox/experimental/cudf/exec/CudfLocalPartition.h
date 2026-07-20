@@ -74,6 +74,11 @@ class CudfLocalPartition : public CudfOperatorBase {
   PartitionFunctionType partitionFunctionType_;
   size_t counter_{0};
 
+  // A local keyed-FINAL repartition must not reuse the remote exchange seed.
+  // If local partition count divides remote partition count (Q17: 4 vs 32),
+  // identical hashing sends the peer's entire remote bucket to one local lane.
+  uint32_t hashSeed_;
+
   std::vector<exec::BlockingReason> blockingReasons_;
   std::vector<ContinueFuture> futures_;
 

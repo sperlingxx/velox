@@ -708,6 +708,35 @@ TEST_F(TableScanTest, splitOffsetAndLength) {
       "SELECT * FROM tmp LIMIT 0");
 }
 
+TEST_F(TableScanTest, splitOffsetAndLengthWithChunkedOutput) {
+  auto vectors = makeVectors(10, 1'000);
+  auto filePath = TempFilePath::create();
+  writeToFile(filePath->getPath(), vectors);
+  createDuckDbTable(vectors);
+
+  const auto halfFileSize = fs::file_size(filePath->getPath()) / 2;
+  auto plan = tableScanNode();
+  AssertQueryBuilder(plan, duckDbQueryRunner_)
+      .connectorSessionProperty(
+          kCudfHiveConnectorId,
+          cudf_velox::connector::hive::CudfHiveConfig::
+              kMaxChunkReadLimitSession,
+          "1024")
+      .splits({Split(
+          makeCudfHiveConnectorSplit(filePath->getPath(), 0, halfFileSize))})
+      .assertResults("SELECT * FROM tmp OFFSET 0 LIMIT 6000");
+
+  AssertQueryBuilder(plan, duckDbQueryRunner_)
+      .connectorSessionProperty(
+          kCudfHiveConnectorId,
+          cudf_velox::connector::hive::CudfHiveConfig::
+              kMaxChunkReadLimitSession,
+          "1024")
+      .splits({Split(
+          makeCudfHiveConnectorSplit(filePath->getPath(), halfFileSize))})
+      .assertResults("SELECT * FROM tmp OFFSET 6000 LIMIT 4000");
+}
+
 // Verify that extractFiltersFromRemainingFilter extracts simple single-column
 // filters from the remaining filter into subfield filters for pushdown.
 // When a filter like "c0 = 1" is fully extracted, remainingFilterExprSet_ is

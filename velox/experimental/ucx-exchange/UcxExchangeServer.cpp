@@ -298,6 +298,24 @@ void UcxExchangeServer::process() {
                         << " getData callback called after close, ignoring";
                 return;
               }
+              if (sequence != static_cast<int64_t>(self->sequenceNumber_)) {
+                // The destination queue has already advanced beyond this
+                // duplicate/retried server.  Close only this stale server.
+                // In particular, do not deleteResults(): another active
+                // server owns the already-advanced queue and may still need
+                // its remaining pages.
+                LOG(WARNING)
+                    << "Closing stale UCX exchange server for task="
+                    << self->partitionKey_.taskId
+                    << " destination=" << self->partitionKey_.destination
+                    << " requestedSequence=" << self->sequenceNumber_
+                    << " acknowledgedSequence=" << sequence;
+                self->skipQueueDeleteOnClose_.store(
+                    true, std::memory_order_release);
+                self->setState(ServerState::Done);
+                self->wakeCommunicator();
+                return;
+              }
               // This upcall may be called from another thread than the
               // communicator thread. It is called
               // when data on the queue becomes available.
@@ -381,7 +399,7 @@ void UcxExchangeServer::close() {
           << " hasDataRequest=" << (dataRequest_ != nullptr)
           << " hasDataPtr=" << (dataPtr_ != nullptr);
 
-  if (queueMgr_) {
+  if (queueMgr_ && !skipQueueDeleteOnClose_.load(std::memory_order_acquire)) {
     queueMgr_->deleteResults(partitionKey_.taskId, partitionKey_.destination);
   }
 

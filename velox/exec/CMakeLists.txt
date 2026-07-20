@@ -11,6 +11,26 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+if(VELOX_ENABLE_CUDF)
+  # Task owns output-queue initialization. Without this definition the cuDF
+  # UcxPartitionedOutput operator runs without a registered output queue.
+  set_source_files_properties(
+    Task.cpp
+    TARGET_DIRECTORY velox
+    PROPERTIES COMPILE_DEFINITIONS VELOX_ENABLE_CUDF
+  )
+  set_property(
+    SOURCE Task.cpp TARGET_DIRECTORY velox
+    APPEND
+    PROPERTY
+      INCLUDE_DIRECTORIES
+        "${CMAKE_BINARY_DIR}/_deps/cccl-src/libcudacxx/include"
+        "${CMAKE_BINARY_DIR}/_deps/cccl-src/thrust"
+        "${CMAKE_BINARY_DIR}/_deps/cccl-src/cub"
+        "${CUDAToolkit_INCLUDE_DIRS}"
+  )
+endif()
+
 velox_add_library(
   velox_exec
   AddressableNonNullValueList.cpp
@@ -242,6 +262,18 @@ velox_link_libraries(
   velox_test_util
   velox_vector
 )
+
+if(VELOX_ENABLE_CUDF)
+  # Task.cpp owns the UCX output-queue lifecycle when cuDF exchange is enabled.
+  # The CMake option does not automatically define a C++ preprocessor macro;
+  # without this definition the guarded initialize/update/remove paths are
+  # silently omitted from production builds.
+  velox_compile_definitions(velox_exec PRIVATE VELOX_ENABLE_CUDF)
+  # Task.cpp includes the cuDF-backed queue manager under the same guard.
+  # Propagate cuDF's CCCL include directories (including <cuda/version>) to
+  # this target without exposing them to velox_exec consumers.
+  velox_link_libraries(velox_exec PRIVATE cudf::cudf)
+endif()
 
 if(VELOX_ENABLE_GEO)
   velox_compile_definitions(velox_exec PRIVATE VELOX_ENABLE_GEO)

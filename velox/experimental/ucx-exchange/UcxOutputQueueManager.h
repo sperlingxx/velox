@@ -65,6 +65,10 @@ class UcxOutputQueueManager {
       int numBuffers,
       bool noMoreBuffers);
 
+  bool updateNumDriversIfExists(
+      std::string_view taskId,
+      uint32_t newNumDrivers);
+
   /// @brief Enqueues a cudf packed column into the queue.
   /// @param taskId The unique task Id.
   /// @param destination The destination (partition, queue number) into which

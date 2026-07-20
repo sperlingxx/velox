@@ -47,7 +47,7 @@ std::shared_ptr<Communicator> Communicator::initAndGet(
     uint16_t port,
     std::string_view coordinatorURL,
     ContinueFuture* future) {
-  if (!FLAGS_velox_ucx_exchange) {
+  if (!CudfConfig::getInstance().exchange) {
     return nullptr;
   }
   std::call_once(onceFlag, [&] {

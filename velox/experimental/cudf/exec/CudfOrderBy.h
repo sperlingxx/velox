@@ -143,6 +143,8 @@ class CudfOrderBy : public CudfOperatorBase {
   std::vector<cudf::null_order> nullOrder_;
   const uint64_t sortedRunBytes_;
   const size_t mergeFanIn_;
+  const uint64_t outputChunkBytes_;
+  const cudf::size_type maxOutputRows_;
   uint64_t bufferedBytes_{0};
   std::vector<SortedRun> sortedRuns_;
   std::string spillDirectory_;

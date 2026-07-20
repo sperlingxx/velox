@@ -28,12 +28,14 @@
 #include "velox/type/Type.h"
 
 #include <cudf/aggregation.hpp>
+#include <cudf/binaryop.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/filling.hpp>
 #include <cudf/groupby.hpp>
 #include <cudf/io/parquet.hpp>
+#include <cudf/join/hash_join.hpp>
 #include <cudf/merge.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/replace.hpp>
@@ -53,6 +55,7 @@
 #include <malloc.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <filesystem>
 #include <limits>
@@ -92,6 +95,17 @@ cudf::size_type firstSearchPosition(
       stream.value()));
   stream.synchronize();
   return result;
+}
+
+std::vector<cudf::column_view> selectColumns(
+    const cudf::table_view& table,
+    const std::vector<cudf::size_type>& indices) {
+  std::vector<cudf::column_view> columns;
+  columns.reserve(indices.size());
+  for (const auto index : indices) {
+    columns.push_back(table.column(index));
+  }
+  return columns;
 }
 
 // Returns true when the window function's value argument is a cast expression.
@@ -216,6 +230,26 @@ cudf::rank_method toRankMethod(const std::string& name) {
     return cudf::rank_method::DENSE;
   }
   VELOX_FAIL("Unsupported rank window function: {}", name);
+}
+
+bool isStreamingRankFunction(const core::WindowNode::Function& function) {
+  const auto& prefix = CudfConfig::getInstance().functionNamePrefix;
+  const auto baseName =
+      stripFunctionPrefix(function.functionCall->name(), prefix);
+  return (baseName == "row_number" || baseName == "rank") &&
+      function.functionCall->inputs().empty() && !function.ignoreNulls &&
+      function.frame.startType ==
+      core::WindowNode::BoundType::kUnboundedPreceding &&
+      function.frame.endType == core::WindowNode::BoundType::kCurrentRow &&
+      function.frame.startValue == nullptr &&
+      function.frame.endValue == nullptr;
+}
+
+bool isStreamingRankWindow(const core::WindowNode& windowNode) {
+  const auto& functions = windowNode.windowFunctions();
+  return windowNode.inputsSorted() && !windowNode.partitionKeys().empty() &&
+      !windowNode.sortingKeys().empty() && !functions.empty() &&
+      std::all_of(functions.begin(), functions.end(), isStreamingRankFunction);
 }
 
 std::unique_ptr<cudf::column> makeConstantOnesColumn(
@@ -453,7 +487,8 @@ bool CudfWindow::canRunOnGPU(const core::WindowNode& windowNode) {
 bool CudfWindow::canRunOnGPU(
     const core::WindowNode& windowNode,
     std::string* reason) {
-  if (windowNode.sortingKeys().size() > 1) {
+  if (windowNode.sortingKeys().size() > 1 &&
+      !isStreamingRankWindow(windowNode)) {
     if (reason) {
       *reason = "Multi-column ORDER BY requires a cuDF upgrade (follow-on PR)";
     }
@@ -752,6 +787,8 @@ CudfWindow::CudfWindow(
           NvtxMethodFlag::kAddInput | NvtxMethodFlag::kGetOutput),
       windowNode_(windowNode),
       inputRowType_(asRowType(windowNode->inputType())),
+      rankLikeStreaming_(isStreamingRankWindow(*windowNode)),
+      stateStream_(cudfGlobalStreamPool().get_stream()),
       sortedRunBytes_(CudfConfig::getInstance().windowSortedRunBytes) {
   const auto& inputType = windowNode->inputType();
 
@@ -781,6 +818,28 @@ void CudfWindow::doAddInput(RowVectorPtr input) {
 
   auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input);
   VELOX_CHECK_NOT_NULL(cudfInput, "CudfWindow expects CudfVector input");
+
+  if (rankLikeStreaming_) {
+    VELOX_CHECK_NULL(
+        pendingOutput_,
+        "CudfWindow received sorted input before prior output was drained");
+    const auto inputStream = cudfInput->stream();
+    if (inputStream.value() != stateStream_.value()) {
+      cudf::detail::join_streams(
+          std::vector<rmm::cuda_stream_view>{inputStream}, stateStream_);
+    }
+    VELOX_CHECK(
+        cudfInput->rebindStream(stateStream_),
+        "CudfWindow cannot rebind sorted input to its state stream");
+
+    stream_ = stateStream_;
+    streamAcquired_ = true;
+    logicalRowCount_ = cudfInput->size();
+    sortedData_ = cudfInput->release();
+    pendingOutput_ = computeOutput();
+    return;
+  }
+
   bufferedBytes_ += cudfInput->estimateFlatSize();
   inputBatches_.push_back(std::move(cudfInput));
 
@@ -997,6 +1056,328 @@ std::unique_ptr<cudf::table> CudfWindow::takeCompletePartitions(
     return nullptr;
   }
   return copyTableSlice(sorted->view(), 0, completeEnd, stream_, mr);
+}
+
+std::unique_ptr<cudf::column> CudfWindow::computeStreamingRowNumberColumn(
+    const cudf::table_view& sortedInput,
+    const TypePtr& expectedType,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) const {
+  const auto valuesColumn = sortedInput.column(sortKeyIndices_[0]);
+  const auto order = sortOrders_[0];
+  const auto nullOrder = nullOrders_[0];
+
+  std::vector<cudf::groupby::scan_request> requests(1);
+  requests[0].values = valuesColumn;
+  requests[0].aggregations.push_back(
+      cudf::make_rank_aggregation<cudf::groupby_scan_aggregation>(
+          cudf::rank_method::FIRST,
+          order,
+          cudf::null_policy::INCLUDE,
+          nullOrder));
+
+  cudf::groupby::groupby grouper(
+      cudf::table_view(selectColumns(sortedInput, partitionKeyIndices_)),
+      cudf::null_policy::INCLUDE,
+      cudf::sorted::YES,
+      std::vector<cudf::order>(
+          partitionKeyIndices_.size(), cudf::order::ASCENDING),
+      std::vector<cudf::null_order>(
+          partitionKeyIndices_.size(), cudf::null_order::BEFORE));
+
+  auto scanResult = grouper.scan(requests, stream, mr);
+  VELOX_CHECK_EQ(scanResult.second.size(), 1);
+  VELOX_CHECK_EQ(scanResult.second[0].results.size(), 1);
+  auto rowNumber = std::move(scanResult.second[0].results[0]);
+
+  const auto expectedCudfType = veloxToCudfDataType(expectedType);
+  if (rowNumber->type() != expectedCudfType) {
+    rowNumber = cudf::cast(rowNumber->view(), expectedCudfType, stream, mr);
+  }
+  return rowNumber;
+}
+
+std::unique_ptr<cudf::column> CudfWindow::computeStreamingRankColumn(
+    const cudf::table_view& sortedInput,
+    const TypePtr& expectedType,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) const {
+  auto rowNumber =
+      computeStreamingRowNumberColumn(sortedInput, expectedType, stream, mr);
+
+  std::vector<cudf::size_type> rankKeyIndices = partitionKeyIndices_;
+  rankKeyIndices.insert(
+      rankKeyIndices.end(), sortKeyIndices_.begin(), sortKeyIndices_.end());
+  auto rankKeyColumns = selectColumns(sortedInput, rankKeyIndices);
+  cudf::groupby::groupby grouper(
+      cudf::table_view(rankKeyColumns), cudf::null_policy::INCLUDE);
+
+  std::vector<cudf::groupby::aggregation_request> requests(1);
+  requests[0].values = rowNumber->view();
+  requests[0].aggregations.push_back(
+      cudf::make_min_aggregation<cudf::groupby_aggregation>());
+
+  auto [groupKeys, results] = grouper.aggregate(requests, stream, mr);
+  VELOX_CHECK_EQ(results.size(), 1);
+  VELOX_CHECK_EQ(results[0].results.size(), 1);
+  auto minRankByPeerGroup = std::move(results[0].results[0]);
+
+  cudf::hash_join lookup(
+      groupKeys->view(),
+      cudf::nullable_join::YES,
+      cudf::null_equality::EQUAL,
+      0.5,
+      stream);
+  auto [leftJoinIndices, rightJoinIndices] = lookup.left_join(
+      cudf::table_view(rankKeyColumns),
+      static_cast<std::size_t>(sortedInput.num_rows()),
+      stream,
+      mr);
+
+  auto leftIndicesCol = cudf::column_view{
+      cudf::device_span<const cudf::size_type>{*leftJoinIndices}};
+  auto rightIndicesCol = cudf::column_view{
+      cudf::device_span<const cudf::size_type>{*rightJoinIndices}};
+  auto gatheredRanks = cudf::gather(
+      cudf::table_view{{minRankByPeerGroup->view()}},
+      rightIndicesCol,
+      cudf::out_of_bounds_policy::NULLIFY,
+      stream,
+      mr);
+  auto gatheredColumns = gatheredRanks->release();
+  VELOX_CHECK_EQ(gatheredColumns.size(), 1);
+
+  auto target = cudf::allocate_like(
+      gatheredColumns[0]->view(),
+      sortedInput.num_rows(),
+      cudf::mask_allocation_policy::RETAIN,
+      stream,
+      mr);
+  auto scattered = cudf::scatter(
+      cudf::table_view{{gatheredColumns[0]->view()}},
+      leftIndicesCol,
+      cudf::table_view{{target->view()}},
+      stream,
+      mr);
+  return std::move(scattered->release()[0]);
+}
+
+cudf::size_type CudfWindow::continuingPrefixSize(
+    const cudf::table_view& sortedInput,
+    const std::vector<cudf::size_type>& indices,
+    const std::unique_ptr<cudf::table>& previousKey,
+    const std::vector<cudf::order>& orders,
+    const std::vector<cudf::null_order>& nullOrders,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) const {
+  if (!previousKey || sortedInput.num_rows() == 0) {
+    return 0;
+  }
+  VELOX_CHECK_EQ(indices.size(), orders.size());
+  VELOX_CHECK_EQ(indices.size(), nullOrders.size());
+  auto positions = cudf::upper_bound(
+      cudf::table_view(selectColumns(sortedInput, indices)),
+      previousKey->view(),
+      orders,
+      nullOrders,
+      stream,
+      mr);
+  return firstSearchPosition(positions->view(), stream);
+}
+
+std::unique_ptr<cudf::column> CudfWindow::fixRankLikeColumn(
+    std::unique_ptr<cudf::column> localResult,
+    std::string_view functionName,
+    const cudf::table_view& sortedInput,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) const {
+  if (!hasRankLikeState_ || sortedInput.num_rows() == 0) {
+    return localResult;
+  }
+
+  const std::vector<cudf::order> partitionOrders(
+      partitionKeyIndices_.size(), cudf::order::ASCENDING);
+  const std::vector<cudf::null_order> partitionNullOrders(
+      partitionKeyIndices_.size(), cudf::null_order::BEFORE);
+  const auto samePartitionEnd = continuingPrefixSize(
+      sortedInput,
+      partitionKeyIndices_,
+      previousPartitionKey_,
+      partitionOrders,
+      partitionNullOrders,
+      stream,
+      mr);
+  if (samePartitionEnd == 0) {
+    return localResult;
+  }
+
+  auto addOffset = [&](cudf::column_view values,
+                       int64_t offset) -> std::unique_ptr<cudf::column> {
+    switch (values.type().id()) {
+      case cudf::type_id::INT32: {
+        cudf::numeric_scalar<int32_t> scalar(
+            static_cast<int32_t>(offset), true, stream, mr);
+        return cudf::binary_operation(
+            values,
+            scalar,
+            cudf::binary_operator::ADD,
+            values.type(),
+            stream,
+            mr);
+      }
+      case cudf::type_id::INT64: {
+        cudf::numeric_scalar<int64_t> scalar(offset, true, stream, mr);
+        return cudf::binary_operation(
+            values,
+            scalar,
+            cudf::binary_operator::ADD,
+            values.type(),
+            stream,
+            mr);
+      }
+      default:
+        VELOX_FAIL(
+            "Unsupported rank output type {}",
+            static_cast<int>(values.type().id()));
+    }
+  };
+  auto makeConstant =
+      [&](int64_t value,
+          cudf::size_type rows) -> std::unique_ptr<cudf::column> {
+    switch (localResult->type().id()) {
+      case cudf::type_id::INT32: {
+        cudf::numeric_scalar<int32_t> scalar(
+            static_cast<int32_t>(value), true, stream, mr);
+        return cudf::make_column_from_scalar(scalar, rows, stream, mr);
+      }
+      case cudf::type_id::INT64: {
+        cudf::numeric_scalar<int64_t> scalar(value, true, stream, mr);
+        return cudf::make_column_from_scalar(scalar, rows, stream, mr);
+      }
+      default:
+        VELOX_FAIL(
+            "Unsupported rank output type {}",
+            static_cast<int>(localResult->type().id()));
+    }
+  };
+
+  std::vector<std::unique_ptr<cudf::column>> ownedSegments;
+  std::vector<cudf::column_view> segments;
+  auto appendUnchanged = [&](cudf::size_type begin, cudf::size_type end) {
+    if (begin == end) {
+      return;
+    }
+    auto slice = cudf::slice(localResult->view(), {begin, end}, stream);
+    segments.push_back(slice.front());
+  };
+  auto appendOffset =
+      [&](cudf::size_type begin, cudf::size_type end, int64_t offset) {
+        if (begin == end) {
+          return;
+        }
+        auto slice = cudf::slice(localResult->view(), {begin, end}, stream);
+        ownedSegments.push_back(addOffset(slice.front(), offset));
+        segments.push_back(ownedSegments.back()->view());
+      };
+
+  cudf::size_type fixedEnd{0};
+  if (functionName == "rank") {
+    auto continuingPartition =
+        cudf::slice(sortedInput, {0, samePartitionEnd}, stream);
+    const auto sameOrderEnd = continuingPrefixSize(
+        continuingPartition.front(),
+        sortKeyIndices_,
+        previousOrderKey_,
+        sortOrders_,
+        nullOrders_,
+        stream,
+        mr);
+    if (sameOrderEnd > 0) {
+      ownedSegments.push_back(makeConstant(previousRank_, sameOrderEnd));
+      segments.push_back(ownedSegments.back()->view());
+    }
+    fixedEnd = sameOrderEnd;
+  }
+  appendOffset(fixedEnd, samePartitionEnd, previousPartitionRows_);
+  appendUnchanged(samePartitionEnd, localResult->size());
+  VELOX_CHECK(!segments.empty());
+  return segments.size() == 1
+      ? std::make_unique<cudf::column>(segments.front(), stream, mr)
+      : cudf::concatenate(segments, stream, mr);
+}
+
+void CudfWindow::updateRankLikeState(
+    const cudf::table_view& sortedInput,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  VELOX_CHECK_GT(sortedInput.num_rows(), 0);
+  const auto numRows = sortedInput.num_rows();
+  const std::vector<cudf::order> partitionOrders(
+      partitionKeyIndices_.size(), cudf::order::ASCENDING);
+  const std::vector<cudf::null_order> partitionNullOrders(
+      partitionKeyIndices_.size(), cudf::null_order::BEFORE);
+  const auto continuedRows = hasRankLikeState_ ? continuingPrefixSize(
+                                                     sortedInput,
+                                                     partitionKeyIndices_,
+                                                     previousPartitionKey_,
+                                                     partitionOrders,
+                                                     partitionNullOrders,
+                                                     stream,
+                                                     mr)
+                                               : 0;
+  const bool continuedWholeBatch = continuedRows == numRows;
+
+  auto partitionColumns =
+      cudf::table_view(selectColumns(sortedInput, partitionKeyIndices_));
+  auto lastPartition =
+      cudf::slice(partitionColumns, {numRows - 1, numRows}, stream);
+  auto partitionPositions = cudf::lower_bound(
+      partitionColumns,
+      lastPartition.front(),
+      partitionOrders,
+      partitionNullOrders,
+      stream,
+      mr);
+  const auto trailingPartitionBegin =
+      firstSearchPosition(partitionPositions->view(), stream);
+
+  auto trailingPartition =
+      cudf::slice(sortedInput, {trailingPartitionBegin, numRows}, stream);
+  auto trailingOrderColumns = cudf::table_view(
+      selectColumns(trailingPartition.front(), sortKeyIndices_));
+  auto lastOrder = cudf::slice(
+      trailingOrderColumns,
+      {trailingOrderColumns.num_rows() - 1, trailingOrderColumns.num_rows()},
+      stream);
+  auto orderPositions = cudf::lower_bound(
+      trailingOrderColumns,
+      lastOrder.front(),
+      sortOrders_,
+      nullOrders_,
+      stream,
+      mr);
+  const auto lastPeerBegin =
+      firstSearchPosition(orderPositions->view(), stream);
+  const bool lastPeerContinued = continuedWholeBatch &&
+      continuingPrefixSize(
+          sortedInput,
+          sortKeyIndices_,
+          previousOrderKey_,
+          sortOrders_,
+          nullOrders_,
+          stream,
+          mr) == numRows;
+
+  const auto priorRows = continuedWholeBatch ? previousPartitionRows_ : 0;
+  if (!lastPeerContinued) {
+    previousRank_ = priorRows + lastPeerBegin + 1;
+  }
+  previousPartitionRows_ = priorRows + numRows - trailingPartitionBegin;
+  previousPartitionKey_ =
+      std::make_unique<cudf::table>(lastPartition.front(), stream, mr);
+  previousOrderKey_ =
+      std::make_unique<cudf::table>(lastOrder.front(), stream, mr);
+  hasRankLikeState_ = true;
 }
 
 void CudfWindow::computeRankColumnsBatch(
@@ -1219,6 +1600,11 @@ std::unique_ptr<cudf::column> CudfWindow::computeAggregateColumn(
 void CudfWindow::doNoMoreInput() {
   Operator::noMoreInput();
 
+  if (rankLikeStreaming_) {
+    finished_ = true;
+    return;
+  }
+
   if (spilled_) {
     if (!inputBatches_.empty()) {
       spillSortedRun();
@@ -1290,7 +1676,7 @@ void CudfWindow::doNoMoreInput() {
 }
 
 bool CudfWindow::isFinished() {
-  return finished_;
+  return finished_ && pendingOutput_ == nullptr;
 }
 
 RowVectorPtr CudfWindow::computeOutput() {
@@ -1303,7 +1689,7 @@ RowVectorPtr CudfWindow::computeOutput() {
   auto partKeys = sortedView.select(partitionKeyIndices_);
 
   std::unique_ptr<cudf::groupby::groupby> rankGrouper;
-  if (!partitionKeyIndices_.empty()) {
+  if (!rankLikeStreaming_ && !partitionKeyIndices_.empty()) {
     bool needsRankGrouper = false;
     const auto& prefix = CudfConfig::getInstance().functionNamePrefix;
     for (const auto& func : windowNode_->windowFunctions()) {
@@ -1343,7 +1729,23 @@ RowVectorPtr CudfWindow::computeOutput() {
 
     if (baseName == "row_number" || baseName == "rank" ||
         baseName == "dense_rank") {
-      pendingRanks.emplace_back(funcIndex, baseName);
+      if (rankLikeStreaming_) {
+        auto localResult = baseName == "rank"
+            ? computeStreamingRankColumn(
+                  sortedView,
+                  outputType_->childAt(inputRowType_->size() + funcIndex),
+                  stream_,
+                  mr)
+            : computeStreamingRowNumberColumn(
+                  sortedView,
+                  outputType_->childAt(inputRowType_->size() + funcIndex),
+                  stream_,
+                  mr);
+        windowResultCols[funcIndex] = fixRankLikeColumn(
+            std::move(localResult), baseName, sortedView, stream_, mr);
+      } else {
+        pendingRanks.emplace_back(funcIndex, baseName);
+      }
     } else if (baseName == "lag" || baseName == "lead") {
       auto inputColIdx = resolveInputChannel(func, inputRowType_);
       VELOX_CHECK(
@@ -1438,6 +1840,10 @@ RowVectorPtr CudfWindow::computeOutput() {
       windowResultCols,
       stream_,
       mr);
+
+  if (rankLikeStreaming_) {
+    updateRankLikeState(sortedView, stream_, mr);
+  }
 
   if (!rangeRollingBatches.empty()) {
     ColumnOrView orderbyColHolder{cudf::column_view{}};
@@ -1549,6 +1955,10 @@ RowVectorPtr CudfWindow::computeNextSortedOutput() {
 }
 
 RowVectorPtr CudfWindow::doGetOutput() {
+  if (pendingOutput_) {
+    return std::exchange(pendingOutput_, nullptr);
+  }
+
   if (finished_ || !noMoreInput_) {
     return nullptr;
   }
@@ -1603,7 +2013,11 @@ void CudfWindow::doClose() {
     }
   }
   inputBatches_.clear();
+  pendingOutput_.reset();
   sortedData_.reset();
+  previousPartitionKey_.reset();
+  previousOrderKey_.reset();
+  hasRankLikeState_ = false;
   cleanupSpillFiles();
   if (streamAcquired_) {
     try {
