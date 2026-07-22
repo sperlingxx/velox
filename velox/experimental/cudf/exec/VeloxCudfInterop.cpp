@@ -167,6 +167,122 @@ void setArrowSchemaTypesForCudfImport(
   }
 }
 
+bool containsUnknownType(const TypePtr& type) {
+  if (type->kind() == TypeKind::UNKNOWN) {
+    return true;
+  }
+  for (size_t i = 0; i < type->size(); ++i) {
+    if (containsUnknownType(type->childAt(i))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+TypePtr physicalTypeForCudfImport(const TypePtr& type) {
+  if (!containsUnknownType(type)) {
+    return type;
+  }
+  switch (type->kind()) {
+    case TypeKind::UNKNOWN:
+      return TINYINT();
+    case TypeKind::ROW: {
+      const auto rowType = asRowType(type);
+      std::vector<TypePtr> children;
+      children.reserve(rowType->size());
+      for (size_t i = 0; i < rowType->size(); ++i) {
+        children.push_back(physicalTypeForCudfImport(rowType->childAt(i)));
+      }
+      return ROW(rowType->names(), std::move(children));
+    }
+    case TypeKind::ARRAY:
+      return ARRAY(physicalTypeForCudfImport(type->childAt(0)));
+    case TypeKind::MAP:
+      return MAP(
+          physicalTypeForCudfImport(type->childAt(0)),
+          physicalTypeForCudfImport(type->childAt(1)));
+    default:
+      VELOX_UNREACHABLE(
+          "Type {} reported an UNKNOWN child but is not complex", type);
+  }
+}
+
+// Arrow's null type imports into cuDF as an EMPTY column. EMPTY is useful as
+// an Arrow placeholder, but cuDF operators such as gather and hash join cannot
+// dispatch it. Convert logical Velox UNKNOWN vectors to all-null INT8 transport
+// vectors before Arrow export. The reverse conversion in restoreLogicalTypes()
+// restores the requested UNKNOWN schema when data returns to Velox.
+VectorPtr prepareLogicalTypesForCudfImport(
+    const VectorPtr& vector,
+    memory::MemoryPool* pool) {
+  VELOX_CHECK_NOT_NULL(vector);
+  const auto& type = vector->type();
+  if (!containsUnknownType(type)) {
+    return vector;
+  }
+
+  if (type->kind() == TypeKind::UNKNOWN) {
+    for (vector_size_t i = 0; i < vector->size(); ++i) {
+      VELOX_CHECK(
+          vector->isNullAt(i),
+          "Cannot encode UNKNOWN non-null value for cuDF at row {}",
+          i);
+    }
+    return BaseVector::createNullConstant(TINYINT(), vector->size(), pool);
+  }
+
+  switch (type->kind()) {
+    case TypeKind::ROW: {
+      const auto row = std::dynamic_pointer_cast<RowVector>(vector);
+      VELOX_CHECK_NOT_NULL(row);
+      std::vector<VectorPtr> children;
+      children.reserve(row->childrenSize());
+      for (size_t i = 0; i < row->childrenSize(); ++i) {
+        children.push_back(
+            prepareLogicalTypesForCudfImport(row->childAt(i), pool));
+      }
+      return std::make_shared<RowVector>(
+          pool,
+          physicalTypeForCudfImport(type),
+          row->nulls(),
+          row->size(),
+          std::move(children),
+          row->getNullCount());
+    }
+    case TypeKind::ARRAY: {
+      const auto array = std::dynamic_pointer_cast<ArrayVector>(vector);
+      VELOX_CHECK_NOT_NULL(array);
+      return std::make_shared<ArrayVector>(
+          pool,
+          physicalTypeForCudfImport(type),
+          array->nulls(),
+          array->size(),
+          array->offsets(),
+          array->sizes(),
+          prepareLogicalTypesForCudfImport(array->elements(), pool),
+          array->getNullCount());
+    }
+    case TypeKind::MAP: {
+      const auto map = std::dynamic_pointer_cast<MapVector>(vector);
+      VELOX_CHECK_NOT_NULL(map);
+      return std::make_shared<MapVector>(
+          pool,
+          physicalTypeForCudfImport(type),
+          map->nulls(),
+          map->size(),
+          map->offsets(),
+          map->sizes(),
+          prepareLogicalTypesForCudfImport(map->mapKeys(), pool),
+          prepareLogicalTypesForCudfImport(map->mapValues(), pool),
+          map->getNullCount(),
+          map->hasSortedKeys());
+    }
+    default:
+      VELOX_UNREACHABLE(
+          "Type {} reported an UNKNOWN child but is not complex", type);
+  }
+}
+
 } // namespace
 
 std::unique_ptr<cudf::table> toCudfTable(
@@ -202,13 +318,8 @@ std::unique_ptr<cudf::table> toCudfTable(
       .timestampTimeZone = timestampTimeZone,
       .exportVarbinaryAsString = true,
       .useDecimalTypeWidth = true};
-  auto exportVector =
-      std::static_pointer_cast<BaseVector>(std::make_shared<RowVector>(
-          veloxTable->pool(),
-          veloxTable->type(),
-          veloxTable->nulls(),
-          veloxTable->size(),
-          veloxTable->children()));
+  auto exportVector = std::static_pointer_cast<BaseVector>(
+      prepareLogicalTypesForCudfImport(veloxTable, pool));
   BaseVector::flattenVector(exportVector);
   ArrowArray arrowArray;
   exportToArrow(exportVector, arrowArray, pool, arrowOptions);
@@ -288,6 +399,114 @@ void setArrowSchemaTypesFromVelox(ArrowSchema* schema, const TypePtr& type) {
   }
 }
 
+// cuDF has no physical representation for Velox's UNKNOWN type. Producers use
+// an all-null INT8 column as the transport representation. Arrow therefore
+// imports that column as TINYINT, which makes RowVector::setType fail before it
+// can restore the requested logical schema. Rebuild the complex-vector path and
+// replace these placeholders with real UNKNOWN null constants first.
+VectorPtr restoreLogicalTypes(
+    const VectorPtr& vector,
+    const TypePtr& type,
+    memory::MemoryPool* pool) {
+  VELOX_CHECK_NOT_NULL(vector);
+  VELOX_CHECK_NOT_NULL(type);
+
+  if (type->kind() == TypeKind::UNKNOWN) {
+    for (vector_size_t i = 0; i < vector->size(); ++i) {
+      VELOX_CHECK(
+          vector->isNullAt(i),
+          "Cannot restore UNKNOWN from a non-null physical value at row {}",
+          i);
+    }
+    return BaseVector::createNullConstant(type, vector->size(), pool);
+  }
+
+  switch (type->kind()) {
+    case TypeKind::ROW: {
+      auto row = std::dynamic_pointer_cast<RowVector>(vector);
+      VELOX_CHECK_NOT_NULL(
+          row,
+          "Expected ROW physical vector for logical type {}, got {}",
+          type,
+          vector->type());
+      VELOX_CHECK_EQ(row->childrenSize(), type->size());
+      std::vector<VectorPtr> children;
+      children.reserve(type->size());
+      for (size_t i = 0; i < type->size(); ++i) {
+        children.push_back(
+            restoreLogicalTypes(row->childAt(i), type->childAt(i), pool));
+      }
+      return std::make_shared<RowVector>(
+          pool,
+          type,
+          row->nulls(),
+          row->size(),
+          std::move(children),
+          row->getNullCount());
+    }
+    case TypeKind::ARRAY: {
+      auto array = std::dynamic_pointer_cast<ArrayVector>(vector);
+      VELOX_CHECK_NOT_NULL(
+          array,
+          "Expected ARRAY physical vector for logical type {}, got {}",
+          type,
+          vector->type());
+      return std::make_shared<ArrayVector>(
+          pool,
+          type,
+          array->nulls(),
+          array->size(),
+          array->offsets(),
+          array->sizes(),
+          restoreLogicalTypes(array->elements(), type->childAt(0), pool),
+          array->getNullCount());
+    }
+    case TypeKind::MAP: {
+      auto map = std::dynamic_pointer_cast<MapVector>(vector);
+      VELOX_CHECK_NOT_NULL(
+          map,
+          "Expected MAP physical vector for logical type {}, got {}",
+          type,
+          vector->type());
+      return std::make_shared<MapVector>(
+          pool,
+          type,
+          map->nulls(),
+          map->size(),
+          map->offsets(),
+          map->sizes(),
+          restoreLogicalTypes(map->mapKeys(), type->childAt(0), pool),
+          restoreLogicalTypes(map->mapValues(), type->childAt(1), pool),
+          map->getNullCount(),
+          map->hasSortedKeys());
+    }
+    default:
+      // An untyped NULL can acquire a concrete logical type after Spark/Velox
+      // type coercion without adding a physical cuDF cast.  Its transport
+      // column is still all-null INT8.  Rebuild such columns with the requested
+      // logical type; never reinterpret a non-null physical value.
+      if (!vector->type()->kindEquals(type)) {
+        for (vector_size_t i = 0; i < vector->size(); ++i) {
+          VELOX_CHECK(
+              vector->isNullAt(i),
+              "Cannot restore logical type {} from physical type {} with a "
+              "non-null value at row {}",
+              type,
+              vector->type(),
+              i);
+        }
+        return BaseVector::createNullConstant(type, vector->size(), pool);
+      }
+      VELOX_CHECK(
+          vector->type()->kindEquals(type),
+          "Cannot restore logical type {} from physical type {}",
+          type,
+          vector->type());
+      vector->setType(type);
+      return vector;
+  }
+}
+
 RowVectorPtr toVeloxColumn(
     const cudf::table_view& table,
     memory::MemoryPool* pool,
@@ -325,6 +544,9 @@ RowVectorPtr toVeloxColumn(
   }
 
   auto veloxTable = importFromArrowAsOwner(schemaCopy, arrayCopy, pool);
+  if (outputType) {
+    veloxTable = restoreLogicalTypes(veloxTable, *outputType, pool);
+  }
 
   // BaseVector to RowVector
   auto castedPtr =

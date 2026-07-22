@@ -63,8 +63,9 @@ using namespace facebook::velox::exec::test;
 
 namespace {
 
-class CudfAggregationSelectionTest : public ::testing::Test,
-                                     public test::VectorTestBase {
+class CudfAggregationSelectionTest
+    : public ::testing::Test,
+      public facebook::velox::test::VectorTestBase {
  protected:
   static void SetUpTestCase() {
     memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});

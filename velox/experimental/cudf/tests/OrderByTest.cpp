@@ -29,6 +29,8 @@
 
 #include <fmt/format.h>
 
+#include <limits>
+
 using namespace facebook::velox;
 using namespace facebook::velox::exec;
 using namespace facebook::velox::exec::test;
@@ -261,6 +263,26 @@ TEST_F(OrderByTest, externalSpillSchemaEligibility) {
               .planNode());
   ASSERT_NE(safeNestedPayload, nullptr);
   EXPECT_TRUE(cudf_velox::CudfOrderBy::isSupported(safeNestedPayload));
+
+  const auto safeMapPayload =
+      std::dynamic_pointer_cast<const core::OrderByNode>(
+          PlanBuilder()
+              .tableScan(ROW(
+                  {"key", "payload"}, {INTEGER(), MAP(VARCHAR(), VARCHAR())}))
+              .orderBy({"key ASC NULLS LAST"}, false)
+              .planNode());
+  ASSERT_NE(safeMapPayload, nullptr);
+  EXPECT_TRUE(cudf_velox::CudfOrderBy::isSupported(safeMapPayload));
+
+  const auto unsupportedMapKey =
+      std::dynamic_pointer_cast<const core::OrderByNode>(
+          PlanBuilder()
+              .tableScan(ROW(
+                  {"key", "payload"}, {MAP(VARCHAR(), VARCHAR()), INTEGER()}))
+              .orderBy({"key ASC NULLS LAST"}, false)
+              .planNode());
+  ASSERT_NE(unsupportedMapKey, nullptr);
+  EXPECT_FALSE(cudf_velox::CudfOrderBy::isSupported(unsupportedMapKey));
 
   const auto unsupportedBinaryPayload =
       std::dynamic_pointer_cast<const core::OrderByNode>(
@@ -505,6 +527,71 @@ TEST_F(OrderByTest, boundedExternalSortManyRuns) {
       OrderByTestHelper::emittedChunks(),
       (kNumRuns * kRowsPerRun + kMaxOutputRows - 1) / kMaxOutputRows);
   EXPECT_EQ(OrderByTestHelper::spillCleanups(), 1);
+}
+
+TEST_F(OrderByTest, boundedExternalSortMapPayload) {
+  constexpr int32_t kNumRuns = 7;
+  constexpr vector_size_t kRowsPerRun = 31;
+  OrderByTestHelper::setMemoryLimits(1, 2048, 2048, 13);
+
+  std::vector<RowVectorPtr> vectors;
+  vectors.reserve(kNumRuns);
+  for (int32_t run = 0; run < kNumRuns; ++run) {
+    auto key = makeFlatVector<int64_t>(kRowsPerRun, [run](vector_size_t row) {
+      return run * kRowsPerRun + row;
+    });
+    auto map = makeMapVector<std::string, std::string>(
+        kRowsPerRun,
+        [](vector_size_t row) { return row % 4; },
+        [run](vector_size_t index) {
+          return fmt::format("key-{}-{}", run, index);
+        },
+        [run](vector_size_t index) {
+          return fmt::format("value-{}-{}", run, index);
+        },
+        [run](vector_size_t row) { return (run + row) % 17 == 0; },
+        [run](vector_size_t index) { return (run + index) % 11 == 0; });
+    vectors.push_back(makeRowVector({key, map}));
+  }
+  createDuckDbTable(vectors);
+
+  auto plan = PlanBuilder()
+                  .values(vectors)
+                  .orderBy({"c0 DESC NULLS LAST"}, false)
+                  .planNode();
+  assertQueryOrdered(
+      plan, "SELECT * FROM tmp ORDER BY c0 DESC NULLS LAST", {0});
+
+  EXPECT_GE(OrderByTestHelper::sourceChunks(), kNumRuns);
+  EXPECT_GT(OrderByTestHelper::mergeOutputBatches(), 0);
+  EXPECT_EQ(OrderByTestHelper::spillCleanups(), 1);
+}
+
+TEST_F(OrderByTest, inMemoryResultMovesWithoutChunkCopies) {
+  constexpr uint64_t kLargeByteLimit = 1ULL << 40;
+  OrderByTestHelper::setMemoryLimits(
+      kLargeByteLimit,
+      4096,
+      kLargeByteLimit,
+      std::numeric_limits<cudf::size_type>::max());
+
+  std::vector<RowVectorPtr> vectors;
+  for (int32_t batch = 0; batch < 4; ++batch) {
+    vectors.push_back(makeRowVector(
+        {makeFlatVector<int64_t>(1024, [batch](vector_size_t row) {
+          return 4096 - batch * 1024 - row;
+        })}));
+  }
+  createDuckDbTable(vectors);
+
+  auto plan = PlanBuilder()
+                  .values(vectors)
+                  .orderBy({"c0 ASC NULLS LAST"}, false)
+                  .planNode();
+  assertQueryOrdered(plan, "SELECT * FROM tmp ORDER BY c0", {0});
+
+  EXPECT_EQ(OrderByTestHelper::emittedChunks(), 1);
+  EXPECT_EQ(OrderByTestHelper::spillCleanups(), 0);
 }
 
 /// Verifies output batch rows of OrderBy

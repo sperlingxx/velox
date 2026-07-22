@@ -102,12 +102,15 @@ int64_t maxInFlightRecvHostBytes() {
 std::atomic<int64_t> inFlightRecvHostBytes{0};
 
 rmm::mr::statistics_resource_adaptor& receiveDeviceMemoryResource() {
-  // Keep UCX receive allocations on a synchronous, fresh cudaMalloc resource,
-  // but wrap it with RMM statistics so queued packed pages are visible in
-  // diagnostics even after ownership moves out of UcxExchangeSource.
+  // Allocate UCX receive pages from the same async resource as cuDF operators.
+  // A separate cuda_memory_resource cannot reuse blocks cached by the async
+  // pool and can therefore fail cudaMalloc while scan/aggregation has ample
+  // reusable memory in that pool. Keep a dedicated statistics adaptor so
+  // receive credit continues to account for packed pages after ownership moves
+  // out of UcxExchangeSource.
   static rmm::mr::statistics_resource_adaptor resource{
       cuda::mr::any_resource<cuda::mr::device_accessible>{
-          rmm::mr::cuda_memory_resource{}}};
+          rmm::mr::get_current_device_resource_ref()}};
   return resource;
 }
 
@@ -785,20 +788,48 @@ bool UcxExchangeSource::tryStartDataReceive(
   ptr->stream = stream;
 
   // UCX writes receive buffers from its progress thread, outside CUDA stream
-  // ordering. Keep these buffers on a dedicated synchronous resource so UCX
-  // can never write into a block that a stream-ordered pool has recycled while
-  // work on another stream is still in flight. This also avoids waiting on an
-  // unrelated compute stream in the single UCX progress thread.
-  //
-  // Only transports without CUDA support stage through host memory and use a
-  // fresh synchronous device allocation for the final copy.
-  try {
-    auto& recvMemoryResource = receiveDeviceMemoryResource();
+  // ordering. Allocate from the shared async pool, then synchronize this
+  // allocation stream before exposing the pointer to UCX. Receive completion
+  // transfers ownership to a packed table that retains the same stream, so
+  // downstream work and eventual deallocation remain stream ordered.
+  auto& recvMemoryResource = receiveDeviceMemoryResource();
+  const auto allocateReceiveBuffer = [&]() {
     ptr->dataBuf = std::make_unique<rmm::device_buffer>(
         ptr->metadata.dataSizeBytes,
         stream,
         cuda::mr::any_resource<cuda::mr::device_accessible>{
             recvMemoryResource});
+    CUDF_CUDA_TRY(cudaStreamSynchronize(stream.value()));
+  };
+  try {
+    allocateReceiveBuffer();
+  } catch (const rmm::bad_alloc& firstError) {
+    // On the allocation-failure slow path, wait for stream-ordered frees and
+    // let the shared async pool reclaim completed blocks, then retry once.
+    cudaGetLastError();
+    const auto syncStatus = cudaDeviceSynchronize();
+    if (syncStatus == cudaSuccess) {
+      try {
+        allocateReceiveBuffer();
+        LOG(WARNING)
+            << toString()
+            << " recovered UCX receive allocation after device synchronize: "
+            << ptr->metadata.dataSizeBytes
+            << " bytes; first error: " << firstError.what();
+      } catch (const rmm::bad_alloc& retryError) {
+        VLOG(0) << toString() << " *** RMM failed to allocate "
+                << ptr->metadata.dataSizeBytes
+                << " bytes after device synchronize retry: "
+                << retryError.what();
+      }
+    } else {
+      VLOG(0) << toString()
+              << " *** cudaDeviceSynchronize failed while recovering "
+                 "receive allocation: "
+              << cudaGetErrorString(syncStatus);
+    }
+  }
+  if (ptr->dataBuf != nullptr) {
     if (facebook::velox::cudf_velox::deviceMemoryDiagnosticsEnabled()) {
       constexpr int64_t kReportStep = 512LL << 20;
       const auto bytes = recvMemoryResource.get_bytes_counter();
@@ -836,10 +867,8 @@ bool UcxExchangeSource::tryStartDataReceive(
                 maxInFlightRecvBytes()));
       }
     }
-  } catch (const rmm::bad_alloc& e) {
+  } else {
     releaseReceiveReservation();
-    VLOG(0) << toString() << " *** RMM failed to allocate "
-            << ptr->metadata.dataSizeBytes << " bytes: " << e.what();
     queue_->setError("Failed to alloc GPU memory");
     deliverEndMarker();
     setState(ReceiverState::Done);

@@ -105,7 +105,8 @@ std::shared_ptr<Task> createPartitionedOutputTask(
     int numPartitions,
     const std::vector<std::string>& partitionKeys,
     uint64_t kMaxOutputBufferSize,
-    const std::unordered_map<std::string, std::string>& extraConfig) {
+    const std::unordered_map<std::string, std::string>& extraConfig,
+    core::PartitionFunctionSpecPtr partitionFunctionSpec) {
   VLOG(3) << "Creating PartitionedOutput task with " << numPartitions
           << " partitions";
 
@@ -127,6 +128,15 @@ std::shared_ptr<Task> createPartitionedOutputTask(
                           .values({rowVector})
                           .partitionedOutput(partitionKeys, numPartitions)
                           .planFragment();
+  if (partitionFunctionSpec) {
+    auto output = std::dynamic_pointer_cast<const core::PartitionedOutputNode>(
+        planFragment.planNode);
+    VELOX_CHECK_NOT_NULL(output);
+    planFragment.planNode =
+        core::PartitionedOutputNode::Builder(*output)
+            .partitionFunctionSpec(std::move(partitionFunctionSpec))
+            .build();
+  }
 
   std::shared_ptr<folly::Executor> executor(
       std::make_shared<folly::CPUThreadPoolExecutor>(

@@ -23,6 +23,7 @@
 #include "velox/exec/Operator.h"
 
 #include <queue>
+#include <string>
 
 namespace facebook::velox::cudf_velox {
 
@@ -33,10 +34,28 @@ class CudfBatchConcat : public CudfOperatorBase {
       exec::DriverCtx* driverCtx,
       std::shared_ptr<const core::PlanNode> planNode);
 
-  bool needsInput() const override {
-    return !noMoreInput_ && outputQueue_.empty() &&
-        currentNumRows_ < targetRows_;
-  }
+  CudfBatchConcat(
+      int32_t operatorId,
+      exec::DriverCtx* driverCtx,
+      std::shared_ptr<const core::PlanNode> planNode,
+      RowTypePtr outputType);
+
+  CudfBatchConcat(
+      int32_t operatorId,
+      exec::DriverCtx* driverCtx,
+      std::shared_ptr<const core::PlanNode> planNode,
+      RowTypePtr outputType,
+      int32_t targetRows);
+
+  CudfBatchConcat(
+      int32_t operatorId,
+      exec::DriverCtx* driverCtx,
+      std::shared_ptr<const core::PlanNode> planNode,
+      RowTypePtr outputType,
+      int32_t targetRows,
+      uint64_t targetBytes);
+
+  bool needsInput() const override;
 
   exec::BlockingReason isBlocked(ContinueFuture* /*future*/) override {
     return exec::BlockingReason::kNotBlocked;
@@ -50,10 +69,18 @@ class CudfBatchConcat : public CudfOperatorBase {
 
  private:
   exec::DriverCtx* const driverCtx_;
+  const std::string aggregationStep_;
   std::vector<CudfVectorPtr> buffer_;
   std::queue<CudfVectorPtr> outputQueue_;
+  uint64_t totalInputRows_{0};
+  uint64_t totalInputBytes_{0};
+  uint64_t inputBatches_{0};
+  uint64_t outputBatches_{0};
   size_t currentNumRows_{0};
+  uint64_t currentNumBytes_{0};
   const size_t targetRows_{0};
+  const uint64_t targetBytes_{0};
+  bool summaryLogged_{false};
 };
 
 } // namespace facebook::velox::cudf_velox

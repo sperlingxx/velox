@@ -1325,6 +1325,20 @@ class ExchangeAdapter : public OperatorAdapter {
     result.push_back(
         std::make_unique<ucx_exchange::UcxExchange>(
             operatorId, ctx, planNode, client));
+    if (CudfConfig::getInstance().concatOptimizationEnabled &&
+        CudfConfig::getInstance().exchangeConcatOptimizationEnabled) {
+      result.push_back(
+          std::make_unique<CudfBatchConcat>(
+              operatorId,
+              ctx,
+              planNode,
+              planNode->outputType(),
+              CudfConfig::getInstance().exchangeBatchSizeMinThreshold,
+              ctx->queryConfig().get<uint64_t>(
+                  CudfConfig::kCudfExchangeBatchSizeMinThresholdBytes,
+                  CudfConfig::getInstance()
+                      .exchangeBatchSizeMinThresholdBytes)));
+    }
     return result;
   }
 

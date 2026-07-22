@@ -15,6 +15,7 @@
  */
 
 #include "velox/exec/Task.h"
+#include <folly/ScopeGuard.h>
 #include "folly/synchronization/EventCount.h"
 #include "velox/common/base/tests/GTestUtils.h"
 #include "velox/common/file/tests/FaultyFileSystem.h"
@@ -565,6 +566,174 @@ class TaskTest : public HiveConnectorTestBase {
     return {task, results};
   }
 };
+
+namespace {
+
+struct TestOutputManagerState {
+  std::atomic_int supportsCalls{0};
+  std::atomic_int initializeCalls{0};
+  std::atomic_int updateBuffersCalls{0};
+  std::atomic_int updateDriversCalls{0};
+  std::atomic_int statsCalls{0};
+  std::atomic_int removeCalls{0};
+  std::atomic_int initialDrivers{0};
+  std::atomic_int lastDrivers{0};
+  std::atomic_int lastBuffers{0};
+  std::atomic_int sequence{0};
+  std::atomic_int statsSequence{0};
+  std::atomic_int removeSequence{0};
+  std::atomic_bool noMoreBuffers{false};
+};
+
+class TestOutputManager final : public PartitionedOutputBufferManager {
+ public:
+  explicit TestOutputManager(std::shared_ptr<TestOutputManagerState> state)
+      : state_(std::move(state)) {}
+
+  bool supports(const core::PartitionedOutputNode&, const core::QueryConfig&)
+      const override {
+    ++state_->supportsCalls;
+    return true;
+  }
+
+  void initializeTask(
+      std::shared_ptr<Task>,
+      core::PartitionedOutputNode::Kind,
+      int,
+      int numOutputDrivers) override {
+    ++state_->initializeCalls;
+    state_->initialDrivers = numOutputDrivers;
+  }
+
+  void updateOutputBuffers(
+      const std::string&,
+      int numBuffers,
+      bool noMoreBuffers) override {
+    ++state_->updateBuffersCalls;
+    state_->lastBuffers = numBuffers;
+    state_->noMoreBuffers = noMoreBuffers;
+  }
+
+  void updateNumDrivers(const std::string&, uint32_t numOutputDrivers)
+      override {
+    ++state_->updateDriversCalls;
+    state_->lastDrivers = numOutputDrivers;
+  }
+
+  std::optional<OutputBuffer::Stats> stats(const std::string&) override {
+    ++state_->statsCalls;
+    state_->statsSequence = ++state_->sequence;
+    return OutputBuffer::Stats(
+        core::PartitionedOutputNode::Kind::kBroadcast,
+        true,
+        true,
+        true,
+        0,
+        0,
+        123,
+        456,
+        7,
+        0,
+        0,
+        {});
+  }
+
+  void removeTask(const std::string&) override {
+    ++state_->removeCalls;
+    state_->removeSequence = ++state_->sequence;
+  }
+
+ private:
+  const std::shared_ptr<TestOutputManagerState> state_;
+};
+
+} // namespace
+
+TEST_F(TaskTest, partitionedOutputManagerLifecycle) {
+  auto state = std::make_shared<TestOutputManagerState>();
+  auto manager = std::make_shared<TestOutputManager>(state);
+  ASSERT_TRUE(registerPartitionedOutputBufferManager(manager));
+  ASSERT_FALSE(registerPartitionedOutputBufferManager(manager));
+  auto unregister = folly::makeGuard(
+      [&]() { unregisterPartitionedOutputBufferManager(manager); });
+
+  auto plan = PlanBuilder()
+                  .tableScan(ROW({"c0"}, {BIGINT()}))
+                  .partitionedOutputBroadcast()
+                  .planFragment();
+  auto task = Task::create(
+      "partitioned-output-manager-lifecycle",
+      std::move(plan),
+      0,
+      core::QueryCtx::create(driverExecutor_.get()),
+      Task::ExecutionMode::kParallel,
+      Consumer{});
+  task->start(2, 1);
+
+  EXPECT_EQ(state->supportsCalls, 1);
+  EXPECT_EQ(state->initializeCalls, 1);
+  EXPECT_EQ(state->initialDrivers, 2);
+  EXPECT_TRUE(task->updateOutputBuffers(3, true));
+  EXPECT_EQ(state->updateBuffersCalls, 1);
+  EXPECT_EQ(state->lastBuffers, 3);
+  EXPECT_TRUE(state->noMoreBuffers);
+
+  task->requestAbort().wait();
+  EXPECT_EQ(state->statsCalls, 1);
+  EXPECT_EQ(state->removeCalls, 1);
+  EXPECT_LT(state->statsSequence, state->removeSequence);
+  const auto stats = task->taskStats().outputBufferStats;
+  ASSERT_TRUE(stats.has_value());
+  EXPECT_EQ(stats->totalBytesSent, 123);
+  EXPECT_EQ(stats->totalRowsSent, 456);
+  EXPECT_EQ(stats->totalPagesSent, 7);
+
+  task->requestAbort().wait();
+  EXPECT_EQ(state->removeCalls, 1);
+  EXPECT_TRUE(unregisterPartitionedOutputBufferManager(manager));
+  unregister.dismiss();
+  EXPECT_FALSE(unregisterPartitionedOutputBufferManager(manager));
+}
+
+TEST_F(TaskTest, groupedPartitionedOutputUpdatesManagerDriverCount) {
+  auto state = std::make_shared<TestOutputManagerState>();
+  auto manager = std::make_shared<TestOutputManager>(state);
+  ASSERT_TRUE(registerPartitionedOutputBufferManager(manager));
+  auto unregister = folly::makeGuard(
+      [&]() { unregisterPartitionedOutputBufferManager(manager); });
+
+  auto data = makeRowVector({makeFlatVector<int64_t>({1})});
+  auto file = TempFilePath::create();
+  writeToFile(file->getPath(), data);
+
+  core::PlanNodeId scanNodeId;
+  auto plan = PlanBuilder()
+                  .tableScan(asRowType(data->type()))
+                  .capturePlanNodeId(scanNodeId)
+                  .partitionedOutput({}, 1)
+                  .planFragment();
+  plan.executionStrategy = core::ExecutionStrategy::kGrouped;
+  plan.groupedExecutionLeafNodeIds.emplace(scanNodeId);
+  plan.numSplitGroups = 4;
+  auto task = Task::create(
+      "grouped-partitioned-output-manager",
+      std::move(plan),
+      0,
+      core::QueryCtx::create(driverExecutor_.get()),
+      Task::ExecutionMode::kParallel,
+      Consumer{});
+  task->start(2, 1);
+  EXPECT_EQ(state->initialDrivers, 8);
+
+  task->addSplit(
+      scanNodeId, exec::Split(makeHiveConnectorSplit(file->getPath()), 3));
+  task->noMoreSplitsForGroup(scanNodeId, 3);
+  task->noMoreSplits(scanNodeId);
+
+  EXPECT_GE(state->updateDriversCalls, 1);
+  EXPECT_EQ(state->lastDrivers, 2);
+  task->requestAbort().wait();
+}
 
 TEST_F(TaskTest, toJson) {
   auto plan = PlanBuilder()

@@ -31,9 +31,21 @@
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/resource_ref.hpp>
 
+#include <algorithm>
 #include <vector>
 
 namespace facebook::velox::cudf_velox::connector::hive {
+
+constexpr std::size_t kDefaultMultiFileChunkReadLimit = 256UL << 20;
+
+inline std::size_t multiFileChunkReadLimit(
+    std::size_t configuredLimit,
+    std::size_t batchTarget) {
+  if (configuredLimit > 0) {
+    return configuredLimit;
+  }
+  return std::max(batchTarget, kDefaultMultiFileChunkReadLimit);
+}
 
 // ---------------- Internal helper ----------------
 // A cudf::io::datasource that serves bytes via Velox BufferedInput so that

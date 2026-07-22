@@ -14,9 +14,13 @@
  * limitations under the License.
  */
 
+#include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 
 #include "velox/vector/tests/utils/VectorTestBase.h"
+
+#include <cudf/copying.hpp>
+#include <cudf/filling.hpp>
 
 using namespace facebook::velox;
 using namespace facebook::velox::test;
@@ -220,6 +224,123 @@ TEST_F(InteropTest, emptyBoolean) {
 TEST_F(InteropTest, emptyDouble) {
   auto input = makeRowVector({"c0"}, {makeFlatVector<double>({})});
   roundTrip(input);
+}
+
+TEST_F(InteropTest, emptyStructWithUntypedNullField) {
+  auto stream = cudf::get_default_stream();
+  auto mr = cudf::get_current_device_resource_ref();
+  auto type =
+      ROW({"payload"}, {ROW({"value", "missing"}, {BIGINT(), UNKNOWN()})});
+  std::vector<CudfVectorPtr> inputs;
+
+  auto table = getConcatenatedTable(std::move(inputs), type, stream, mr);
+
+  ASSERT_EQ(table->num_rows(), 0);
+  ASSERT_EQ(table->num_columns(), 1);
+  const auto payload = table->view().column(0);
+  ASSERT_EQ(payload.type().id(), cudf::type_id::STRUCT);
+  ASSERT_EQ(payload.num_children(), 2);
+  EXPECT_EQ(payload.child(0).type().id(), cudf::type_id::INT64);
+  EXPECT_EQ(payload.child(1).type().id(), cudf::type_id::INT8);
+}
+
+TEST_F(InteropTest, restoresNestedUntypedNullAfterCudfRoundTrip) {
+  auto stream = cudf::get_default_stream();
+  auto mr = cudf::get_current_device_resource_ref();
+  auto physicalInput = makeRowVector(
+      {"payload"},
+      {makeRowVector(
+          {"value", "missing"},
+          {makeFlatVector<int64_t>({11, 22, 33}),
+           makeNullableFlatVector<int8_t>(
+               {std::nullopt, std::nullopt, std::nullopt})})});
+  auto logicalType =
+      ROW({"payload"}, {ROW({"value", "missing"}, {BIGINT(), UNKNOWN()})});
+
+  auto table = cudf_velox::with_arrow::toCudfTable(
+      physicalInput, pool_.get(), stream, mr);
+  auto result = cudf_velox::with_arrow::toVeloxColumn(
+      table->view(), pool_.get(), logicalType, stream, mr);
+  stream.synchronize();
+
+  ASSERT_TRUE(logicalType->equivalent(*result->type()));
+  auto payload = result->childAt(0)->as<RowVector>();
+  ASSERT_EQ(payload->childAt(1)->typeKind(), TypeKind::UNKNOWN);
+  ASSERT_EQ(payload->childAt(1)->size(), 3);
+  for (vector_size_t i = 0; i < payload->childAt(1)->size(); ++i) {
+    EXPECT_TRUE(payload->childAt(1)->isNullAt(i));
+  }
+  test::assertEqualVectors(
+      physicalInput->childAt(0)->as<RowVector>()->childAt(0),
+      payload->childAt(0));
+}
+
+TEST_F(InteropTest, transportsNestedUntypedNullThroughCudfGather) {
+  auto stream = cudf::get_default_stream();
+  auto mr = cudf::get_current_device_resource_ref();
+  auto payloadType = ROW({"value", "missing"}, {BIGINT(), UNKNOWN()});
+  auto payload = std::make_shared<RowVector>(
+      pool_.get(),
+      payloadType,
+      nullptr,
+      3,
+      std::vector<VectorPtr>{
+          makeFlatVector<int64_t>({11, 22, 33}),
+          BaseVector::createNullConstant(UNKNOWN(), 3, pool_.get())});
+  auto input = makeRowVector({"payload"}, {payload});
+
+  auto table =
+      cudf_velox::with_arrow::toCudfTable(input, pool_.get(), stream, mr);
+  const auto payloadView = table->view().column(0);
+  ASSERT_EQ(payloadView.type().id(), cudf::type_id::STRUCT);
+  ASSERT_EQ(payloadView.num_children(), 2);
+  EXPECT_EQ(payloadView.child(1).type().id(), cudf::type_id::INT8);
+  EXPECT_EQ(payloadView.child(1).null_count(), 3);
+
+  cudf::numeric_scalar<cudf::size_type> start(0, true, stream, mr);
+  cudf::numeric_scalar<cudf::size_type> step(1, true, stream, mr);
+  auto indices = cudf::sequence(3, start, step, stream, mr);
+  auto gathered = cudf::gather(
+      table->view(),
+      indices->view(),
+      cudf::out_of_bounds_policy::DONT_CHECK,
+      stream,
+      mr);
+  auto result = cudf_velox::with_arrow::toVeloxColumn(
+      gathered->view(), pool_.get(), input->type(), stream, mr);
+  stream.synchronize();
+
+  test::assertEqualVectors(input, result);
+}
+
+TEST_F(InteropTest, restoresTypedNullAfterUntypedTransport) {
+  auto stream = cudf::get_default_stream();
+  auto mr = cudf::get_current_device_resource_ref();
+  auto physicalInput = makeRowVector(
+      {"payload"},
+      {makeRowVector(
+          {"value", "missing"},
+          {makeFlatVector<int64_t>({11, 22, 33}),
+           makeNullableFlatVector<int8_t>(
+               {std::nullopt, std::nullopt, std::nullopt})})});
+  auto logicalType =
+      ROW({"payload"}, {ROW({"value", "missing"}, {BIGINT(), VARCHAR()})});
+
+  auto table = cudf_velox::with_arrow::toCudfTable(
+      physicalInput, pool_.get(), stream, mr);
+  auto result = cudf_velox::with_arrow::toVeloxColumn(
+      table->view(), pool_.get(), logicalType, stream, mr);
+  stream.synchronize();
+
+  ASSERT_TRUE(logicalType->equivalent(*result->type()));
+  const auto payload = result->childAt(0)->as<RowVector>();
+  test::assertEqualVectors(
+      physicalInput->childAt(0)->as<RowVector>()->childAt(0),
+      payload->childAt(0));
+  ASSERT_EQ(payload->childAt(1)->typeKind(), TypeKind::VARCHAR);
+  for (vector_size_t i = 0; i < payload->childAt(1)->size(); ++i) {
+    EXPECT_TRUE(payload->childAt(1)->isNullAt(i));
+  }
 }
 
 TEST_F(InteropTest, emptyTimestamp) {

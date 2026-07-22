@@ -25,6 +25,7 @@
 #include "velox/connectors/hive/iceberg/IcebergSplit.h"
 #include "velox/connectors/hive/iceberg/PositionalDeleteFileReader.h"
 
+#include <deque>
 #include <list>
 #include <optional>
 #include <string>
@@ -106,6 +107,15 @@ class CudfIcebergSplitReader : public CudfSplitReader {
   // Read metadata and cache `fileRowCount_` and `fileColumnNames_`
   void cacheSchemaFromMetadata();
 
+  // Prepare the current physical split. Schema-evolved files that cannot
+  // share one cuDF reader are queued and prepared one at a time.
+  void prepareCurrentSplit(
+      dwio::common::RuntimeStatistics& runtimeStats,
+      bool countProcessedSplit);
+
+  // Advance to the next single-file fallback split, if any.
+  bool prepareNextFallbackSplit();
+
   // Adapts the data file schema to match the table schema expected by the
   // query. Classifies each output and filter-only column into one of:
   //
@@ -166,6 +176,10 @@ class CudfIcebergSplitReader : public CudfSplitReader {
   // are expanded into nested parquet selector paths.
   std::vector<std::string> logicalReadColumnNames_;
   std::vector<std::string> outputReadColumnNames_;
+  std::vector<std::string> initialReadColumnNames_;
+
+  std::deque<std::shared_ptr<CudfHiveConnectorSplit>> fallbackSplits_;
+  dwio::common::RuntimeStatistics* runtimeStats_{nullptr};
 
   // cuDF-accelerated reader for Iceberg V3 deletion vector (Puffin-encoded
   // roaring bitmaps).

@@ -72,7 +72,8 @@ HiveIcebergSplit::HiveIcebergSplit(
     std::vector<IcebergDeleteFile> deletes,
     const std::unordered_map<std::string, std::string>& infoColumns,
     std::optional<FileProperties> properties,
-    int64_t dataSequenceNumber)
+    int64_t dataSequenceNumber,
+    std::vector<IcebergCoalescedFile> coalescedFiles)
     : HiveConnectorSplit(
           connectorId,
           filePath,
@@ -91,6 +92,7 @@ HiveIcebergSplit::HiveIcebergSplit(
           std::nullopt,
           std::nullopt),
       deleteFiles(std::move(deletes)),
+      coalescedFiles(std::move(coalescedFiles)),
       dataSequenceNumber(dataSequenceNumber) {}
 
 std::shared_ptr<HiveIcebergSplit> IcebergSplitBuilder::build() const {

@@ -35,7 +35,8 @@ std::string stripFilePrefix(const std::string& targetPath) {
 } // namespace
 
 std::string CudfHiveConnectorSplit::toString() const {
-  return fmt::format("CudfHive: {}", filePath);
+  return fmt::format(
+      "CudfHive: {} ({} files)", filePath, 1 + coalescedFiles.size());
 }
 
 std::string CudfHiveConnectorSplit::getFileName() const {
@@ -44,7 +45,14 @@ std::string CudfHiveConnectorSplit::getFileName() const {
 }
 
 uint64_t CudfHiveConnectorSplit::size() const {
-  return length;
+  if (length == std::numeric_limits<uint64_t>::max()) {
+    return length;
+  }
+  uint64_t total = length;
+  for (const auto& file : coalescedFiles) {
+    total += file.length;
+  }
+  return total;
 }
 
 CudfHiveConnectorSplit::CudfHiveConnectorSplit(
@@ -53,13 +61,15 @@ CudfHiveConnectorSplit::CudfHiveConnectorSplit(
     uint64_t _start,
     uint64_t _length,
     int64_t _splitWeight,
-    const std::unordered_map<std::string, std::string>& _infoColumns)
+    const std::unordered_map<std::string, std::string>& _infoColumns,
+    std::vector<CudfCoalescedFile> _coalescedFiles)
     : facebook::velox::connector::ConnectorSplit(connectorId, _splitWeight),
       filePath(stripFilePrefix(_filePath)),
       start(_start),
       length(_length),
       cudfSourceInfo(std::make_unique<cudf::io::source_info>(filePath)),
-      infoColumns(_infoColumns) {}
+      infoColumns(_infoColumns),
+      coalescedFiles(std::move(_coalescedFiles)) {}
 
 // static
 std::shared_ptr<CudfHiveConnectorSplit> CudfHiveConnectorSplit::create(
@@ -75,8 +85,23 @@ std::shared_ptr<CudfHiveConnectorSplit> CudfHiveConnectorSplit::create(
     infoColumns[key.asString()] = value.asString();
   }
 
+  std::vector<CudfCoalescedFile> coalescedFiles;
+  if (obj.count("coalescedFiles")) {
+    for (const auto& file : obj["coalescedFiles"]) {
+      coalescedFiles.push_back(
+          {file["filePath"].asString(),
+           static_cast<uint64_t>(file["length"].asInt())});
+    }
+  }
+
   return std::make_shared<CudfHiveConnectorSplit>(
-      connectorId, filePath, start, length, splitWeight, infoColumns);
+      connectorId,
+      filePath,
+      start,
+      length,
+      splitWeight,
+      infoColumns,
+      std::move(coalescedFiles));
 }
 
 folly::dynamic CudfHiveConnectorSplit::serialize() const {
@@ -92,6 +117,14 @@ folly::dynamic CudfHiveConnectorSplit::serialize() const {
     infoColumnsObj[key] = value;
   }
   obj["infoColumns"] = infoColumnsObj;
+
+  folly::dynamic coalescedFilesObj = folly::dynamic::array;
+  for (const auto& file : coalescedFiles) {
+    coalescedFilesObj.push_back(
+        folly::dynamic::object("filePath", file.filePath)(
+            "length", static_cast<int64_t>(file.length)));
+  }
+  obj["coalescedFiles"] = std::move(coalescedFilesObj);
 
   return obj;
 }

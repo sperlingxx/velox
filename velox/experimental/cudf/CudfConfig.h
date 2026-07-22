@@ -45,6 +45,12 @@ struct CudfConfig {
   static constexpr const char* kCudfLogFallback{"cudf.log_fallback"};
   static constexpr const char* kCudfBatchSizeMinThreshold{
       "cudf.batch_size_min_threshold"};
+  static constexpr const char* kCudfExchangeBatchSizeMinThreshold{
+      "cudf.exchange_batch_size_min_threshold"};
+  static constexpr const char* kCudfExchangeBatchSizeMinThresholdBytes{
+      "cudf.exchange_batch_size_min_threshold_bytes"};
+  static constexpr const char* kCudfBatchSizeMinThresholdBytes{
+      "cudf.batch_size_min_threshold_bytes"};
   static constexpr const char* kCudfBatchSizeMaxThreshold{
       "cudf.batch_size_max_threshold"};
   static constexpr const char* kCudfConcatOptimizationEnabled{
@@ -57,6 +63,12 @@ struct CudfConfig {
       "cudf.order_by_merge_fan_in"};
   static constexpr const char* kCudfWindowSortedRunBytes{
       "cudf.window.sorted_run_bytes"};
+  static constexpr const char* kCudfOrderByOutputChunkBytes{
+      "cudf.order_by_output_chunk_bytes"};
+  static constexpr const char* kCudfOrderByMaxOutputRows{
+      "cudf.order_by_max_output_rows"};
+  static constexpr const char* kCudfExchangeConcatOptimizationEnabled{
+      "cudf.exchange_concat_optimization_enabled"};
   static constexpr const char* kCudfTimestampUnit{"cudf.timestamp_unit"};
   // The value could be either spark or presto.
   static constexpr const char* kCudfFunctionEngine{"cudf.function_engine"};
@@ -105,7 +117,7 @@ struct CudfConfig {
   std::string memoryResource{"async"};
 
   /// The initial percent of GPU memory to allocate for pool or arena memory
-  /// resources.
+  /// resources, and the retained-memory release threshold for async.
   int32_t memoryPercent{50};
 
   /// Memory resource for output vectors. When set to a value different from
@@ -140,8 +152,7 @@ struct CudfConfig {
   /// Whether to log a reason for falling back to Velox CPU execution.
   bool logFallback{true};
 
-  /// Whether to insert CudfBatchConcat operators before supported Cudf
-  /// operators.
+  /// Whether to insert CudfBatchConcat before supported Cudf operators.
   /// This can improve performance by reducing the number of cuda kernel
   /// launches on addInput of certain operators by collecting a minimum number
   /// of rows before concatenating and passing on to the next operator.
@@ -165,9 +176,27 @@ struct CudfConfig {
   /// independently sorted run.
   uint64_t windowSortedRunBytes{3ULL << 30};
 
+  /// Maximum bytes and rows returned by one OrderBy output batch.
+  uint64_t orderByOutputChunkBytes{32ULL << 20};
+  int32_t orderByMaxOutputRows{262144};
+
   /// Minimum rows to accumulate before GPU-side concatenation in
   /// `CudfBatchConcat` (default 100k).
   int32_t batchSizeMinThreshold{100000};
+
+  /// Target rows for CudfBatchConcat immediately after a UCX Exchange. Keep
+  /// this below the aggregation target because a fragment can buffer several
+  /// inbound exchanges concurrently while its join builds are still live.
+  int32_t exchangeBatchSizeMinThreshold{32000000};
+
+  /// Target bytes to accumulate immediately after a UCX Exchange. Zero
+  /// disables the exchange-specific byte threshold.
+  uint64_t exchangeBatchSizeMinThresholdBytes{0};
+
+  /// Target bytes to accumulate before GPU-side concatenation. Zero disables
+  /// the byte threshold. When both row and byte thresholds are configured,
+  /// reaching either one flushes the batch.
+  uint64_t batchSizeMinThresholdBytes{0};
 
   /// Maximum rows allowed in a concatenated batch (user configurable).
   /// When not set, cuDF's own `size_type::max()` is used.
@@ -195,6 +224,12 @@ struct CudfConfig {
 
   /// VLOG level for ucx-exchange source files.
   int32_t exchangeLogLevel{0};
+
+  /// Whether to insert CudfBatchConcat immediately after ordinary UCX
+  /// Exchange sources. Keep this independent from aggregation-side concat.
+  /// This field is intentionally appended so incremental builds that reuse
+  /// stable UCX objects preserve the offsets of every pre-existing field.
+  bool exchangeConcatOptimizationEnabled{true};
 };
 
 } // namespace facebook::velox::cudf_velox

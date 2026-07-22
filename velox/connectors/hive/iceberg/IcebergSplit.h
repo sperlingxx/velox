@@ -27,8 +27,21 @@
 
 namespace facebook::velox::connector::hive::iceberg {
 
+/// An additional whole data file that can be decoded together with the
+/// primary file of an Iceberg split. Multi-file splits are produced only for
+/// the cuDF Iceberg connector; CPU readers continue to receive one file per
+/// split.
+struct IcebergCoalescedFile {
+  std::string filePath;
+  uint64_t length;
+};
+
 struct HiveIcebergSplit : public connector::hive::HiveConnectorSplit {
   std::vector<IcebergDeleteFile> deleteFiles;
+
+  /// Additional whole files with the same partition and metadata constants.
+  /// Delete-bearing and byte-range splits must never be coalesced.
+  std::vector<IcebergCoalescedFile> coalescedFiles;
 
   /// Data sequence number of the base data file in this split. Per the Iceberg
   /// spec (V2+), an equality delete file should only apply to data files whose
@@ -69,7 +82,8 @@ struct HiveIcebergSplit : public connector::hive::HiveConnectorSplit {
       std::vector<IcebergDeleteFile> deletes = {},
       const std::unordered_map<std::string, std::string>& infoColumns = {},
       std::optional<FileProperties> fileProperties = std::nullopt,
-      int64_t dataSequenceNumber = 0);
+      int64_t dataSequenceNumber = 0,
+      std::vector<IcebergCoalescedFile> coalescedFiles = {});
 };
 
 /// Builds Iceberg splits with named parameters.

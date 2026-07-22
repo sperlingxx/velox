@@ -119,7 +119,9 @@ bool isCountFunctionName(std::string_view kind);
 bool hasOnlyConstantArguments(const core::CallTypedExpr& call);
 
 // Returns true if the aggregation node contains companion aggregates
-// (e.g. _merge, _partial, _merge_extract suffixes), which disables streaming.
+// (e.g. _merge, _partial, _merge_extract suffixes). Kept for callers that need
+// to inspect the external plan shape; CudfGroupby streaming supports companion
+// aggregates by forcing its internal compaction step to kIntermediate.
 bool hasCompanionAggregates(
     std::vector<core::AggregationNode::Aggregate> const& aggregates);
 

@@ -82,6 +82,16 @@ bool UcxOutputQueueManager::updateOutputBuffersIfExists(
   return false;
 }
 
+bool UcxOutputQueueManager::updateNumDriversIfExists(
+    std::string_view taskId,
+    uint32_t newNumDrivers) {
+  if (auto queue = getQueueIfExists(taskId)) {
+    queue->updateNumDrivers(newNumDrivers);
+    return true;
+  }
+  return false;
+}
+
 void UcxOutputQueueManager::enqueue(
     std::string_view taskId,
     int destination,

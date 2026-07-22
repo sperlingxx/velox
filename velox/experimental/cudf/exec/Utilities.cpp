@@ -116,6 +116,14 @@ std::unique_ptr<cudf::column> makeEmptyColumnForType(
         0);
   };
   switch (type->kind()) {
+    case TypeKind::UNKNOWN:
+      // Velox uses UNKNOWN for an untyped NULL literal. cuDF has no physical
+      // UNKNOWN type, but an empty column carries no values whose type could
+      // be observed. Keep the same INT8 placeholder used by the row
+      // constructor for all-null UNKNOWN fields. This is required when an
+      // empty hash-join build side contains such a field and must synthesize
+      // its physical schema in noMoreInput().
+      return cudf::make_empty_column(cudf::data_type{cudf::type_id::INT8});
     case TypeKind::VARCHAR:
     case TypeKind::VARBINARY:
       return cudf::make_strings_column(

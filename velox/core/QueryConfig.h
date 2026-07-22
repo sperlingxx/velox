@@ -351,6 +351,53 @@ class QueryConfig {
       10'000,
       "Target rows per CudfPartitionedOutput exchange chunk.")
 
+  /// Maximum input rows for one libcudf hash_partition call in UCX output.
+  /// Zero keeps the normal single-call path. This is query-scoped so a query
+  /// that needs the libcudf safety bound does not regress every other query.
+  VELOX_QUERY_CONFIG(
+      kUcxHashPartitionInputBatchRows,
+      ucxHashPartitionInputBatchRows,
+      "cudf.hash_partition_input_batch_rows",
+      int64_t,
+      0,
+      "Maximum input rows per UCX hash_partition call; 0 disables slicing.")
+
+  /// Maximum source rows whose safely sliced hash results are recombined at
+  /// once. Zero derives the window from cudf.partitioned_output_batch_rows.
+  VELOX_QUERY_CONFIG(
+      kUcxHashPartitionWindowRows,
+      ucxHashPartitionWindowRows,
+      "cudf.hash_partition_window_rows",
+      int64_t,
+      0,
+      "Maximum source rows per sliced UCX hash recombination window; 0 uses "
+      "the partitioned-output batch row setting.")
+
+  /// Query-boundary cudaMallocAsync trim policy. Values >= 0 trim unused pool
+  /// memory to the requested retained bytes; -1 explicitly disables trim for
+  /// this query; -2 preserves the executor-environment fallback. This allows
+  /// benchmark hot iterations to reuse the pool while retaining deterministic
+  /// release before a following high-peak query.
+  VELOX_QUERY_CONFIG(
+      kCudfAsyncQueryEndTrimBytes,
+      cudfAsyncQueryEndTrimBytes,
+      "cudf.async_query_end_trim_bytes",
+      int64_t,
+      -2,
+      "cudaMallocAsync bytes to retain at query end; -1 disables and -2 uses "
+      "the executor environment fallback.")
+
+  /// Target bytes to accumulate before flushing CudfPartitionedOutput and the
+  /// maximum approximate payload bytes per destination chunk. Set to 0 to
+  /// disable byte-based accumulation and chunking.
+  VELOX_QUERY_CONFIG(
+      kUcxPartitionedOutputBatchBytes,
+      ucxPartitionedOutputBatchBytes,
+      "cudf.partitioned_output_batch_bytes",
+      uint64_t,
+      0,
+      "Target bytes per CudfPartitionedOutput exchange chunk.")
+
   VELOX_QUERY_CONFIG(
       kMaxPartialAggregationMemory,
       maxPartialAggregationMemoryUsage,

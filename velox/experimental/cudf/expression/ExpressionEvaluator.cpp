@@ -670,6 +670,15 @@ bool isUnsupportedConstantLiteral(
   return !isSupportedCudfScalarLiteralType(expr->type());
 }
 
+bool isUntypedNullConstantLiteral(
+    const std::shared_ptr<velox::exec::Expr>& expr) {
+  const auto constant =
+      std::dynamic_pointer_cast<velox::exec::ConstantExpr>(expr);
+  return constant != nullptr && constant->value() != nullptr &&
+      constant->type()->kind() == TypeKind::UNKNOWN &&
+      constant->value()->isNullAt(0);
+}
+
 bool isNonNullEmptyArrayConstantLiteral(
     const std::shared_ptr<velox::exec::Expr>& expr) {
   const auto constant =
@@ -694,8 +703,12 @@ bool isNonNullEmptyArrayConstantLiteral(
 
 bool hasUnsupportedComplexConstantLiteral(
     const std::shared_ptr<velox::exec::Expr>& expr) {
+  const bool isRowConstructor = expr->name() == "row_constructor" ||
+      expr->name() == "row_constructor_with_null" ||
+      expr->name() == "row_constructor_with_all_null";
   for (const auto& input : expr->inputs()) {
     if (isUnsupportedConstantLiteral(input) &&
+        !(isRowConstructor && isUntypedNullConstantLiteral(input)) &&
         !(expr->name() == "coalesce" &&
           isNonNullEmptyArrayConstantLiteral(input))) {
       return true;
@@ -3882,10 +3895,14 @@ class RowConstructorFunction : public CudfFunction {
     literals_.reserve(numInputs_);
     for (const auto& input : expr->inputs()) {
       if (auto constant = std::dynamic_pointer_cast<ConstantExpr>(input)) {
-        literals_.push_back(makeScalarFromConstantExpr(constant));
+        const bool isUntypedNull = isUntypedNullConstantLiteral(input);
+        literals_.push_back(
+            isUntypedNull ? nullptr : makeScalarFromConstantExpr(constant));
+        untypedNullLiterals_.push_back(isUntypedNull);
       } else {
         hasNonLiteralInput = true;
         literals_.push_back(nullptr);
+        untypedNullLiterals_.push_back(false);
       }
     }
     if (!hasNonLiteralInput) {
@@ -3906,10 +3923,22 @@ class RowConstructorFunction : public CudfFunction {
     children.reserve(numInputs_);
 
     size_t nextInputColumnIndex = 0;
-    for (const auto& literal : literals_) {
+    for (size_t i = 0; i < literals_.size(); ++i) {
+      const auto& literal = literals_[i];
       if (literal) {
         children.push_back(
             cudf::make_column_from_scalar(*literal, outputSize, stream, mr));
+      } else if (untypedNullLiterals_[i]) {
+        // Velox UNKNOWN is the logical type of an untyped NULL literal and
+        // has no cuDF physical type. Keep the logical UNKNOWN in the row
+        // schema and use an all-null byte column as its inert physical child.
+        children.push_back(
+            cudf::make_fixed_width_column(
+                cudf::data_type{cudf::type_id::INT8},
+                outputSize,
+                cudf::mask_state::ALL_NULL,
+                stream,
+                mr));
       } else {
         VELOX_CHECK_LT(nextInputColumnIndex, inputColumns.size());
         children.push_back(
@@ -3949,6 +3978,7 @@ class RowConstructorFunction : public CudfFunction {
       rmm::device_async_resource_ref mr);
 
   std::vector<std::unique_ptr<cudf::scalar>> literals_;
+  std::vector<bool> untypedNullLiterals_;
   RowParentNullPolicy parentNullPolicy_;
   std::string functionName_;
   size_t numInputs_{0};

@@ -21,10 +21,14 @@
 #include "velox/exec/LocalPartition.h"
 #include "velox/exec/Operator.h"
 
+#include <cudf/table/table.hpp>
+#include <cudf/types.hpp>
+
 namespace facebook::velox::cudf_velox {
 
 enum class PartitionFunctionType {
   kHash,
+  kRange,
   kRoundRobin,
   kRoundRobinRow,
 };
@@ -74,10 +78,19 @@ class CudfLocalPartition : public CudfOperatorBase {
   PartitionFunctionType partitionFunctionType_;
   size_t counter_{0};
 
+  // A local keyed-FINAL repartition must not reuse the remote exchange seed.
+  // If local partition count divides remote partition count (Q17: 4 vs 32),
+  // identical hashing sends the peer's entire remote bucket to one local lane.
+  uint32_t hashSeed_;
+
   std::vector<exec::BlockingReason> blockingReasons_;
   std::vector<ContinueFuture> futures_;
 
   std::vector<column_index_t> partitionKeyIndices_;
+  std::string rangeBoundsJson_;
+  std::unique_ptr<cudf::table> rangeBoundaries_;
+  std::vector<cudf::order> rangeOrders_;
+  std::vector<cudf::null_order> rangeNullOrders_;
 };
 
 } // namespace facebook::velox::cudf_velox

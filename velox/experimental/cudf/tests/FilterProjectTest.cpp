@@ -1792,6 +1792,19 @@ TEST_F(CudfFilterProjectTest, dereferenceWithLiteralAndNullFields) {
   assertQuery(plan, "SELECT c0, CAST(NULL AS INTEGER), 'x' FROM tmp");
 }
 
+TEST_F(CudfFilterProjectTest, rowConstructorWithUntypedNullField) {
+  auto vectors = makeVectors(rowType_, 2, 128);
+  createDuckDbTable(vectors);
+
+  auto plan = PlanBuilder()
+                  .values(vectors)
+                  .project({"row_constructor(c0, null) AS r"})
+                  .project({"r.c1"})
+                  .planNode();
+
+  assertQuery(plan, "SELECT c0 FROM tmp");
+}
+
 TEST_F(CudfFilterProjectTest, cardinality) {
   auto input = makeArrayVector<int64_t>({{1, 2, 3}, {1, 2}, {}});
   auto data = makeRowVector({input});

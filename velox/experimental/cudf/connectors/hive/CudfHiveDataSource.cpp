@@ -292,6 +292,10 @@ void CudfHiveDataSource::addSplit(std::shared_ptr<ConnectorSplit> split) {
 
   cudfSplitReader_ = createCudfSplitReader();
   cudfSplitReader_->prepareSplit(runtimeStats_);
+  numFilesCoalesced_ += split_->coalescedFiles.size();
+  for (const auto& file : split_->coalescedFiles) {
+    completedBytes_ += file.length;
+  }
 
   // TODO: `completedBytes_` should be updated in `next()` as we read more and
   // more table bytes
@@ -379,6 +383,9 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
 std::unordered_map<std::string, RuntimeMetric>
 CudfHiveDataSource::getRuntimeStats() {
   auto result = runtimeStats_.toRuntimeMetricMap();
+  if (numFilesCoalesced_ > 0) {
+    result.emplace("numFilesCoalesced", RuntimeMetric(numFilesCoalesced_));
+  }
   result.insert({
       {std::string(connector::hive::HiveDataSource::kTotalScanTime),
        RuntimeMetric(

@@ -13,6 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "velox/common/memory/Memory.h"
 #include "velox/common/process/ThreadDebugInfo.h"
 
 #include <folly/Unit.h>
@@ -25,5 +26,9 @@ int main(int argc, char** argv) {
   // Signal handler required for ThreadDebugInfoTest
   facebook::velox::process::addDefaultFatalSignalHandler();
   folly::Init init(&argc, &argv, false);
+  // Match the regular Velox exec test main. Without an initialized global
+  // memory manager, fixtures that create vectors fail before SetUp() on their
+  // first small allocation, so no cuDF operator code is exercised.
+  facebook::velox::memory::MemoryManager::initialize({});
   return RUN_ALL_TESTS();
 }

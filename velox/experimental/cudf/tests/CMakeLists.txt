@@ -73,7 +73,7 @@ endif()
 
 velox_add_cudf_test(
   NAME velox_cudf_adapter_operator_test
-  SOURCES Main.cpp AdapterOperatorTest.cpp
+  SOURCES Main.cpp AdapterOperatorTest.cpp TaskOutputManagerTest.cpp
   LIBS ${CUDF_TEST_DEFAULT_LIBS} velox_functions_test_lib velox_window velox_functions_spark_window
 )
 

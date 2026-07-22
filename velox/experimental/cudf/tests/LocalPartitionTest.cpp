@@ -14,7 +14,9 @@
  * limitations under the License.
  */
 #include "velox/experimental/cudf/exec/CudfConversion.h"
+#include "velox/experimental/cudf/exec/CudfLocalPartition.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
+#include "velox/experimental/ucx-exchange/RangePartitionFunction.h"
 
 #include "velox/common/base/tests/GTestUtils.h"
 #include "velox/exec/PlanNodeStats.h"
@@ -158,6 +160,37 @@ TEST_F(LocalPartitionTest, partition) {
 
   auto task =
       queryBuilder.assertResults("SELECT c0, max(c0) FROM tmp GROUP BY 1");
+}
+
+TEST_F(LocalPartitionTest, rangePartition) {
+  auto data = makeRowVector({makeNullableFlatVector<int32_t>(
+      {std::nullopt, -5, 0, 1, 9, 10, 11, 20, 21})});
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  auto source = PlanBuilder(planNodeIdGenerator).values({data}).planNode();
+  constexpr auto kBounds = R"json({
+    "version": 1,
+    "keys": [{"sparkType":"int","ascending":true,"nullsFirst":true}],
+    "bounds": [
+      [{"isNull":false,"value":0}],
+      [{"isNull":false,"value":10}],
+      [{"isNull":false,"value":20}]
+    ]
+  })json";
+  auto spec = std::make_shared<ucx_exchange::RangePartitionFunctionSpec>(
+      source->outputType(), std::vector<column_index_t>{0}, kBounds);
+  auto op = std::make_shared<core::LocalPartitionNode>(
+      planNodeIdGenerator->next(),
+      core::LocalPartitionNode::Type::kRepartition,
+      false,
+      std::move(spec),
+      std::vector<core::PlanNodePtr>{source});
+
+  ASSERT_TRUE(cudf_velox::CudfLocalPartition::shouldReplace(op));
+  createDuckDbTable({data});
+  AssertQueryBuilder(op, duckDbQueryRunner_)
+      .maxDrivers(4)
+      .config(core::QueryConfig::kMaxLocalExchangePartitionCount, "4")
+      .assertResults("SELECT c0 FROM tmp");
 }
 
 TEST_F(LocalPartitionTest, unionAllLocalExchange) {

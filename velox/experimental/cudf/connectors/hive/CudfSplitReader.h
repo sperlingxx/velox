@@ -95,6 +95,13 @@ class CudfSplitReader : public NvtxHelper {
   // Setup the cuDF data source
   void setupCudfDataSource();
 
+  // Create a data source for one physical file.
+  std::shared_ptr<cudf::io::datasource> createCudfDataSource(
+      const std::string& filePath);
+
+  // Return non-owning wrappers for every source in this split.
+  std::vector<std::unique_ptr<cudf::io::datasource>> makeDataSourceViews();
+
   // Read file metadatas.
   void fileMetaDatas();
 
@@ -135,6 +142,7 @@ class CudfSplitReader : public NvtxHelper {
 
   // cuDF split reader stuff.
   std::shared_ptr<cudf::io::datasource> dataSource_;
+  std::vector<std::shared_ptr<cudf::io::datasource>> coalescedDataSources_;
   cudf::io::parquet_reader_options readerOptions_;
   CudfParquetReaderPtr splitReader_;
   CudfHybridScanReaderPtr exptSplitReader_;

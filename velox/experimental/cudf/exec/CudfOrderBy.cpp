@@ -42,16 +42,14 @@ namespace {
 constexpr uint64_t kMergeChunkBytes = 32ULL << 20;
 constexpr uint64_t kMergePassBytes = 128ULL << 20;
 constexpr uint64_t kSpillRowGroupBytes = 64ULL << 20;
-constexpr uint64_t kOutputChunkBytes = 32ULL << 20;
 constexpr size_t kFinalMergeRuns = 2;
-constexpr cudf::size_type kMaxOutputRows = 262144;
 
 std::atomic<uint64_t> orderBySpillDirectorySequence{0};
 std::atomic<uint64_t> testingSortedRunBytes{0};
 std::atomic<size_t> testingMergeFanIn{0};
 std::atomic<uint64_t> mergeChunkBytes{kMergeChunkBytes};
-std::atomic<uint64_t> outputChunkBytes{kOutputChunkBytes};
-std::atomic<cudf::size_type> maxOutputRows{kMaxOutputRows};
+std::atomic<uint64_t> testingOutputChunkBytes{0};
+std::atomic<cudf::size_type> testingMaxOutputRows{0};
 
 // Read-only diagnostics used to assert the external-sort bounds in GPU tests.
 // They never participate in operator scheduling or correctness.
@@ -107,8 +105,10 @@ bool isSpillSafeType(const TypePtr& type) {
         }
       }
       return true;
-    case TypeKind::VARBINARY:
     case TypeKind::MAP:
+      return type->size() == 2 && isSpillSafeType(type->childAt(0)) &&
+          isSpillSafeType(type->childAt(1));
+    case TypeKind::VARBINARY:
     case TypeKind::UNKNOWN:
     case TypeKind::FUNCTION:
     case TypeKind::OPAQUE:
@@ -125,7 +125,8 @@ bool isSupportedSortKeyType(const TypePtr& type) {
 
   // Nested cuDF sort semantics have not been validated against Velox. Nested
   // values may still be carried as payload when every leaf is spill-safe.
-  return type->kind() != TypeKind::ARRAY && type->kind() != TypeKind::ROW;
+  return type->kind() != TypeKind::ARRAY && type->kind() != TypeKind::MAP &&
+      type->kind() != TypeKind::ROW;
 }
 
 void updateAtomicMax(std::atomic<uint64_t>& target, uint64_t value) {
@@ -205,8 +206,8 @@ void CudfOrderBy::testingSetMemoryLimits(
   testingSortedRunBytes.store(runBytes);
   testingMergeFanIn.store(fanIn);
   mergeChunkBytes.store(chunkBytes);
-  outputChunkBytes.store(outputBytes);
-  maxOutputRows.store(outputRows);
+  testingOutputChunkBytes.store(outputBytes);
+  testingMaxOutputRows.store(outputRows);
   resetTestingStats();
 }
 
@@ -214,8 +215,8 @@ void CudfOrderBy::testingResetMemoryLimits() {
   testingSortedRunBytes.store(0);
   testingMergeFanIn.store(0);
   mergeChunkBytes.store(kMergeChunkBytes);
-  outputChunkBytes.store(kOutputChunkBytes);
-  maxOutputRows.store(kMaxOutputRows);
+  testingOutputChunkBytes.store(0);
+  testingMaxOutputRows.store(0);
   resetTestingStats();
 }
 
@@ -263,7 +264,16 @@ CudfOrderBy::CudfOrderBy(
           testingMergeFanIn.load() > 0
               ? testingMergeFanIn.load()
               : static_cast<size_t>(
-                    CudfConfig::getInstance().orderByMergeFanIn)) {
+                    CudfConfig::getInstance().orderByMergeFanIn)),
+      outputChunkBytes_(
+          testingOutputChunkBytes.load() > 0
+              ? testingOutputChunkBytes.load()
+              : CudfConfig::getInstance().orderByOutputChunkBytes),
+      maxOutputRows_(
+          testingMaxOutputRows.load() > 0
+              ? testingMaxOutputRows.load()
+              : static_cast<cudf::size_type>(
+                    CudfConfig::getInstance().orderByMaxOutputRows)) {
   VELOX_CHECK(
       isSupported(orderByNode),
       "CudfOrderBy received an unsupported external-spill schema or sorting "
@@ -843,8 +853,8 @@ CudfVectorPtr CudfOrderBy::takePendingOutput() {
   const auto totalRows = pendingOutput_->num_rows();
   VELOX_CHECK_LT(pendingOutputOffset_, totalRows);
   const auto remainingRows = totalRows - pendingOutputOffset_;
-  const auto byteLimit = outputChunkBytes.load();
-  cudf::size_type targetRows = std::min(remainingRows, maxOutputRows.load());
+  const auto byteLimit = outputChunkBytes_;
+  cudf::size_type targetRows = std::min(remainingRows, maxOutputRows_);
   if (pendingOutputBytes_ > byteLimit) {
     const auto proportionalRows =
         static_cast<cudf::size_type>(std::max<uint64_t>(
@@ -852,6 +862,23 @@ CudfVectorPtr CudfOrderBy::takePendingOutput() {
             static_cast<uint64_t>(totalRows) * byteLimit /
                 pendingOutputBytes_));
     targetRows = std::min(targetRows, proportionalRows);
+  }
+
+  // Avoid copying an already materialized in-memory sort result when it fits
+  // the configured output bounds. Spilled/oversized results keep the bounded
+  // slicing path below.
+  if (pendingOutputOffset_ == 0 && targetRows == totalRows &&
+      pendingOutputBytes_ <= byteLimit) {
+    auto output = std::make_shared<CudfVector>(
+        pool(),
+        outputType_,
+        totalRows,
+        std::move(pendingOutput_),
+        stateStream_);
+    pendingOutputOffset_ = 0;
+    pendingOutputBytes_ = 0;
+    observedEmittedChunks.fetch_add(1);
+    return output;
   }
 
   while (true) {

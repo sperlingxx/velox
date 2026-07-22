@@ -125,6 +125,11 @@ class CudfGroupby : public CudfOperatorBase {
     uint64_t representedRows;
   };
 
+  struct IntermediateAggregationRun {
+    CudfVectorPtr data;
+    uint64_t representedRows;
+  };
+
   CudfVectorPtr doGroupByAggregation(
       cudf::table_view tableView,
       std::vector<column_index_t> const& groupByKeys,
@@ -140,6 +145,14 @@ class CudfGroupby : public CudfOperatorBase {
   void computePartialGroupbyStreaming(CudfVectorPtr tbl);
   void computeFinalGroupbyStreaming(CudfVectorPtr tbl);
   void computeSingleGroupbyStreaming(CudfVectorPtr tbl);
+
+  void addIntermediateAggregationRun(IntermediateAggregationRun run);
+  IntermediateAggregationRun mergeIntermediateAggregationRuns(
+      IntermediateAggregationRun left,
+      IntermediateAggregationRun right,
+      size_t outputLevel,
+      bool finalizing);
+  CudfVectorPtr drainIntermediateAggregationRuns();
 
   void addFinalAggregationRun(FinalAggregationRun run);
   FinalAggregationRun mergeFinalAggregationRuns(
@@ -184,6 +197,16 @@ class CudfGroupby : public CudfOperatorBase {
   TypePtr inputType_;
   RowTypePtr bufferedResultType_;
   CudfVectorPtr bufferedResult_;
+
+  // PARTIAL and SINGLE aggregation produce one compacted state per input
+  // page. Keep those states in logarithmic size levels and merge only peers
+  // of comparable weight. This avoids regrouping the complete accumulated
+  // state for every page while retaining the configured partial-memory flush
+  // boundary.
+  std::vector<std::optional<IntermediateAggregationRun>> intermediateRunLevels_;
+  uint64_t intermediateBufferedBytes_{0};
+  uint64_t intermediateInputRunCount_{0};
+  uint64_t intermediateRunMergeCount_{0};
 
   // Supported FINAL aggregates use cuDF's persistent hash state directly
   // across exchange pages. The choice is made from the first page and is never

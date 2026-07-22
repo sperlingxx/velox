@@ -442,6 +442,93 @@ TEST_F(UcxOutputQueueManagerTest, v2OversizeRequestReturnsOneChunk) {
   queueManager_->removeTask(taskId);
 }
 
+TEST_F(UcxOutputQueueManagerTest, v2StaleSequenceDoesNotDequeue) {
+  const std::string taskId = "v2StaleSequence";
+  const int destination = 0;
+  const auto maxBytes = std::numeric_limits<uint64_t>::max();
+
+  initializeTask(taskId, 1 /* numDestinations */, 1 /* numDrivers */);
+
+  enqueue(taskId, destination, 10);
+  enqueue(taskId, destination, 20);
+  noMoreData(taskId);
+
+  auto first = fetchV2Data(taskId, destination, maxBytes, 0);
+  ASSERT_NE(first.data, nullptr);
+  EXPECT_EQ(first.sequence, 0);
+
+  // Simulate a duplicate server reconnecting from sequence zero. It should
+  // be told that sequence one is current, without consuming sequence one.
+  auto stale = fetchV2Data(taskId, destination, maxBytes, 0);
+  EXPECT_EQ(stale.data, nullptr);
+  EXPECT_EQ(stale.sequence, 1);
+
+  auto second = fetchV2Data(taskId, destination, maxBytes, 1);
+  ASSERT_NE(second.data, nullptr);
+  EXPECT_EQ(second.sequence, 1);
+
+  auto end = fetchV2Data(taskId, destination, maxBytes, 2);
+  EXPECT_EQ(end.data, nullptr);
+  EXPECT_EQ(end.sequence, 2);
+
+  queueManager_->deleteResults(taskId, destination);
+  EXPECT_TRUE(queueManager_->isFinished(taskId));
+  queueManager_->removeTask(taskId);
+}
+
+TEST_F(UcxOutputQueueManagerTest, v2DuplicateWaiterPreservesOriginal) {
+  const std::string taskId = "v2DuplicateWaiter";
+  const int destination = 0;
+  const auto maxBytes = std::numeric_limits<uint64_t>::max();
+
+  initializeTask(taskId, 1 /* numDestinations */, 1 /* numDrivers */);
+
+  bool originalFired = false;
+  std::shared_ptr<cudf::packed_columns> originalData;
+  queueManager_->getData(
+      taskId,
+      destination,
+      maxBytes,
+      0,
+      [&](std::shared_ptr<cudf::packed_columns> data,
+          int64_t sequence,
+          std::vector<int64_t>) {
+        EXPECT_EQ(sequence, 0);
+        originalData = std::move(data);
+        originalFired = true;
+      });
+  EXPECT_FALSE(originalFired);
+
+  bool duplicateFired = false;
+  queueManager_->getData(
+      taskId,
+      destination,
+      maxBytes,
+      0,
+      [&](std::shared_ptr<cudf::packed_columns> data,
+          int64_t sequence,
+          std::vector<int64_t>) {
+        EXPECT_EQ(data, nullptr);
+        EXPECT_EQ(sequence, 1);
+        duplicateFired = true;
+      });
+  EXPECT_TRUE(duplicateFired);
+  EXPECT_FALSE(originalFired);
+
+  enqueue(taskId, destination, 10);
+  EXPECT_TRUE(originalFired);
+  EXPECT_NE(originalData, nullptr);
+
+  noMoreData(taskId);
+  auto end = fetchV2Data(taskId, destination, maxBytes, 1);
+  EXPECT_EQ(end.data, nullptr);
+  EXPECT_EQ(end.sequence, 1);
+
+  queueManager_->deleteResults(taskId, destination);
+  EXPECT_TRUE(queueManager_->isFinished(taskId));
+  queueManager_->removeTask(taskId);
+}
+
 TEST_F(UcxOutputQueueManagerTest, v2RemovedTaskReturnsNullAtRequestedSequence) {
   const std::string taskId = "v2RemovedTask";
   const int destination = 0;

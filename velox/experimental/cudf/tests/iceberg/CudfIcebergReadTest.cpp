@@ -18,6 +18,7 @@
 /// Deletion vector and equality delete tests live in their own files
 /// (CudfDeletionVectorReaderTest.cpp and CudfEqualityDeleteFileReaderTest.cpp).
 
+#include "velox/experimental/cudf/connectors/hive/CudfSplitReaderHelpers.h"
 #include "velox/experimental/cudf/tests/iceberg/CudfIcebergTestBase.h"
 
 #include "velox/common/base/tests/GTestUtils.h"
@@ -502,6 +503,105 @@ TEST_F(CudfIcebergReadTest, multipleSplits) {
                   .planNode();
 
   assertQuery(plan, allSplits, "SELECT * FROM tmp", 0);
+}
+
+/// Read multiple whole data files through one cuDF parquet reader.
+TEST_F(CudfIcebergReadTest, coalescedMultipleFiles) {
+  auto rowType = ROW({"c0"}, {BIGINT()});
+  auto data1 = makeRowVector({makeFlatVector<int64_t>({1, 2, 3})});
+  auto data2 = makeRowVector({makeFlatVector<int64_t>({4, 5, 6})});
+
+  auto filePath1 = TempFilePath::create();
+  auto filePath2 = TempFilePath::create();
+  writeToFile(filePath1->getPath(), data1);
+  writeToFile(filePath2->getPath(), data2);
+
+  std::vector<std::shared_ptr<facebook::velox::connector::ConnectorSplit>>
+      splits{std::make_shared<HiveIcebergSplit>(
+          kCudfIcebergConnectorId,
+          filePath1->getPath(),
+          dwio::common::FileFormat::PARQUET,
+          0,
+          getFileSize(filePath1->getPath()),
+          std::unordered_map<std::string, std::optional<std::string>>{},
+          std::nullopt,
+          std::unordered_map<std::string, std::string>{},
+          nullptr,
+          /*cacheable=*/true,
+          std::vector<IcebergDeleteFile>{},
+          std::unordered_map<std::string, std::string>{},
+          std::nullopt,
+          /*dataSequenceNumber=*/0,
+          std::vector<IcebergCoalescedFile>{
+              {filePath2->getPath(), getFileSize(filePath2->getPath())}})};
+
+  createDuckDbTable({data1, data2});
+  auto plan = PlanBuilder()
+                  .startTableScan()
+                  .connectorId(kCudfIcebergConnectorId)
+                  .outputType(rowType)
+                  .endTableScan()
+                  .planNode();
+
+  assertQuery(plan, splits, "SELECT * FROM tmp", 0);
+}
+
+/// Fall back to per-file readers when a coalesced split contains physical
+/// schemas from different Iceberg schema versions.
+TEST_F(CudfIcebergReadTest, coalescedSchemaEvolution) {
+  auto oldData = makeRowVector({"c0"}, {makeFlatVector<int64_t>({1, 2})});
+  auto newData = makeRowVector(
+      {"c0", "c1"},
+      {makeFlatVector<int64_t>({3, 4}), makeFlatVector<int64_t>({30, 40})});
+
+  auto oldFile = TempFilePath::create();
+  auto newFile = TempFilePath::create();
+  writeToFile(oldFile->getPath(), oldData);
+  writeToFile(newFile->getPath(), newData);
+
+  std::vector<std::shared_ptr<facebook::velox::connector::ConnectorSplit>>
+      splits{std::make_shared<HiveIcebergSplit>(
+          kCudfIcebergConnectorId,
+          oldFile->getPath(),
+          dwio::common::FileFormat::PARQUET,
+          0,
+          getFileSize(oldFile->getPath()),
+          std::unordered_map<std::string, std::optional<std::string>>{},
+          std::nullopt,
+          std::unordered_map<std::string, std::string>{},
+          nullptr,
+          /*cacheable=*/true,
+          std::vector<IcebergDeleteFile>{},
+          std::unordered_map<std::string, std::string>{},
+          std::nullopt,
+          /*dataSequenceNumber=*/0,
+          std::vector<IcebergCoalescedFile>{
+              {newFile->getPath(), getFileSize(newFile->getPath())}})};
+
+  auto outputType = ROW({"c0", "c1"}, {BIGINT(), BIGINT()});
+  auto plan = PlanBuilder()
+                  .startTableScan()
+                  .connectorId(kCudfIcebergConnectorId)
+                  .outputType(outputType)
+                  .dataColumns(outputType)
+                  .endTableScan()
+                  .planNode();
+  auto expected = makeRowVector(
+      {"c0", "c1"},
+      {makeFlatVector<int64_t>({1, 2, 3, 4}),
+       makeNullableFlatVector<int64_t>({std::nullopt, std::nullopt, 30, 40})});
+
+  AssertQueryBuilder(plan).splits(splits).assertResults({expected});
+}
+
+TEST_F(CudfIcebergReadTest, multiFileChunkReadLimit) {
+  using connector::hive::kDefaultMultiFileChunkReadLimit;
+  using connector::hive::multiFileChunkReadLimit;
+
+  EXPECT_EQ(
+      multiFileChunkReadLimit(0, 8UL << 20), kDefaultMultiFileChunkReadLimit);
+  EXPECT_EQ(multiFileChunkReadLimit(0, 512UL << 20), 512UL << 20);
+  EXPECT_EQ(multiFileChunkReadLimit(64UL << 20, 8UL << 20), 64UL << 20);
 }
 
 /// Read multiple byte-range splits from the same data file.

@@ -17,16 +17,19 @@
 
 #include "velox/core/PlanNode.h"
 
+#include <cudf/types.hpp>
+
 namespace facebook::velox::ucx_exchange {
 
 /**
- * An explicit range-partition contract for UCX output.
+ * An explicit range-partition contract for GPU output and local exchange.
  *
  * The JSON payload contains Spark RangePartitioner boundaries plus ascending
- * and null-order flags. UcxPartitionedOutput evaluates those boundaries into
- * an INT32 partition-id column before routing. The ordinary Velox CPU
- * PartitionedOutput path is intentionally unsupported: using it would make a
- * RANGE exchange silently change semantics when the GPU adapter is absent.
+ * and null-order flags. UcxPartitionedOutput and CudfLocalPartition evaluate
+ * those boundaries into an INT32 partition-id column before routing. The
+ * ordinary Velox CPU partition path is intentionally unsupported: using it
+ * would make a RANGE exchange silently change semantics when the GPU adapter
+ * is absent.
  */
 class RangePartitionFunctionSpec final : public core::PartitionFunctionSpec {
  public:
@@ -71,5 +74,19 @@ class RangePartitionFunctionSpec final : public core::PartitionFunctionSpec {
   const std::vector<column_index_t> keyChannels_;
   const std::string boundsJson_;
 };
+
+/**
+ * Materializes Spark's serialized RANGE boundaries as a Velox row vector and
+ * returns the matching libcudf sort/null ordering. Shared by UCX
+ * PartitionedOutput and single-task CudfLocalPartition so both paths apply
+ * exactly the same boundary semantics.
+ */
+RowVectorPtr buildRangeBoundaryVector(
+    const std::string& boundsJson,
+    const RowTypePtr& inputType,
+    const std::vector<column_index_t>& keyChannels,
+    memory::MemoryPool* pool,
+    std::vector<cudf::order>& orders,
+    std::vector<cudf::null_order>& nullOrders);
 
 } // namespace facebook::velox::ucx_exchange

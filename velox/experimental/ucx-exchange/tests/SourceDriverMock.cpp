@@ -82,22 +82,30 @@ void SourceDriverMock::sendAllData(UcxPartitionedOutput* partitionedOutput) {
   auto* pool = partitionedOutput->pool();
 
   for (uint32_t chunk = 0; chunk < numChunks_; ++chunk) {
-    // 1. Create CudfVector with test data using makeCudfVector helper
-    auto cudfVector = makeCudfVector(
-        pool, numRowsPerChunk_, rowType, tableGenerator_, stream);
-
-    // 2. Check isBlocked() - if blocked, wait on future
+    // 1. Drain resumable output work and wait for backpressure before adding
+    // another input. A real Driver checks both isBlocked() and needsInput().
+    // Keep this mock on the same contract now that UcxPartitionedOutput can
+    // yield between hash-partition residency windows.
     while (true) {
       ContinueFuture future;
       auto blocked = partitionedOutput->isBlocked(&future);
-      if (blocked == exec::BlockingReason::kNotBlocked) {
+      if (blocked != exec::BlockingReason::kNotBlocked) {
+        future.wait();
+        continue;
+      }
+      if (partitionedOutput->needsInput()) {
         break;
       }
-      // Wait for the operator to become unblocked
-      future.wait();
+      partitionedOutput->getOutput();
     }
 
-    // 3. Call addInput() now that we're not blocked
+    // 2. Create the next CudfVector only after the operator can accept it, as
+    // a real upstream operator would. This avoids retaining an extra large
+    // source batch while the prior batch is blocked in output.
+    auto cudfVector = makeCudfVector(
+        pool, numRowsPerChunk_, rowType, tableGenerator_, stream);
+
+    // 3. Call addInput() now that we're not blocked and need input.
     partitionedOutput->addInput(cudfVector);
 
     // 4. Call getOutput() to advance operator state

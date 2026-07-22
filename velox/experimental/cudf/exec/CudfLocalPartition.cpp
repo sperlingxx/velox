@@ -17,7 +17,9 @@
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/exec/CudfLocalPartition.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
+#include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
+#include "velox/experimental/ucx-exchange/RangePartitionFunction.h"
 
 #include "velox/core/PlanNode.h"
 #include "velox/exec/HashPartitionFunction.h"
@@ -26,6 +28,7 @@
 
 #include <cudf/copying.hpp>
 #include <cudf/partitioning.hpp>
+#include <cudf/search.hpp>
 
 namespace facebook::velox::cudf_velox {
 
@@ -38,11 +41,13 @@ bool isAnyOf(const Base* p) {
 
 bool CudfLocalPartition::shouldReplace(
     const std::shared_ptr<const core::LocalPartitionNode>& planNode) {
-  // Only replace for Hash, Round Robin, and Round Robin Row-Wise Partitioning.
+  // Replace all partition functions with a native cuDF implementation. RANGE
+  // is shared with the UCX output path through RangePartitionFunctionSpec.
   if (isAnyOf<
           exec::HashPartitionFunctionSpec,
           exec::RoundRobinPartitionFunctionSpec,
-          core::GatherPartitionFunctionSpec>(
+          core::GatherPartitionFunctionSpec,
+          ucx_exchange::RangePartitionFunctionSpec>(
           &planNode->partitionFunctionSpec())) {
     return true;
   }
@@ -70,7 +75,11 @@ CudfLocalPartition::CudfLocalPartition(
           planNode),
       queues_{
           ctx->task->getLocalExchangeQueues(ctx->splitGroupId, planNode->id())},
-      numPartitions_{queues_.size()} {
+      numPartitions_{queues_.size()},
+      hashSeed_{
+          planNode->id().find("_keyed_final_local_hash") != std::string::npos
+              ? cudf::DEFAULT_HASH_SEED ^ 0x9e3779b9U
+              : cudf::DEFAULT_HASH_SEED} {
   // Following is IMO a hacky way to get the partition key indices. It is to
   // workaround the fact that the partition spec constructs the hash function
   // directly and has no public methods to get the partition key indices.
@@ -87,9 +96,17 @@ CudfLocalPartition::CudfLocalPartition(
   std::string spec = planNode->partitionFunctionSpec().toString();
   auto* hashFunctionSpec = dynamic_cast<const exec::HashPartitionFunctionSpec*>(
       &planNode->partitionFunctionSpec());
+  auto* rangeFunctionSpec =
+      dynamic_cast<const ucx_exchange::RangePartitionFunctionSpec*>(
+          &planNode->partitionFunctionSpec());
 
-  // Only parse keys if it's a hash function
-  if (hashFunctionSpec) {
+  // RANGE exposes its key channels directly. Hash still uses the legacy
+  // textual spec parsing below.
+  if (rangeFunctionSpec) {
+    partitionKeyIndices_ = rangeFunctionSpec->keyChannels();
+    rangeBoundsJson_ = rangeFunctionSpec->boundsJson();
+    partitionFunctionType_ = PartitionFunctionType::kRange;
+  } else if (hashFunctionSpec) {
     // Extract keys between HASH( and )
     size_t start = spec.find("HASH(") + 5;
     size_t end = spec.find(")", start);
@@ -119,6 +136,11 @@ CudfLocalPartition::CudfLocalPartition(
       }
     }
     partitionFunctionType_ = PartitionFunctionType::kHash;
+    if (hashSeed_ != cudf::DEFAULT_HASH_SEED) {
+      LOG(WARNING) << "CudfLocalPartition: decorrelated keyed-FINAL hash "
+                   << "planNode=" << planNode->id()
+                   << " partitions=" << numPartitions_ << " seed=" << hashSeed_;
+    }
   } else if (
       dynamic_cast<const exec::RoundRobinPartitionFunctionSpec*>(
           &planNode->partitionFunctionSpec()) &&
@@ -210,7 +232,50 @@ void CudfLocalPartition::doAddInput(RowVectorPtr input) {
             partitionKeyIndices,
             numPartitions_,
             cudf::hash_id::HASH_MURMUR3,
-            cudf::DEFAULT_HASH_SEED,
+            hashSeed_,
+            stream,
+            get_temp_mr());
+      } else if (partitionFunctionType_ == PartitionFunctionType::kRange) {
+        if (!rangeBoundaries_) {
+          auto boundaryVector = ucx_exchange::buildRangeBoundaryVector(
+              rangeBoundsJson_,
+              outputType_,
+              partitionKeyIndices_,
+              pool(),
+              rangeOrders_,
+              rangeNullOrders_);
+          rangeBoundaries_ = with_arrow::toCudfTable(
+              boundaryVector, pool(), stream, get_output_mr());
+          VELOX_CHECK_LT(
+              rangeBoundaries_->num_rows(),
+              numPartitions_,
+              "RANGE_PID boundary count must be smaller than requested partitions");
+        }
+
+        std::vector<cudf::size_type> rangeKeyIndices;
+        rangeKeyIndices.reserve(partitionKeyIndices_.size());
+        for (const auto index : partitionKeyIndices_) {
+          rangeKeyIndices.push_back(static_cast<cudf::size_type>(index));
+        }
+        const auto keyTable = tableView.select(rangeKeyIndices);
+        auto partitionIds = cudf::lower_bound(
+            rangeBoundaries_->view(),
+            keyTable,
+            rangeOrders_,
+            rangeNullOrders_,
+            stream,
+            get_temp_mr());
+        VELOX_CHECK_EQ(
+            partitionIds->size(),
+            tableView.num_rows(),
+            "RANGE_PID must produce exactly one id per input row");
+        VELOX_CHECK(
+            partitionIds->type().id() == cudf::type_id::INT32,
+            "RANGE_PID must produce an INT32 partition map");
+        return cudf::partition(
+            tableView,
+            partitionIds->view(),
+            numPartitions_,
             stream,
             get_temp_mr());
       } else if (
@@ -223,16 +288,18 @@ void CudfLocalPartition::doAddInput(RowVectorPtr input) {
       VELOX_FAIL("Unsupported partition function");
     }();
 
-    // cuDF partitioning APIs return num_partitions + 1 offsets where:
-    // - offsets[i] is the starting row index for partition i
-    // - offsets[num_partitions] is the total row count
-    VELOX_CHECK(partitionOffsets.size() == numPartitions_ + 1);
+    // cuDF partitioning APIs return either one starting offset per partition
+    // or those offsets plus a terminal row count, depending on the primitive.
+    VELOX_CHECK(
+        partitionOffsets.size() == numPartitions_ ||
+        partitionOffsets.size() == numPartitions_ + 1);
     VELOX_CHECK(partitionOffsets[0] == 0);
 
-    // cudf::split expects split points (excluding first 0 and last totalRows).
-    // Erase first element (always 0) and last element (total row count).
+    // cudf::split expects only the N - 1 interior split points.
     partitionOffsets.erase(partitionOffsets.begin());
-    partitionOffsets.pop_back();
+    if (partitionOffsets.size() == numPartitions_) {
+      partitionOffsets.pop_back();
+    }
 
     auto partitionedTables =
         cudf::split(partitionedTable->view(), partitionOffsets, stream);

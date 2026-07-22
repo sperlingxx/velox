@@ -29,6 +29,13 @@ namespace velox_connector = ::facebook::velox::connector;
 namespace velox_hive = ::facebook::velox::connector::hive;
 namespace velox_iceberg = ::facebook::velox::connector::hive::iceberg;
 
+namespace {
+std::string stripFilePrefix(const std::string& path) {
+  constexpr std::string_view prefix{"file:"};
+  return path.rfind(prefix, 0) == 0 ? path.substr(prefix.size()) : path;
+}
+} // namespace
+
 CudfIcebergDataSource::CudfIcebergDataSource(
     const RowTypePtr& outputType,
     const velox_connector::ConnectorTableHandlePtr& tableHandle,
@@ -68,6 +75,12 @@ void CudfIcebergDataSource::convertSplit(
 
   // Convert `ConnectorSplit` to `CudfHiveConnectorSplit`
   CudfHiveDataSource::convertSplit(split);
+
+  split_->coalescedFiles.reserve(icebergSplit_->coalescedFiles.size());
+  for (const auto& file : icebergSplit_->coalescedFiles) {
+    split_->coalescedFiles.push_back(
+        {stripFilePrefix(file.filePath), file.length});
+  }
 }
 
 std::unique_ptr<CudfSplitReader>

@@ -88,6 +88,26 @@ FOLLY_ALWAYS_INLINE void checkNotClosed(bool closed) {
   VELOX_CHECK(!closed, "file is closed");
 }
 
+uint64_t writeFully(int32_t fd, const void* data, uint64_t size) {
+  const auto* bytes = static_cast<const uint8_t*>(data);
+  uint64_t totalWritten = 0;
+  while (totalWritten < size) {
+    ssize_t written;
+    do {
+      written = ::write(fd, bytes + totalWritten, size - totalWritten);
+    } while (written < 0 && errno == EINTR);
+    VELOX_CHECK_GT(
+        written,
+        0,
+        "write failure after {} of {} bytes: {}",
+        totalWritten,
+        size,
+        folly::errnoStr(errno));
+    totalWritten += static_cast<uint64_t>(written);
+  }
+  return totalWritten;
+}
+
 #ifdef STATX_DIOALIGN
 bool isPowerOfTwo(uint64_t value) {
   return value != 0 && (value & (value - 1)) == 0;
@@ -403,14 +423,7 @@ LocalWriteFile::~LocalWriteFile() {
 
 void LocalWriteFile::append(std::string_view data) {
   checkNotClosed(closed_);
-  const uint64_t bytesWritten = ::write(fd_, data.data(), data.size());
-  VELOX_CHECK_EQ(
-      bytesWritten,
-      data.size(),
-      "fwrite failure in LocalWriteFile::append, {} vs {}: {}",
-      bytesWritten,
-      data.size(),
-      folly::errnoStr(errno));
+  const auto bytesWritten = writeFully(fd_, data.data(), data.size());
   size_ += bytesWritten;
 }
 
@@ -419,16 +432,8 @@ void LocalWriteFile::append(std::unique_ptr<folly::IOBuf> data) {
   uint64_t totalBytesWritten{0};
   for (auto rangeIter = data->begin(); rangeIter != data->end(); ++rangeIter) {
     const auto bytesToWrite = rangeIter->size();
-    const uint64_t bytesWritten =
-        ::write(fd_, rangeIter->data(), rangeIter->size());
+    const auto bytesWritten = writeFully(fd_, rangeIter->data(), bytesToWrite);
     totalBytesWritten += bytesWritten;
-    if (bytesWritten != bytesToWrite) {
-      VELOX_FAIL(
-          "fwrite failure in LocalWriteFile::append, {} vs {}: {}",
-          bytesWritten,
-          bytesToWrite,
-          folly::errnoStr(errno));
-    }
   }
   const auto totalBytesToWrite = data->computeChainDataLength();
   VELOX_CHECK_EQ(

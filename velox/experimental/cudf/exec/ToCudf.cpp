@@ -33,6 +33,7 @@
 #include "velox/experimental/cudf/expression/JitExpression.h"
 #include "velox/experimental/cudf/expression/PrestoFunctions.h"
 #include "velox/experimental/cudf/expression/SparkFunctions.h"
+#include "velox/experimental/ucx-exchange/UcxOutputQueueManager.h"
 
 #include "folly/Conv.h"
 #include "velox/core/PlanNode.h"
@@ -41,6 +42,7 @@
 #include "velox/exec/NestedLoopJoinBuild.h"
 #include "velox/exec/Operator.h"
 #include "velox/exec/PartitionedOutput.h"
+#include "velox/exec/Task.h"
 #include "velox/exec/Values.h"
 
 #include <cudf/detail/nvtx/ranges.hpp>
@@ -120,6 +122,59 @@ RowTypePtr gpuInputBoundaryType(
   VELOX_CHECK_GT(
       planNode->sources().size(), 0, "GPU input boundary requires a source");
   return planNode->sources()[0]->outputType();
+}
+
+class UcxPartitionedOutputBufferManager final
+    : public exec::PartitionedOutputBufferManager {
+ public:
+  bool supports(
+      const core::PartitionedOutputNode& node,
+      const core::QueryConfig& queryConfig) const override {
+    const auto& config = CudfConfig::getInstance();
+    const auto cudfEnabled =
+        queryConfig.get<bool>(CudfConfig::kCudfEnabled, config.enabled);
+    return cudfEnabled && config.exchange &&
+        node.transportType() ==
+        core::PartitionedOutputNode::TransportType::kUcx;
+  }
+
+  void initializeTask(
+      std::shared_ptr<exec::Task> task,
+      core::PartitionedOutputNode::Kind kind,
+      int numPartitions,
+      int numOutputDrivers) override {
+    ucx_exchange::UcxOutputQueueManager::getInstanceRef()->initializeTask(
+        std::move(task), kind, numPartitions, numOutputDrivers);
+  }
+
+  void updateOutputBuffers(
+      const std::string& taskId,
+      int numBuffers,
+      bool noMoreBuffers) override {
+    ucx_exchange::UcxOutputQueueManager::getInstanceRef()
+        ->updateOutputBuffersIfExists(taskId, numBuffers, noMoreBuffers);
+  }
+
+  void updateNumDrivers(const std::string& taskId, uint32_t numOutputDrivers)
+      override {
+    ucx_exchange::UcxOutputQueueManager::getInstanceRef()
+        ->updateNumDriversIfExists(taskId, numOutputDrivers);
+  }
+
+  std::optional<exec::OutputBuffer::Stats> stats(
+      const std::string& taskId) override {
+    return ucx_exchange::UcxOutputQueueManager::getInstanceRef()->stats(taskId);
+  }
+
+  void removeTask(const std::string& taskId) override {
+    ucx_exchange::UcxOutputQueueManager::getInstanceRef()->removeTask(taskId);
+  }
+};
+
+std::shared_ptr<exec::PartitionedOutputBufferManager>&
+ucxPartitionedOutputBufferManagerRegistration() {
+  static std::shared_ptr<exec::PartitionedOutputBufferManager> manager;
+  return manager;
 }
 
 } // namespace
@@ -457,14 +512,24 @@ void registerCudf() {
     registerJitEvaluator(CudfConfig::getInstance().jitExpressionPriority);
   }
 
+  auto outputManager = std::make_shared<UcxPartitionedOutputBufferManager>();
+  VELOX_CHECK(exec::registerPartitionedOutputBufferManager(outputManager));
+  ucxPartitionedOutputBufferManagerRegistration() = std::move(outputManager);
+
   isCudfRegistered = true;
 }
 
 void unregisterCudf() {
+  auto& outputManager = ucxPartitionedOutputBufferManagerRegistration();
+  if (outputManager != nullptr) {
+    VELOX_CHECK(exec::unregisterPartitionedOutputBufferManager(outputManager));
+    outputManager.reset();
+  }
   output_mr_.reset();
   mr_.reset();
   output_statistics_mr_.reset();
   statistics_mr_.reset();
+  clearAsyncMemoryPoolHandles();
   exec::DriverFactory::adapters.erase(
       std::remove_if(
           exec::DriverFactory::adapters.begin(),
@@ -502,6 +567,18 @@ void CudfConfig::initialize(
   if (config.find(kCudfBatchSizeMinThreshold) != config.end()) {
     batchSizeMinThreshold =
         folly::to<int32_t>(config[kCudfBatchSizeMinThreshold]);
+  }
+  if (config.find(kCudfBatchSizeMinThresholdBytes) != config.end()) {
+    batchSizeMinThresholdBytes =
+        folly::to<uint64_t>(config[kCudfBatchSizeMinThresholdBytes]);
+  }
+  if (config.find(kCudfExchangeBatchSizeMinThreshold) != config.end()) {
+    exchangeBatchSizeMinThreshold =
+        folly::to<int32_t>(config[kCudfExchangeBatchSizeMinThreshold]);
+  }
+  if (config.find(kCudfExchangeBatchSizeMinThresholdBytes) != config.end()) {
+    exchangeBatchSizeMinThresholdBytes =
+        folly::to<uint64_t>(config[kCudfExchangeBatchSizeMinThresholdBytes]);
   }
   if (config.find(kCudfBatchSizeMaxThreshold) != config.end()) {
     batchSizeMaxThreshold =
@@ -547,6 +624,28 @@ void CudfConfig::initialize(
     VELOX_USER_CHECK_GT(
         value, 0, "{} must be positive", kCudfWindowSortedRunBytes);
     windowSortedRunBytes = static_cast<uint64_t>(value);
+  }
+  if (config.find(kCudfOrderByOutputChunkBytes) != config.end()) {
+    const auto value = folly::to<int64_t>(config[kCudfOrderByOutputChunkBytes]);
+    VELOX_USER_CHECK_GT(
+        value, 0, "{} must be positive", kCudfOrderByOutputChunkBytes);
+    orderByOutputChunkBytes = static_cast<uint64_t>(value);
+  }
+  if (config.find(kCudfOrderByMaxOutputRows) != config.end()) {
+    const auto value = folly::to<int64_t>(config[kCudfOrderByMaxOutputRows]);
+    VELOX_USER_CHECK_GT(
+        value, 0, "{} must be positive", kCudfOrderByMaxOutputRows);
+    VELOX_USER_CHECK_LE(
+        value,
+        std::numeric_limits<int32_t>::max(),
+        "{} must not exceed {}",
+        kCudfOrderByMaxOutputRows,
+        std::numeric_limits<int32_t>::max());
+    orderByMaxOutputRows = static_cast<int32_t>(value);
+  }
+  if (config.find(kCudfExchangeConcatOptimizationEnabled) != config.end()) {
+    exchangeConcatOptimizationEnabled =
+        folly::to<bool>(config[kCudfExchangeConcatOptimizationEnabled]);
   }
   if (config.find(kCudfFunctionNamePrefix) != config.end()) {
     functionNamePrefix = config[kCudfFunctionNamePrefix];

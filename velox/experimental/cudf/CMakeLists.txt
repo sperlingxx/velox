@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Velox cuDF targets link NVTX directly. Do not rely on cuDF or RMM to expose
+# their directory-scoped imported target to this directory.
+find_package(nvtx3 REQUIRED)
+
 add_subdirectory(connectors)
 add_subdirectory(exec)
 add_subdirectory(expression)

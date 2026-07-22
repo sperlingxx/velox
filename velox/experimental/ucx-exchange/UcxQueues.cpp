@@ -121,8 +121,26 @@ UcxDestinationQueue::Data UcxDestinationQueue::getData(
     uint64_t maxBytes,
     int64_t sequence,
     UcxDataAvailableCallbackV2 notify) {
-  VELOX_CHECK_GE(
-      sequence, sequence_, "Get received for an already acknowledged item");
+  if (sequence < sequence_) {
+    // A retried/duplicate UCX connection can race with task abort after the
+    // original server has already advanced this destination queue.  Treat
+    // that request as stale instead of throwing on the communicator thread
+    // (an uncaught VeloxException there terminates the whole Spark executor).
+    // Returning the current sequence lets UcxExchangeServer identify and
+    // close only the stale connection without dequeuing or clearing data.
+    LOG(WARNING) << "Ignoring stale UCX queue request: requestedSequence="
+                 << sequence << " acknowledgedSequence=" << sequence_;
+    return {nullptr, sequence_, {}, true};
+  }
+  if (notifyV2_ != nullptr && notify != nullptr) {
+    // A second server for the same task/destination/sequence must not replace
+    // the active server's waiter.  Return a deliberately different sequence
+    // so the duplicate UcxExchangeServer follows its stale-connection close
+    // path while the original callback remains installed.
+    LOG(WARNING) << "Ignoring duplicate UCX queue waiter: sequence=" << sequence
+                 << " acknowledgedSequence=" << sequence_;
+    return {nullptr, sequence_ + 1, {}, true};
+  }
   VELOX_CHECK(
       notify_ == nullptr && notifyV2_ == nullptr,
       "UcxDestinationQueue already has a pending data notification");
