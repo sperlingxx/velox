@@ -15,6 +15,7 @@
  */
 
 #include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/cudf/exec/CudfOperator.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/expression/PrestoFunctions.h"
 
@@ -26,17 +27,108 @@
 #include "velox/exec/tests/utils/PlanBuilder.h"
 #include "velox/type/Time.h"
 
+#include <algorithm>
+
 namespace facebook::velox::exec::test {
 
 using core::QueryConfig;
 using facebook::velox::test::BatchMaker;
 using namespace common::testutil;
 
+namespace {
+
+class TestGpuSourceNode final : public core::PlanNode {
+ public:
+  TestGpuSourceNode(core::PlanNodeId id, RowTypePtr outputType)
+      : PlanNode(std::move(id)), outputType_(std::move(outputType)) {}
+
+  const RowTypePtr& outputType() const override {
+    return outputType_;
+  }
+
+  const std::vector<core::PlanNodePtr>& sources() const override {
+    return sources_;
+  }
+
+  std::string_view name() const override {
+    return "TestGpuSource";
+  }
+
+ private:
+  void addDetails(std::stringstream& /*stream*/) const override {}
+
+  const RowTypePtr outputType_;
+  const std::vector<core::PlanNodePtr> sources_;
+};
+
+class TestGpuSourceOperator final : public exec::SourceOperator,
+                                    public cudf_velox::CudfOperator {
+ public:
+  TestGpuSourceOperator(
+      int32_t operatorId,
+      exec::DriverCtx* driverCtx,
+      const std::shared_ptr<const TestGpuSourceNode>& node)
+      : SourceOperator(
+            driverCtx,
+            node->outputType(),
+            operatorId,
+            node->id(),
+            "TestGpuSource"),
+        CudfOperator(operatorId, node->id()) {}
+
+  RowVectorPtr getOutput() override {
+    finished_ = true;
+    return nullptr;
+  }
+
+  exec::BlockingReason isBlocked(ContinueFuture* /*future*/) override {
+    return exec::BlockingReason::kNotBlocked;
+  }
+
+  bool isFinished() override {
+    return finished_;
+  }
+
+ private:
+  bool finished_{false};
+};
+
+class TestGpuSourceTranslator final
+    : public exec::Operator::PlanNodeTranslator {
+ public:
+  std::unique_ptr<exec::Operator> toOperator(
+      exec::DriverCtx* ctx,
+      int32_t id,
+      const core::PlanNodePtr& node) override {
+    if (auto source =
+            std::dynamic_pointer_cast<const TestGpuSourceNode>(node)) {
+      return std::make_unique<TestGpuSourceOperator>(id, ctx, source);
+    }
+    return nullptr;
+  }
+};
+
+std::vector<std::string> operatorTypes(
+    const std::shared_ptr<exec::Task>& task) {
+  std::vector<std::string> types;
+  const auto stats = task->taskStats();
+  for (const auto& pipeline : stats.pipelineStats) {
+    for (const auto& op : pipeline.operatorStats) {
+      types.push_back(op.operatorType);
+    }
+  }
+  return types;
+}
+
+} // namespace
+
 class ToCudfSelectionTest : public OperatorTestBase {
  protected:
   static void SetUpTestCase() {
     OperatorTestBase::SetUpTestCase();
     TestValue::enable();
+    exec::Operator::registerOperator(
+        std::make_unique<TestGpuSourceTranslator>());
   }
 
   void SetUp() override {
@@ -123,6 +215,39 @@ class ToCudfSelectionTest : public OperatorTestBase {
            DOUBLE(),
            VARCHAR()})};
 };
+
+TEST_F(ToCudfSelectionTest, cpuSourceConvertsBeforeGpuConsumer) {
+  auto data = makeRowVector({"c0"}, {makeFlatVector<int64_t>({1, 2, 3})});
+  auto plan = PlanBuilder().values({data}).project({"c0 + 1 as c0"}).planNode();
+
+  std::shared_ptr<exec::Task> task;
+  AssertQueryBuilder(plan).copyResults(pool(), task);
+  const auto types = operatorTypes(task);
+
+  const auto values = std::find(types.begin(), types.end(), "Values");
+  const auto fromVelox = std::find(types.begin(), types.end(), "CudfFromVelox");
+  const auto project =
+      std::find(types.begin(), types.end(), "CudfFilterProject");
+  ASSERT_NE(values, types.end());
+  ASSERT_NE(fromVelox, types.end());
+  ASSERT_NE(project, types.end());
+  EXPECT_LT(values, fromVelox);
+  EXPECT_LT(fromVelox, project);
+}
+
+TEST_F(ToCudfSelectionTest, gpuSourceLeafHasNoInputConversion) {
+  auto plan = std::make_shared<TestGpuSourceNode>(
+      "gpu-source", ROW({"c0"}, {BIGINT()}));
+
+  std::shared_ptr<exec::Task> task;
+  AssertQueryBuilder(plan).copyResults(pool(), task);
+  const auto types = operatorTypes(task);
+
+  EXPECT_NE(
+      std::find(types.begin(), types.end(), "TestGpuSource"), types.end());
+  EXPECT_EQ(
+      std::find(types.begin(), types.end(), "CudfFromVelox"), types.end());
+}
 
 TEST_F(ToCudfSelectionTest, supportedPrestoDateAddDateUsesCudf) {
   auto input = makeRowVector(

@@ -285,7 +285,13 @@ bool CompileState::compile(bool allowCpuFallback) {
       planNode = getPlanNode(oper->planNodeId());
     }
 
-    if (previousOperatorIsNotGpu and thisOpProps.acceptsGpuInput and planNode) {
+    // Source plan nodes (for example a fused GPU table scan) have no upstream
+    // RowVector to convert.  operatorIndex == 0 also covers real external
+    // fragment inputs, so distinguish the two using the plan-node edge: an
+    // input-consuming boundary always has at least one source.
+    const bool hasInputPlanEdge = !planNode || !planNode->sources().empty();
+    if (previousOperatorIsNotGpu and thisOpProps.acceptsGpuInput and
+        planNode and hasInputPlanEdge) {
       replaceOp.push_back(
           std::make_unique<CudfFromVelox>(
               id,
