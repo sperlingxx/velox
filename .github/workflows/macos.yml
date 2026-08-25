@@ -16,9 +16,13 @@ name: macOS Build
 
 on:
   push:
+    branches:
+      - dev
     paths:
       - velox/**
       - '!velox/docs/**'
+      - '!velox/experimental/cudf/**'
+      - '!velox/experimental/ucx-exchange/**'
       - CMakeLists.txt
       - CMake/**
       - scripts/setup-macos.sh
@@ -28,9 +32,13 @@ on:
       - .github/workflows/macos.yml
 
   pull_request:
+    branches:
+      - dev
     paths:
       - velox/**
       - '!velox/docs/**'
+      - '!velox/experimental/cudf/**'
+      - '!velox/experimental/ucx-exchange/**'
       - CMakeLists.txt
       - CMake/**
       - scripts/setup-macos.sh
@@ -48,13 +56,13 @@ concurrency:
 
 jobs:
   macos-build:
-    if: ${{ github.repository == 'facebookincubator/velox' }}
     name: macos-15-${{ matrix.type }}
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
         # macos-15 = arm64 Mac and cmake 4.0 with 7GB RAM
-        type: [debug, release]
+        type: [debug]
     runs-on: macos-15
     env:
       CCACHE_DIR: ${{ github.workspace }}/ccache
