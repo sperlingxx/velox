@@ -91,7 +91,7 @@ jobs:
 
       - name: Configure and compile GPU Spark objects
         env:
-          IMAGE: ghcr.io/facebookincubator/velox-dev@sha256:921424bcfdd08df93e6cb0e67659e98476c461dd9acfbff68c7304548a598e78
+          IMAGE: ghcr.io/czentgr/czentgr-test@sha256:9141292f15415307aa9da45da11f3f79fcb0296ec27e85abf81e37840ac76cac
         run: |
           mkdir -p ccache
           docker pull "$IMAGE"

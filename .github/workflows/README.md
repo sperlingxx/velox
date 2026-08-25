@@ -43,9 +43,9 @@ For current build times and performance trends, see the [CI performance metrics]
 
 ### GPU Spark Hosted Compile (`gpu-spark-hosted-compile.yml`)
 
-Uses the existing `velox-dev:adapters` image and adapters CMake profile on a
-standard four-core GitHub-hosted runner. It configures the complete cuDF build
-graph, then asks Ninja to compile only Velox-owned production objects under
+Uses the existing adapters CI image and CMake profile on a standard four-core
+GitHub-hosted runner. It configures the complete cuDF build graph, then asks
+Ninja to compile only Velox-owned production objects under
 `velox/experimental/cudf` and `velox/experimental/ucx-exchange`. Building
 objects directly avoids compiling and linking all of libcudf while still
 checking C++, CUDA, generated-header, and public API compatibility.
