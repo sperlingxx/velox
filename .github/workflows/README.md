@@ -49,6 +49,8 @@ Ninja to compile only Velox-owned production objects under
 `velox/experimental/cudf` and `velox/experimental/ucx-exchange`. Building
 objects directly avoids compiling and linking all of libcudf while still
 checking C++, CUDA, generated-header, and public API compatibility.
+The current adapters image does not include UCX, so the workflow installs it
+through `scripts/setup-centos-adapters.sh` and caches the resulting prefix.
 
 This lane does not link the resulting libraries or execute GPU tests. Those
 remain responsibilities of the full adapters and `cudf-tests` jobs on larger

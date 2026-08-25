@@ -65,6 +65,8 @@ jobs:
     name: cuDF and UCX object compile
     runs-on: ubuntu-22.04
     timeout-minutes: 90
+    env:
+      BUILD_IMAGE: ghcr.io/czentgr/czentgr-test@sha256:9141292f15415307aa9da45da11f3f79fcb0296ec27e85abf81e37840ac76cac
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
@@ -81,6 +83,13 @@ jobs:
             /opt/hostedtoolcache/CodeQL
           df -h /
 
+      - name: Restore UCX
+        id: ucx-cache
+        uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: hosted-deps/ucx
+          key: hosted-ucx-${{ runner.os }}-1.20.1-v1
+
       - name: Restore compiler cache
         uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
         with:
@@ -89,25 +98,58 @@ jobs:
           restore-keys: |
             hosted-gpu-spark-${{ runner.os }}-
 
+      - name: Pull build image
+        run: |
+          docker pull "$BUILD_IMAGE"
+
+      - name: Build UCX dependency
+        if: steps.ucx-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p hosted-deps/ucx
+          docker run --rm \
+            --entrypoint /bin/bash \
+            --env BUILD_THREADS=4 \
+            --env DEPENDENCY_DIR=/tmp/velox-hosted-deps \
+            --env INSTALL_PREFIX=/workspace/hosted-deps/ucx \
+            --env UCX_VERSION=1.20.1 \
+            --mount "type=bind,source=$GITHUB_WORKSPACE,target=/workspace" \
+            --workdir /workspace \
+            "$BUILD_IMAGE" -lc '
+              set -euo pipefail
+              mkdir -p "$DEPENDENCY_DIR"
+              source scripts/setup-centos-adapters.sh
+              install_ucx
+            '
+
+      - name: Save UCX
+        if: steps.ucx-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: hosted-deps/ucx
+          key: hosted-ucx-${{ runner.os }}-1.20.1-v1
+
       - name: Configure and compile GPU Spark objects
-        env:
-          IMAGE: ghcr.io/czentgr/czentgr-test@sha256:9141292f15415307aa9da45da11f3f79fcb0296ec27e85abf81e37840ac76cac
         run: |
           mkdir -p ccache
-          docker pull "$IMAGE"
           docker run --rm \
             --entrypoint /bin/bash \
             --env CCACHE_DIR=/workspace/ccache \
             --env CCACHE_MAXSIZE=2G \
             --env CCACHE_NOHASHDIR=true \
+            --env CMAKE_PREFIX_PATH=/workspace/hosted-deps/ucx \
+            --env CPATH=/workspace/hosted-deps/ucx/include \
+            --env LD_LIBRARY_PATH=/workspace/hosted-deps/ucx/lib:/workspace/hosted-deps/ucx/lib64 \
+            --env LIBRARY_PATH=/workspace/hosted-deps/ucx/lib:/workspace/hosted-deps/ucx/lib64 \
+            --env PKG_CONFIG_PATH=/workspace/hosted-deps/ucx/lib/pkgconfig:/workspace/hosted-deps/ucx/lib64/pkgconfig \
             --env VELOX_DEPENDENCY_SOURCE=SYSTEM \
             --env cudf_SOURCE=BUNDLED \
             --mount "type=bind,source=$GITHUB_WORKSPACE,target=/workspace" \
             --workdir /workspace \
-            "$IMAGE" -lc '
+            "$BUILD_IMAGE" -lc '
               set -euo pipefail
               git config --global --add safe.directory /workspace
               source /opt/rh/gcc-toolset-14/enable
+              dnf -y install rdma-core-devel
 
               BUILD_PROFILE=adapters USE_CLANG=false source .github/scripts/cmake-flags.sh
               export CUDA_ARCHITECTURES=70
