@@ -143,6 +143,7 @@ jobs:
             --env PKG_CONFIG_PATH=/workspace/hosted-deps/ucx/lib/pkgconfig:/workspace/hosted-deps/ucx/lib64/pkgconfig \
             --env VELOX_DEPENDENCY_SOURCE=SYSTEM \
             --env cudf_SOURCE=BUNDLED \
+            --env faiss_SOURCE=BUNDLED \
             --mount "type=bind,source=$GITHUB_WORKSPACE,target=/workspace" \
             --workdir /workspace \
             "$BUILD_IMAGE" -lc '
