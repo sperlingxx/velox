@@ -193,7 +193,8 @@ void CudfBatchConcat::doAddInput(RowVectorPtr input) {
       cudfVector,
       "CudfBatchConcat",
       planNodeId(),
-      static_cast<const void*>(this),
+      operatorId(),
+      driverId(),
       "addInput");
   buffer_.push_back(std::move(cudfVector));
 

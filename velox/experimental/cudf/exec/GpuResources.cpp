@@ -57,6 +57,16 @@ namespace facebook::velox::cudf_velox {
 namespace {
 thread_local std::string currentAllocationContext{"unattributed"};
 
+using CudaAllocTracePush = void (*)(const char*);
+
+/// Resolves the optional LD_PRELOAD tracer's push entry point once. Null when
+/// the tracer is not loaded, which is the normal case.
+CudaAllocTracePush cudaAllocTracePush() {
+  static const auto push = reinterpret_cast<CudaAllocTracePush>(
+      dlsym(RTLD_DEFAULT, "cuda_alloc_trace_push_context"));
+  return push;
+}
+
 // Number of live-allocation owners listed in the OOM dump. With every scope
 // from this change in place a task has roughly twenty non-zero contexts, so a
 // smaller cap can hide an owner that is individually small but collectively
@@ -374,6 +384,11 @@ std::vector<DeviceAllocationContextStats> captureDeviceAllocationAttribution() {
 
 std::string currentDeviceAllocationContext() {
   return currentAllocationContext;
+}
+
+void clearDeviceMemoryAttributionResources() {
+  primaryAttributionResource.reset();
+  outputAttributionResource.reset();
 }
 
 cuda::mr::any_resource<cuda::mr::device_accessible> createMemoryResource(
@@ -717,20 +732,34 @@ void logDeviceMemorySnapshot(
                << " rmmTotalAllocations=" << snapshot.rmmTotalAllocations;
 }
 
+bool deviceAllocationTracingEnabled() {
+  static const bool enabled =
+      deviceMemoryDiagnosticsEnabled() || cudaAllocTracePush() != nullptr;
+  return enabled;
+}
+
 CudaAllocationTraceScope::CudaAllocationTraceScope(const std::string& label) {
+  if (!deviceAllocationTracingEnabled()) {
+    return;
+  }
+  enter(label);
+}
+
+void CudaAllocationTraceScope::enter(const std::string& label) {
+  entered_ = true;
   previousContext_ = currentAllocationContext;
   currentAllocationContext = label;
-  using Push = void (*)(const char*);
-  static auto push = reinterpret_cast<Push>(
-      dlsym(RTLD_DEFAULT, "cuda_alloc_trace_push_context"));
-  if (push != nullptr) {
+  if (const auto push = cudaAllocTracePush()) {
     push(label.c_str());
     active_ = true;
   }
 }
 
 CudaAllocationTraceScope::~CudaAllocationTraceScope() {
-  currentAllocationContext = previousContext_;
+  if (!entered_) {
+    return;
+  }
+  currentAllocationContext = std::move(previousContext_);
   if (!active_) {
     return;
   }

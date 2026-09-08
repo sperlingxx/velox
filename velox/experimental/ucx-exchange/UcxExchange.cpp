@@ -195,7 +195,8 @@ RowVectorPtr UcxExchange::getOutputFromPackedTable() {
       result,
       "UcxExchange",
       planNodeId(),
-      static_cast<const void*>(this),
+      operatorId(),
+      operatorCtx_->driverCtx()->driverId,
       "getOutput");
 
   recordInputStats(gpuDataSize, result);

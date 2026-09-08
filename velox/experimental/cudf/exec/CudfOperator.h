@@ -132,11 +132,11 @@ class CudfOperatorBase : public exec::Operator, public NvtxHelper {
     VELOX_NVTX_OPERATOR_FUNC_RANGE_IF(
         nvtxMethods_ & NvtxMethodFlag::kAddInput, className_);
     CudaAllocationTraceScope allocationTrace(
-        fmt::format(
-            "{} node={} instance={} method=addInput",
-            className_,
-            planNodeId_,
-            static_cast<const void*>(this)));
+        "{} node={} operatorId={} driver={} method=addInput",
+        className_,
+        planNodeId_,
+        operatorId_,
+        driverId());
     const auto inputRows = input == nullptr ? 0 : input->size();
     const auto sample = shouldSampleDeviceMemory(false);
     if (sample) {
@@ -158,11 +158,11 @@ class CudfOperatorBase : public exec::Operator, public NvtxHelper {
     VELOX_NVTX_OPERATOR_FUNC_RANGE_IF(
         nvtxMethods_ & NvtxMethodFlag::kGetOutput, className_);
     CudaAllocationTraceScope allocationTrace(
-        fmt::format(
-            "{} node={} instance={} method=getOutput",
-            className_,
-            planNodeId_,
-            static_cast<const void*>(this)));
+        "{} node={} operatorId={} driver={} method=getOutput",
+        className_,
+        planNodeId_,
+        operatorId_,
+        driverId());
     const auto sample = shouldSampleDeviceMemory(false);
     if (sample) {
       logDeviceMemory("getOutput", "before", -1, -1);
@@ -185,11 +185,11 @@ class CudfOperatorBase : public exec::Operator, public NvtxHelper {
     VELOX_NVTX_OPERATOR_FUNC_RANGE_IF(
         nvtxMethods_ & NvtxMethodFlag::kNoMoreInput, className_);
     CudaAllocationTraceScope allocationTrace(
-        fmt::format(
-            "{} node={} instance={} method=noMoreInput",
-            className_,
-            planNodeId_,
-            static_cast<const void*>(this)));
+        "{} node={} operatorId={} driver={} method=noMoreInput",
+        className_,
+        planNodeId_,
+        operatorId_,
+        driverId());
     const auto sample = shouldSampleDeviceMemory(true);
     if (sample) {
       logDeviceMemory("noMoreInput", "before", -1, -1);
@@ -210,11 +210,11 @@ class CudfOperatorBase : public exec::Operator, public NvtxHelper {
     VELOX_NVTX_OPERATOR_FUNC_RANGE_IF(
         nvtxMethods_ & NvtxMethodFlag::kClose, className_);
     CudaAllocationTraceScope allocationTrace(
-        fmt::format(
-            "{} node={} instance={} method=close",
-            className_,
-            planNodeId_,
-            static_cast<const void*>(this)));
+        "{} node={} operatorId={} driver={} method=close",
+        className_,
+        planNodeId_,
+        operatorId_,
+        driverId());
     const auto sample = shouldSampleDeviceMemory(true);
     if (sample) {
       logDeviceMemory("close", "before", -1, -1);
@@ -242,6 +242,14 @@ class CudfOperatorBase : public exec::Operator, public NvtxHelper {
 
   virtual void doClose() {
     Operator::close();
+  }
+
+  /// Identifies this operator instance in device-memory diagnostics. Together
+  /// with the plan node id this is what the instance pointer used to convey,
+  /// but it is stable across runs and comparable between them.
+  int driverId() const {
+    const auto* driverCtx = operatorCtx_->driverCtx();
+    return driverCtx == nullptr ? -1 : driverCtx->driverId;
   }
 
  private:

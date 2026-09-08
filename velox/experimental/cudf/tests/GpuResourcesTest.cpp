@@ -178,6 +178,45 @@ TEST_F(GpuResourcesTest, traceScopeNestsAndRestores) {
   EXPECT_EQ(currentDeviceAllocationContext(), initial);
 }
 
+TEST_F(GpuResourcesTest, traceScopeFormatsLabelLazily) {
+  ASSERT_TRUE(deviceAllocationTracingEnabled());
+  {
+    CudaAllocationTraceScope scope(
+        "{} node={} operatorId={} driver={} method=addInput",
+        "CudfHashJoinBuild",
+        "13",
+        4,
+        2);
+    EXPECT_EQ(
+        currentDeviceAllocationContext(),
+        "CudfHashJoinBuild node=13 operatorId=4 driver=2 method=addInput");
+  }
+  // A single argument is the pre-formatted overload, not a format string.
+  {
+    const std::string label = "already {formatted}";
+    CudaAllocationTraceScope scope(label);
+    EXPECT_EQ(currentDeviceAllocationContext(), label);
+  }
+}
+
+TEST_F(GpuResourcesTest, clearingAttributionResourcesEmptiesTheMap) {
+  TestCudaStream stream;
+  std::optional<rmm::device_buffer> buffer;
+  {
+    CudaAllocationTraceScope scope("cleared");
+    buffer.emplace(4096, stream.view(), resource());
+  }
+  ASSERT_FALSE(captureDeviceAllocationAttribution().empty());
+
+  // unregisterCudf drops these before the statistics resources they wrap.
+  // Free first: the buffer's deallocation would otherwise run against a
+  // resource whose attribution map is gone.
+  buffer.reset();
+  clearDeviceMemoryAttributionResources();
+  EXPECT_TRUE(captureDeviceAllocationAttribution().empty());
+  EXPECT_FALSE(reattributeDeviceAllocation(&stream, "holder"));
+}
+
 TEST_F(GpuResourcesTest, allocationIsBilledToEnclosingScope) {
   TestCudaStream stream;
   constexpr std::size_t kBytes = 4096;
@@ -264,8 +303,8 @@ TEST_F(GpuResourcesTest, reattributionRejectsUnknownPointers) {
   EXPECT_FALSE(reattributeDeviceAllocation(nullptr, "holder"));
 
   // Allocated outside any cuDF resource, so the attribution map has no record
-  // of it. This is also the early-out taken when diagnostics are disabled and
-  // no attribution resource exists at all.
+  // of it. The diagnostics-disabled case, where no attribution resource
+  // exists at all, is covered by clearingAttributionResourcesEmptiesTheMap.
   void* foreign = nullptr;
   ASSERT_EQ(cudaMalloc(&foreign, 1024), cudaSuccess);
   const auto before = captureDeviceAllocationAttribution();
