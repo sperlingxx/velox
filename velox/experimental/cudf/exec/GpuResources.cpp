@@ -57,6 +57,31 @@ namespace facebook::velox::cudf_velox {
 namespace {
 thread_local std::string currentAllocationContext{"unattributed"};
 
+// Number of live-allocation owners listed in the OOM dump. With every scope
+// from this change in place a task has roughly twenty non-zero contexts, so a
+// smaller cap can hide an owner that is individually small but collectively
+// dominant. Override with GLUTEN_CUDF_DEVICE_OOM_OWNER_LIMIT.
+constexpr std::size_t kDefaultDeviceOomOwnerLimit = 32;
+
+std::size_t deviceOomOwnerLimit() {
+  static const std::size_t limit = [] {
+    const auto* value = std::getenv("GLUTEN_CUDF_DEVICE_OOM_OWNER_LIMIT");
+    if (value == nullptr || value[0] == '\0') {
+      return kDefaultDeviceOomOwnerLimit;
+    }
+    char* end = nullptr;
+    errno = 0;
+    const auto parsed = std::strtoull(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' || parsed == 0) {
+      LOG(ERROR) << "Ignoring invalid GLUTEN_CUDF_DEVICE_OOM_OWNER_LIMIT='"
+                 << value << "'";
+      return kDefaultDeviceOomOwnerLimit;
+    }
+    return static_cast<std::size_t>(parsed);
+  }();
+  return limit;
+}
+
 class OperatorAttributionResource final {
   struct State;
 
@@ -85,10 +110,6 @@ class OperatorAttributionResource final {
       dumpFailure(bytes);
       throw;
     }
-
-    const auto context = currentAllocationContext.empty()
-        ? std::string{"unattributed"}
-        : currentAllocationContext;
     recordAllocation(pointer, bytes);
     return pointer;
   }
@@ -120,6 +141,50 @@ class OperatorAttributionResource final {
       std::size_t alignment) noexcept {
     upstream_.deallocate_sync(pointer, bytes, alignment);
     recordDeallocation(pointer);
+  }
+
+  void appendContextStats(
+      std::vector<DeviceAllocationContextStats>& out) const {
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    out.reserve(out.size() + state_->contexts.size());
+    for (const auto& entry : state_->contexts) {
+      out.push_back(
+          DeviceAllocationContextStats{
+              entry.first,
+              entry.second.currentBytes,
+              entry.second.peakBytes,
+              entry.second.currentAllocations});
+    }
+  }
+
+  /// Moves the live bytes and allocation count of an already-recorded
+  /// allocation from its birth context to 'newContext'. Returns false when
+  /// 'pointer' was not allocated through this resource.
+  bool reattribute(void* pointer, const std::string& newContext) {
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    const auto allocation = state_->allocations.find(pointer);
+    if (allocation == state_->allocations.end()) {
+      return false;
+    }
+    if (allocation->second.context == newContext) {
+      return true;
+    }
+
+    const auto bytes = allocation->second.bytes;
+    const auto previous = state_->contexts.find(allocation->second.context);
+    if (previous != state_->contexts.end()) {
+      // Matches deallocation semantics: the old context keeps its peak.
+      previous->second.currentBytes -= bytes;
+      --previous->second.currentAllocations;
+    }
+    // Matches recordAllocation semantics: the new context owns the bytes and
+    // may raise its peak.
+    auto& stats = state_->contexts[newContext];
+    stats.currentBytes += bytes;
+    stats.peakBytes = std::max(stats.peakBytes, stats.currentBytes);
+    ++stats.currentAllocations;
+    allocation->second.context = newContext;
+    return true;
   }
 
   bool operator==(OperatorAttributionResource const& other) const noexcept {
@@ -193,7 +258,8 @@ class OperatorAttributionResource final {
                << " cudaValid=" << (cudaStatus == cudaSuccess)
                << " freeBytes=" << freeBytes << " totalBytes=" << totalBytes
                << " attributedContexts=" << snapshot.size();
-    const auto count = std::min<std::size_t>(snapshot.size(), 12);
+    const auto count =
+        std::min<std::size_t>(snapshot.size(), deviceOomOwnerLimit());
     for (std::size_t index = 0; index < count; ++index) {
       LOG(ERROR) << "CUDF_DEVICE_OOM_OWNER rank=" << (index + 1)
                  << " currentBytes=" << snapshot[index].second.currentBytes
@@ -275,6 +341,39 @@ wrapDeviceMemoryResourceForDiagnostics(
       rmm::device_async_resource_ref{statistics.value()});
   return cuda::mr::any_resource<cuda::mr::device_accessible>{
       rmm::device_async_resource_ref{*attribution}};
+}
+
+bool reattributeDeviceAllocation(void* pointer, const std::string& newContext) {
+  if (pointer == nullptr) {
+    return false;
+  }
+  // Both resources exist only on the diagnostic path, so this is also the
+  // diagnostics-disabled early out. With the default empty cudf.output_mr,
+  // output_mr_ aliases mr_ and the second resource is never created, making
+  // the fallback lookup free.
+  if (primaryAttributionResource != nullptr &&
+      primaryAttributionResource->reattribute(pointer, newContext)) {
+    return true;
+  }
+  if (outputAttributionResource != nullptr) {
+    return outputAttributionResource->reattribute(pointer, newContext);
+  }
+  return false;
+}
+
+std::vector<DeviceAllocationContextStats> captureDeviceAllocationAttribution() {
+  std::vector<DeviceAllocationContextStats> stats;
+  if (primaryAttributionResource != nullptr) {
+    primaryAttributionResource->appendContextStats(stats);
+  }
+  if (outputAttributionResource != nullptr) {
+    outputAttributionResource->appendContextStats(stats);
+  }
+  return stats;
+}
+
+std::string currentDeviceAllocationContext() {
+  return currentAllocationContext;
 }
 
 cuda::mr::any_resource<cuda::mr::device_accessible> createMemoryResource(

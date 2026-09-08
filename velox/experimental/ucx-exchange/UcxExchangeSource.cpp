@@ -224,6 +224,13 @@ UcxExchangeSource::UcxExchangeSource(
       taskId_(taskId),
       partitionKey_(partitionKey),
       partitionKeyHash_(fnv1a_32(partitionKey_.toString())),
+      receiveTraceLabel_(
+          fmt::format(
+              "UcxExchangeSource task={} remoteTask={} destination={} "
+              "method=receive",
+              taskId_,
+              partitionKey_.taskId,
+              partitionKey_.destination)),
       queue_(std::move(queue)) {
   setState(ReceiverState::Created);
 }
@@ -794,6 +801,11 @@ bool UcxExchangeSource::tryStartDataReceive(
   // downstream work and eventual deallocation remain stream ordered.
   auto& recvMemoryResource = receiveDeviceMemoryResource();
   const auto allocateReceiveBuffer = [&]() {
+    // Constructed inside the lambda so the thread_local allocation context is
+    // set on the ucx-progress thread that performs the allocation, and so the
+    // post-synchronize retry below is covered as well.
+    facebook::velox::cudf_velox::CudaAllocationTraceScope allocationTrace(
+        receiveTraceLabel_);
     ptr->dataBuf = std::make_unique<rmm::device_buffer>(
         ptr->metadata.dataSizeBytes,
         stream,
