@@ -184,6 +184,12 @@ class CudfOperatorBase : public exec::Operator, public NvtxHelper {
   void noMoreInput() final {
     VELOX_NVTX_OPERATOR_FUNC_RANGE_IF(
         nvtxMethods_ & NvtxMethodFlag::kNoMoreInput, className_);
+    CudaAllocationTraceScope allocationTrace(
+        fmt::format(
+            "{} node={} instance={} method=noMoreInput",
+            className_,
+            planNodeId_,
+            static_cast<const void*>(this)));
     const auto sample = shouldSampleDeviceMemory(true);
     if (sample) {
       logDeviceMemory("noMoreInput", "before", -1, -1);
@@ -203,6 +209,12 @@ class CudfOperatorBase : public exec::Operator, public NvtxHelper {
   void close() final {
     VELOX_NVTX_OPERATOR_FUNC_RANGE_IF(
         nvtxMethods_ & NvtxMethodFlag::kClose, className_);
+    CudaAllocationTraceScope allocationTrace(
+        fmt::format(
+            "{} node={} instance={} method=close",
+            className_,
+            planNodeId_,
+            static_cast<const void*>(this)));
     const auto sample = shouldSampleDeviceMemory(true);
     if (sample) {
       logDeviceMemory("close", "before", -1, -1);

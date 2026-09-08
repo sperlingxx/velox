@@ -297,6 +297,10 @@ class UcxExchangeSource
   const uint32_t
       partitionKeyHash_; // A hash of above, used to create unique tags.
 
+  // Allocation-attribution label for receive buffers. Built once because the
+  // scope is entered on the ucx-progress thread once per received chunk.
+  const std::string receiveTraceLabel_;
+
   std::atomic<ReceiverState> state_;
 
   uint32_t sequenceNumber_{0};

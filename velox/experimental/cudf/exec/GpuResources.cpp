@@ -57,6 +57,31 @@ namespace facebook::velox::cudf_velox {
 namespace {
 thread_local std::string currentAllocationContext{"unattributed"};
 
+// Number of live-allocation owners listed in the OOM dump. With every scope
+// from this change in place a task has roughly twenty non-zero contexts, so a
+// smaller cap can hide an owner that is individually small but collectively
+// dominant. Override with GLUTEN_CUDF_DEVICE_OOM_OWNER_LIMIT.
+constexpr std::size_t kDefaultDeviceOomOwnerLimit = 32;
+
+std::size_t deviceOomOwnerLimit() {
+  static const std::size_t limit = [] {
+    const auto* value = std::getenv("GLUTEN_CUDF_DEVICE_OOM_OWNER_LIMIT");
+    if (value == nullptr || value[0] == '\0') {
+      return kDefaultDeviceOomOwnerLimit;
+    }
+    char* end = nullptr;
+    errno = 0;
+    const auto parsed = std::strtoull(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' || parsed == 0) {
+      LOG(ERROR) << "Ignoring invalid GLUTEN_CUDF_DEVICE_OOM_OWNER_LIMIT='"
+                 << value << "'";
+      return kDefaultDeviceOomOwnerLimit;
+    }
+    return static_cast<std::size_t>(parsed);
+  }();
+  return limit;
+}
+
 class OperatorAttributionResource final {
   struct State;
 
@@ -85,10 +110,6 @@ class OperatorAttributionResource final {
       dumpFailure(bytes);
       throw;
     }
-
-    const auto context = currentAllocationContext.empty()
-        ? std::string{"unattributed"}
-        : currentAllocationContext;
     recordAllocation(pointer, bytes);
     return pointer;
   }
@@ -193,7 +214,8 @@ class OperatorAttributionResource final {
                << " cudaValid=" << (cudaStatus == cudaSuccess)
                << " freeBytes=" << freeBytes << " totalBytes=" << totalBytes
                << " attributedContexts=" << snapshot.size();
-    const auto count = std::min<std::size_t>(snapshot.size(), 12);
+    const auto count =
+        std::min<std::size_t>(snapshot.size(), deviceOomOwnerLimit());
     for (std::size_t index = 0; index < count; ++index) {
       LOG(ERROR) << "CUDF_DEVICE_OOM_OWNER rank=" << (index + 1)
                  << " currentBytes=" << snapshot[index].second.currentBytes

@@ -388,6 +388,11 @@ void CudfHiveDataSource::setFromDataSource(
 std::optional<RowVectorPtr> CudfHiveDataSource::next(
     uint64_t size,
     velox::ContinueFuture& /* future */) {
+  CudaAllocationTraceScope allocationTrace(
+      fmt::format(
+          "CudfHiveDataSource instance={} reader={} method=next",
+          static_cast<const void*>(this),
+          static_cast<const void*>(cudfSplitReader_.get())));
   VELOX_CHECK_NOT_NULL(split_, "No split present. Call addSplit() first.");
   VELOX_CHECK_NOT_NULL(cudfSplitReader_, "No split to process.");
   auto chunkOpt = cudfSplitReader_->next(size);
