@@ -401,7 +401,8 @@ void reattributeCudfVectorHolder(
     const CudfVectorPtr& vector,
     std::string_view operatorName,
     std::string_view nodeId,
-    const void* instance,
+    int32_t operatorId,
+    int driverId,
     std::string_view method) {
   if (vector == nullptr || !deviceMemoryDiagnosticsEnabled()) {
     return;
@@ -416,10 +417,11 @@ void reattributeCudfVectorHolder(
   (void)reattributeDeviceAllocation(
       allocation->pointer,
       fmt::format(
-          "{} node={} instance={} method={} role=holder",
+          "{} node={} operatorId={} driver={} method={} role=holder",
           operatorName,
           nodeId,
-          instance,
+          operatorId,
+          driverId,
           method));
 }
 

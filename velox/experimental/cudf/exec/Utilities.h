@@ -234,7 +234,8 @@ void reattributeCudfVectorHolder(
     const CudfVectorPtr& vector,
     std::string_view operatorName,
     std::string_view nodeId,
-    const void* instance,
+    int32_t operatorId,
+    int driverId,
     std::string_view method);
 
 /// Extract the base function name from a possibly-prefixed name.

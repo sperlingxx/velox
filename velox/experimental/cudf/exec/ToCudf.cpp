@@ -556,6 +556,9 @@ void unregisterCudf() {
       std::string{core::TransportKind::kUcx});
   output_mr_.reset();
   mr_.reset();
+  // The attribution resources reference the statistics resources, so they
+  // must go first.
+  clearDeviceMemoryAttributionResources();
   output_statistics_mr_.reset();
   statistics_mr_.reset();
   clearAsyncMemoryPoolHandles();

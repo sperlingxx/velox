@@ -300,7 +300,8 @@ void CudfHashJoinBuild::doAddInput(RowVectorPtr input) {
         cudfInput,
         "CudfHashJoinBuild",
         planNodeId(),
-        static_cast<const void*>(this),
+        operatorId(),
+        driverId(),
         "addInput");
     inputs_.push_back(std::move(cudfInput));
   }

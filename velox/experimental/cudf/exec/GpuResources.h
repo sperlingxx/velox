@@ -23,11 +23,14 @@
 
 #include <cuda/memory_resource>
 
+#include <fmt/format.h>
+
 #include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace facebook::velox::cudf_velox {
@@ -168,8 +171,13 @@ struct DeviceAllocationContextStats {
 captureDeviceAllocationAttribution();
 
 /// Returns the allocation context that CudaAllocationTraceScope has
-/// established on the calling thread.
+/// established on the calling thread, or "unattributed" when tracing is off.
 [[nodiscard]] std::string currentDeviceAllocationContext();
+
+/// Drops the diagnostic attribution resources. Must be called before the
+/// statistics resources they wrap are destroyed, otherwise they are left
+/// holding a reference to a destroyed upstream.
+void clearDeviceMemoryAttributionResources();
 
 /// If GLUTEN_CUDF_ASYNC_QUERY_END_TRIM_BYTES is set, synchronizes the device
 /// and releases unused cudaMallocAsync pool memory down to that retained-byte
@@ -229,17 +237,49 @@ inline void logDeviceMemorySnapshot(const std::string& label) {
   }
 }
 
-/// Associates CUDA allocations on the current thread with a native operator
-/// when the optional LD_PRELOAD diagnostic tracer is present.
+/// Returns true when an allocation context is worth establishing, i.e. when
+/// device memory diagnostics are on or the optional LD_PRELOAD tracer is
+/// loaded. Cached after the first call.
+[[nodiscard]] bool deviceAllocationTracingEnabled();
+
+/// Associates device allocations made on the current thread with the operator
+/// and method that requested them. The context is recorded by the diagnostic
+/// attribution resource and, when the optional LD_PRELOAD tracer is loaded,
+/// pushed to it as well.
+///
+/// Inert when deviceAllocationTracingEnabled() is false: nothing is formatted,
+/// copied, or stored. Prefer the format-string constructor on hot paths so the
+/// label is built only when it will be used; use the std::string constructor
+/// for labels cached outside the hot path.
 class CudaAllocationTraceScope {
  public:
   explicit CudaAllocationTraceScope(const std::string& label);
+
+  /// Formats 'label' only when tracing is enabled. Takes at least one
+  /// argument so a single-argument call is unambiguously the constructor
+  /// above.
+  template <typename Arg, typename... Args>
+  CudaAllocationTraceScope(
+      fmt::format_string<Arg, Args...> label,
+      Arg&& arg,
+      Args&&... args) {
+    if (!deviceAllocationTracingEnabled()) {
+      return;
+    }
+    enter(
+        fmt::format(
+            label, std::forward<Arg>(arg), std::forward<Args>(args)...));
+  }
+
   ~CudaAllocationTraceScope();
 
   CudaAllocationTraceScope(const CudaAllocationTraceScope&) = delete;
   CudaAllocationTraceScope& operator=(const CudaAllocationTraceScope&) = delete;
 
  private:
+  void enter(const std::string& label);
+
+  bool entered_{false};
   bool active_{false};
   std::string previousContext_;
 };
