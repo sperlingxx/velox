@@ -294,6 +294,14 @@ void CudfHashJoinBuild::doAddInput(RowVectorPtr input) {
       auto lockedStats = stats_.wlock();
       lockedStats->numNullKeys += null_count;
     }
+    // inputs_ retains every build batch until doNoMoreInput concatenates
+    // them, so the build side owns these bytes from here on.
+    reattributeCudfVectorHolder(
+        cudfInput,
+        "CudfHashJoinBuild",
+        planNodeId(),
+        static_cast<const void*>(this),
+        "addInput");
     inputs_.push_back(std::move(cudfInput));
   }
 }

@@ -16,6 +16,7 @@
 
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/CudfNoDefaults.h"
+#include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 
@@ -27,8 +28,11 @@
 
 #include <cuda_runtime_api.h>
 
+#include <fmt/format.h>
+
 #include <algorithm>
 #include <limits>
+#include <string_view>
 #include <vector>
 
 namespace facebook::velox::cudf_velox {
@@ -391,6 +395,32 @@ const CudaEvent& CudaEvent::recordFrom(rmm::cuda_stream_view stream) const {
 const CudaEvent& CudaEvent::waitOn(rmm::cuda_stream_view stream) const {
   CUDF_CUDA_TRY(cudaStreamWaitEvent(stream.value(), event_, 0));
   return *this;
+}
+
+void reattributeCudfVectorHolder(
+    const CudfVectorPtr& vector,
+    std::string_view operatorName,
+    std::string_view nodeId,
+    const void* instance,
+    std::string_view method) {
+  if (vector == nullptr || !deviceMemoryDiagnosticsEnabled()) {
+    return;
+  }
+  const auto allocation = vector->packedDeviceAllocation();
+  if (!allocation.has_value()) {
+    return;
+  }
+  // A false return means the buffer was not allocated through a cuDF
+  // resource, which is expected for intra-node handoffs, so it is not an
+  // error worth logging on a per-batch path.
+  (void)reattributeDeviceAllocation(
+      allocation->pointer,
+      fmt::format(
+          "{} node={} instance={} method={} role=holder",
+          operatorName,
+          nodeId,
+          instance,
+          method));
 }
 
 std::string getBaseFunctionName(const std::string& fullName) {

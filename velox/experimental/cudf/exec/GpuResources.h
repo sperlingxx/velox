@@ -28,6 +28,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace facebook::velox::cudf_velox {
 
@@ -135,6 +136,40 @@ createMemoryResource(std::string_view mode, int percent);
 wrapDeviceMemoryResourceForDiagnostics(
     cuda::mr::any_resource<cuda::mr::device_accessible> upstream,
     bool outputResource);
+
+/// Re-attributes a live device allocation from the context it was allocated
+/// under to 'newContext', so the OOM dump names the operator that currently
+/// holds the memory rather than the one that created it. Live bytes and the
+/// live allocation count move; the old context keeps its peak, and the new
+/// context may raise its own.
+///
+/// Returns false when diagnostics are disabled or 'pointer' was not allocated
+/// through a cuDF resource. Callers must invoke this only from the thread that
+/// takes ownership, and only once per transfer, or live bytes will be counted
+/// against more than one holder.
+[[nodiscard]] bool reattributeDeviceAllocation(
+    void* pointer,
+    const std::string& newContext);
+
+/// Live device memory billed to one allocation context.
+struct DeviceAllocationContextStats {
+  std::string context;
+  std::size_t currentBytes{0};
+  std::size_t peakBytes{0};
+  std::size_t currentAllocations{0};
+};
+
+/// Returns live per-context attribution across the primary and output cuDF
+/// resources, including zero-byte contexts. Empty when diagnostics are
+/// disabled. The currentBytes sum equals the RMM live bytes of the same
+/// resources, so this is the programmatic form of the CUDF_DEVICE_OOM owner
+/// list. Copies under the attribution mutex; not for per-batch use.
+[[nodiscard]] std::vector<DeviceAllocationContextStats>
+captureDeviceAllocationAttribution();
+
+/// Returns the allocation context that CudaAllocationTraceScope has
+/// established on the calling thread.
+[[nodiscard]] std::string currentDeviceAllocationContext();
 
 /// If GLUTEN_CUDF_ASYNC_QUERY_END_TRIM_BYTES is set, synchronizes the device
 /// and releases unused cudaMallocAsync pool memory down to that retained-byte

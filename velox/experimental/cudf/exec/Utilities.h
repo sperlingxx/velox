@@ -25,6 +25,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string_view>
 
 namespace facebook::velox::cudf_velox {
 
@@ -210,6 +211,31 @@ void orderCudfVectorDeallocationsAfterStream(
     std::span<const CudfVectorPtr> vectors,
     std::span<const rmm::cuda_stream_view> inputStreams,
     rmm::cuda_stream_view stream);
+
+/**
+ * @brief Re-attributes the device memory backing @p vector to the operator
+ * that now holds it.
+ *
+ * Allocation attribution records the operator that created a buffer, which
+ * for exchange and join inputs is not the operator that keeps it live. This
+ * moves the live bytes to the current holder so an OOM dump names the owner
+ * rather than the producer.
+ *
+ * Only packed-table-backed vectors have a single stable allocation key; any
+ * other vector is skipped. Non-allocating and effectively free when device
+ * memory diagnostics are disabled.
+ *
+ * Call from the thread taking ownership, and exactly once per transfer,
+ * otherwise the same bytes are billed to more than one holder. In particular
+ * do not call this from the ucx-progress thread, which must not contend on
+ * the attribution mutex.
+ */
+void reattributeCudfVectorHolder(
+    const CudfVectorPtr& vector,
+    std::string_view operatorName,
+    std::string_view nodeId,
+    const void* instance,
+    std::string_view method);
 
 /// Extract the base function name from a possibly-prefixed name.
 /// Handles both Presto-style "presto.default.lag" and simple "lag".
