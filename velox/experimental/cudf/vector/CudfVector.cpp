@@ -217,4 +217,21 @@ uint64_t CudfVector::estimateFlatSize() const {
   return flatSize_;
 }
 
+std::optional<CudfVector::DeviceAllocationKey>
+CudfVector::packedDeviceAllocation() const {
+  const auto* packedPtr =
+      std::get_if<std::unique_ptr<cudf::packed_table>>(&tableStorage_);
+  // Null after release() has materialized the packed data into a table.
+  if (packedPtr == nullptr || *packedPtr == nullptr) {
+    return std::nullopt;
+  }
+  const auto& gpuData = (*packedPtr)->data.gpu_data;
+  if (gpuData == nullptr || gpuData->size() == 0) {
+    return std::nullopt;
+  }
+  // Used only as an allocation identity, never dereferenced.
+  return DeviceAllocationKey{
+      const_cast<void*>(gpuData->data()), gpuData->size()};
+}
+
 } // namespace facebook::velox::cudf_velox

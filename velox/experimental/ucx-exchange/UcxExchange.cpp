@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include "velox/experimental/ucx-exchange/UcxExchange.h"
+#include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
 using facebook::velox::exec::Operator;
@@ -187,6 +188,15 @@ RowVectorPtr UcxExchange::getOutputFromPackedTable() {
   // and the packed_table constructor of CudfVector to avoid copying data.
   auto result = std::make_shared<cudf_velox::CudfVector>(
       pool(), outputType_, numRows, std::move(data.packedTable), data.stream);
+
+  // The receive buffer was allocated on the ucx-progress thread. This driver
+  // thread now owns it, so bill it here instead of to the receive path.
+  cudf_velox::reattributeCudfVectorHolder(
+      result,
+      "UcxExchange",
+      planNodeId(),
+      static_cast<const void*>(this),
+      "getOutput");
 
   recordInputStats(gpuDataSize, result);
   // free the memory owned by PackedTableWithStream and set it to nullptr;

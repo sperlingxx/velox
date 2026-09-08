@@ -153,6 +153,12 @@ velox_add_cudf_test(
 )
 
 velox_add_cudf_test(
+  NAME velox_cudf_gpu_resources_test
+  SOURCES Main.cpp GpuResourcesTest.cpp
+  LIBS velox_cudf_exec velox_cudf_vector velox_vector_test_lib cudf::cudf
+)
+
+velox_add_cudf_test(
   NAME velox_cudf_group_id_test
   SOURCES Main.cpp GroupIdTest.cpp
   LIBS ${CUDF_TEST_DEFAULT_LIBS}

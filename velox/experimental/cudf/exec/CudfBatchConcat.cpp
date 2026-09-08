@@ -187,6 +187,14 @@ void CudfBatchConcat::doAddInput(RowVectorPtr input) {
   totalInputBytes_ += cudfVector->estimateFlatSize();
   currentNumRows_ += cudfVector->size();
   currentNumBytes_ += cudfVector->estimateFlatSize();
+  // buffer_ holds the input until the concatenate, so this operator, not the
+  // upstream producer, is the owner of those bytes from here on.
+  reattributeCudfVectorHolder(
+      cudfVector,
+      "CudfBatchConcat",
+      planNodeId(),
+      static_cast<const void*>(this),
+      "addInput");
   buffer_.push_back(std::move(cudfVector));
 
   // Enforce the bound here as well as in needsInput(). Source pipelines may

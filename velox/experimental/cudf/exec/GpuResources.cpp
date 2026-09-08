@@ -143,6 +143,50 @@ class OperatorAttributionResource final {
     recordDeallocation(pointer);
   }
 
+  void appendContextStats(
+      std::vector<DeviceAllocationContextStats>& out) const {
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    out.reserve(out.size() + state_->contexts.size());
+    for (const auto& entry : state_->contexts) {
+      out.push_back(
+          DeviceAllocationContextStats{
+              entry.first,
+              entry.second.currentBytes,
+              entry.second.peakBytes,
+              entry.second.currentAllocations});
+    }
+  }
+
+  /// Moves the live bytes and allocation count of an already-recorded
+  /// allocation from its birth context to 'newContext'. Returns false when
+  /// 'pointer' was not allocated through this resource.
+  bool reattribute(void* pointer, const std::string& newContext) {
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    const auto allocation = state_->allocations.find(pointer);
+    if (allocation == state_->allocations.end()) {
+      return false;
+    }
+    if (allocation->second.context == newContext) {
+      return true;
+    }
+
+    const auto bytes = allocation->second.bytes;
+    const auto previous = state_->contexts.find(allocation->second.context);
+    if (previous != state_->contexts.end()) {
+      // Matches deallocation semantics: the old context keeps its peak.
+      previous->second.currentBytes -= bytes;
+      --previous->second.currentAllocations;
+    }
+    // Matches recordAllocation semantics: the new context owns the bytes and
+    // may raise its peak.
+    auto& stats = state_->contexts[newContext];
+    stats.currentBytes += bytes;
+    stats.peakBytes = std::max(stats.peakBytes, stats.currentBytes);
+    ++stats.currentAllocations;
+    allocation->second.context = newContext;
+    return true;
+  }
+
   bool operator==(OperatorAttributionResource const& other) const noexcept {
     return state_ == other.state_;
   }
@@ -297,6 +341,39 @@ wrapDeviceMemoryResourceForDiagnostics(
       rmm::device_async_resource_ref{statistics.value()});
   return cuda::mr::any_resource<cuda::mr::device_accessible>{
       rmm::device_async_resource_ref{*attribution}};
+}
+
+bool reattributeDeviceAllocation(void* pointer, const std::string& newContext) {
+  if (pointer == nullptr) {
+    return false;
+  }
+  // Both resources exist only on the diagnostic path, so this is also the
+  // diagnostics-disabled early out. With the default empty cudf.output_mr,
+  // output_mr_ aliases mr_ and the second resource is never created, making
+  // the fallback lookup free.
+  if (primaryAttributionResource != nullptr &&
+      primaryAttributionResource->reattribute(pointer, newContext)) {
+    return true;
+  }
+  if (outputAttributionResource != nullptr) {
+    return outputAttributionResource->reattribute(pointer, newContext);
+  }
+  return false;
+}
+
+std::vector<DeviceAllocationContextStats> captureDeviceAllocationAttribution() {
+  std::vector<DeviceAllocationContextStats> stats;
+  if (primaryAttributionResource != nullptr) {
+    primaryAttributionResource->appendContextStats(stats);
+  }
+  if (outputAttributionResource != nullptr) {
+    outputAttributionResource->appendContextStats(stats);
+  }
+  return stats;
+}
+
+std::string currentDeviceAllocationContext() {
+  return currentAllocationContext;
 }
 
 cuda::mr::any_resource<cuda::mr::device_accessible> createMemoryResource(

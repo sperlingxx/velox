@@ -24,7 +24,9 @@
 
 #include <rmm/cuda_stream_view.hpp>
 
+#include <cstddef>
 #include <memory>
+#include <optional>
 #include <utility>
 #include <variant>
 
@@ -80,6 +82,23 @@ class CudfVector : public RowVector {
   bool rebindStream(rmm::cuda_stream_view stream);
 
   uint64_t estimateFlatSize() const override;
+
+  /// Identity of a single contiguous device allocation, for keying device
+  /// memory diagnostics. The pointer is not intended to be dereferenced.
+  struct DeviceAllocationKey {
+    void* pointer;
+    std::size_t bytes;
+  };
+
+  /// Returns the single contiguous device allocation backing this vector when
+  /// it is packed-table backed. Returns nullopt for table-backed vectors,
+  /// which have many buffers and no stable single key: column data pointers
+  /// can be interior for sliced columns and buffers can be shared across
+  /// columns.
+  ///
+  /// The returned pointer is the RMM base address of the packed buffer and
+  /// stays valid until this vector releases or frees that buffer.
+  std::optional<DeviceAllocationKey> packedDeviceAllocation() const;
 
  private:
   // Storage for either an owned table or packed table.
