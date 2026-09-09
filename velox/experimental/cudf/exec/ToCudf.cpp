@@ -554,6 +554,13 @@ void registerCudf() {
 void unregisterCudf() {
   exec::OutputTransportRegistry::global().erase(
       std::string{core::TransportKind::kUcx});
+  // Registration published mr_ as the process-wide RMM resource, and RMM keeps
+  // its own copy of that handle. On the diagnostic path the published handle
+  // only holds a reference to the attribution resource destroyed below, so RMM
+  // has to let go first or the next allocation through the current device
+  // resource reads freed memory. Test binaries re-register once per case, so
+  // this window is not hypothetical.
+  cudf::reset_current_device_resource();
   output_mr_.reset();
   mr_.reset();
   // The attribution resources reference the statistics resources, so they

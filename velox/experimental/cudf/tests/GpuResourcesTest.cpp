@@ -14,7 +14,9 @@
  * limitations under the License.
  */
 
+#include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
+#include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
@@ -24,6 +26,7 @@
 #include <cudf/contiguous_split.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/error.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 
 #include <rmm/device_buffer.hpp>
 #include <rmm/mr/cuda_memory_resource.hpp>
@@ -217,6 +220,64 @@ TEST_F(GpuResourcesTest, clearingAttributionResourcesEmptiesTheMap) {
   clearDeviceMemoryAttributionResources();
   EXPECT_TRUE(captureDeviceAllocationAttribution().empty());
   EXPECT_FALSE(reattributeDeviceAllocation(&stream, "holder"));
+}
+
+// registerCudf publishes the diagnostic chain as the process-wide RMM
+// resource and RMM keeps its own copy of that handle. On the diagnostic path
+// the copy only references the attribution resource, so unregisterCudf must
+// release RMM's copy before destroying it. Test binaries re-register once per
+// case, so this is the sequence that would read freed memory.
+TEST_F(GpuResourcesTest, registrationCycleLeavesAllocatableCurrentResource) {
+  TestCudaStream stream;
+  constexpr std::size_t kBytes = 4096;
+
+  // registerCudf reinstalls the process-wide attribution and statistics
+  // resources over the ones the fixture built, which would leave the
+  // fixture's handle referencing a destroyed resource.
+  resource_.reset();
+
+  // "cuda" keeps the cycle to plain cudaMalloc; the default "async" mode would
+  // build and tear down a CUDA memory pool three times over.
+  auto& config = CudfConfig::getInstance();
+  const auto previousMode = config.memoryResource;
+  config.memoryResource = "cuda";
+
+  const auto allocateThroughCurrentResource = [&](const char* label) {
+    CudaAllocationTraceScope scope(label);
+    rmm::device_buffer buffer(
+        kBytes, stream.view(), cudf::get_current_device_resource_ref());
+    stream.view().synchronize();
+    return findContext(captureDeviceAllocationAttribution(), label);
+  };
+
+  // Identity of the resource registration replaces. Comparing refs never
+  // dereferences them, so this stays well defined even if unregistration
+  // leaves RMM pointing at a destroyed resource.
+  const auto beforeRegistration = cudf::get_current_device_resource_ref();
+
+  registerCudf();
+  EXPECT_FALSE(cudf::get_current_device_resource_ref() == beforeRegistration)
+      << "registration should publish its own resource";
+  EXPECT_TRUE(allocateThroughCurrentResource("registered").has_value())
+      << "registration should route the current device resource through "
+         "attribution";
+
+  unregisterCudf();
+  // The attribution resource is destroyed here, so RMM must have been handed
+  // back the resource it had before registration. Without that, the current
+  // device resource still points into freed memory.
+  EXPECT_TRUE(cudf::get_current_device_resource_ref() == beforeRegistration)
+      << "unregistration must restore the resource registration replaced";
+  // Allocating through it stays valid and must not reach the dead map.
+  EXPECT_FALSE(allocateThroughCurrentResource("after-unregister").has_value());
+  EXPECT_TRUE(captureDeviceAllocationAttribution().empty());
+
+  // Re-registration rebuilds a working chain.
+  registerCudf();
+  EXPECT_TRUE(allocateThroughCurrentResource("reregistered").has_value());
+  unregisterCudf();
+
+  config.memoryResource = previousMode;
 }
 
 TEST_F(GpuResourcesTest, allocationIsBilledToEnclosingScope) {
