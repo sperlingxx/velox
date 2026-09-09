@@ -15,6 +15,7 @@
  */
 
 #include "velox/experimental/cudf/exec/GpuResources.h"
+#include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
 #include "velox/common/base/Exceptions.h"
@@ -29,6 +30,7 @@
 
 #include <cuda_runtime_api.h>
 
+#include <fmt/format.h>
 #include <gtest/gtest.h>
 
 #include <array>
@@ -337,6 +339,81 @@ TEST_F(GpuResourcesTest, packedDeviceAllocationKeyedOnPackedBufferOnly) {
       std::move(table),
       stream.view());
   EXPECT_FALSE(tableVector->packedDeviceAllocation().has_value());
+}
+
+// CudfHashJoinBuild::doNoMoreInput move-inserts every peer driver's queue into
+// the last driver's. Without a re-attribution at that move the bytes stay
+// billed to peers whose queues are already empty, which is the common
+// configuration: Job 34 runs joinDriversPerFragment=4.
+TEST_F(GpuResourcesTest, peerToCollectorTransferMovesHolderOffSourceDrivers) {
+  TestCudaStream stream;
+  constexpr int kPeerDrivers = 3;
+  constexpr int kCollectorDriver = 3;
+  const std::string node = "13";
+  constexpr int32_t kOperatorId = 4;
+
+  const auto holderLabel = [&](int driver, std::string_view method) {
+    return fmt::format(
+        "CudfHashJoinBuild node={} operatorId={} driver={} method={} "
+        "role=holder",
+        node,
+        kOperatorId,
+        driver,
+        method);
+  };
+
+  // Each source driver takes its own build batches through addInput.
+  std::vector<std::shared_ptr<CudfVector>> queued;
+  std::size_t expectedBytes = 0;
+  for (int driver = 0; driver < kPeerDrivers; ++driver) {
+    auto vector = makePackedVector(stream.view());
+    reattributeCudfVectorHolder(
+        vector, "CudfHashJoinBuild", node, kOperatorId, driver, "addInput");
+    const auto key = vector->packedDeviceAllocation();
+    ASSERT_TRUE(key.has_value());
+    expectedBytes += key->bytes;
+    queued.push_back(std::move(vector));
+  }
+
+  const auto beforeTransfer = captureDeviceAllocationAttribution();
+  for (int driver = 0; driver < kPeerDrivers; ++driver) {
+    const auto peer =
+        findContext(beforeTransfer, holderLabel(driver, "addInput"));
+    ASSERT_TRUE(peer.has_value())
+        << "driver " << driver << " should own its batch";
+    EXPECT_GT(peer->currentBytes, 0u);
+  }
+  const auto totalBefore = totalAttributedBytes(beforeTransfer);
+
+  // The barrier hands every queue to the last driver.
+  for (auto& vector : queued) {
+    reattributeCudfVectorHolder(
+        vector,
+        "CudfHashJoinBuild",
+        node,
+        kOperatorId,
+        kCollectorDriver,
+        "noMoreInput");
+  }
+
+  const auto afterTransfer = captureDeviceAllocationAttribution();
+  for (int driver = 0; driver < kPeerDrivers; ++driver) {
+    const auto peer =
+        findContext(afterTransfer, holderLabel(driver, "addInput"));
+    ASSERT_TRUE(peer.has_value());
+    EXPECT_EQ(peer->currentBytes, 0u)
+        << "driver " << driver << " holds nothing after the transfer";
+    EXPECT_EQ(peer->currentAllocations, 0u);
+  }
+
+  const auto collector =
+      findContext(afterTransfer, holderLabel(kCollectorDriver, "noMoreInput"));
+  ASSERT_TRUE(collector.has_value());
+  EXPECT_EQ(collector->currentBytes, expectedBytes);
+  EXPECT_EQ(
+      collector->currentAllocations, static_cast<std::size_t>(kPeerDrivers));
+  // A holder move neither creates nor drops bytes.
+  EXPECT_EQ(totalAttributedBytes(afterTransfer), totalBefore);
 }
 
 TEST_F(GpuResourcesTest, packedVectorAllocationIsReattributable) {

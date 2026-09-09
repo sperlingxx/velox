@@ -329,11 +329,24 @@ void CudfHashJoinBuild::doNoMoreInput() {
     auto op = peer->findOperator(planNodeId());
     auto* build = dynamic_cast<CudfHashJoinBuild*>(op);
     VELOX_CHECK_NOT_NULL(build);
+    const auto transferredFrom = inputs_.size();
     inputs_.insert(
         inputs_.end(),
         std::make_move_iterator(build->inputs_.begin()),
         std::make_move_iterator(build->inputs_.end()));
     build->inputs_.clear();
+    // The peer's queue is empty from here on, so leaving these billed to its
+    // addInput context would charge live bytes to a driver that holds
+    // nothing. This driver is the sole holder until the concatenate below.
+    for (auto index = transferredFrom; index < inputs_.size(); ++index) {
+      reattributeCudfVectorHolder(
+          inputs_[index],
+          "CudfHashJoinBuild",
+          planNodeId(),
+          operatorId(),
+          driverId(),
+          "noMoreInput");
+    }
     auto retainedInputBatches = build->inputs_.size();
     common::testutil::TestValue::adjust(
         "facebook::velox::cudf_velox::CudfHashJoinBuild::doNoMoreInput::sourceDriverRetainedInputBatchesAfterTransfer",
