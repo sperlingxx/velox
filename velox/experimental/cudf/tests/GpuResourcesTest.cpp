@@ -378,6 +378,49 @@ TEST_F(GpuResourcesTest, reattributionRejectsUnknownPointers) {
   ASSERT_EQ(cudaFree(foreign), cudaSuccess);
 }
 
+// A configured cudf.output_mr adds a second attribution resource over the same
+// device. Reporting the two maps side by side would list the same operator
+// twice with no way to tell the entries apart.
+TEST_F(GpuResourcesTest, attributionMergesOneContextAcrossBothResources) {
+  TestCudaStream stream;
+  constexpr std::size_t kPrimaryBytes = 4096;
+  constexpr std::size_t kOutputBytes = 2048;
+  const std::string context = "CudfPartitionedOutput node=7 method=addInput";
+
+  auto output = wrapDeviceMemoryResourceForDiagnostics(
+      cuda::mr::any_resource<cuda::mr::device_accessible>{
+          rmm::mr::cuda_memory_resource{}},
+      /*outputResource=*/true);
+
+  std::optional<rmm::device_buffer> fromPrimary;
+  std::optional<rmm::device_buffer> fromOutput;
+  {
+    CudaAllocationTraceScope scope(context);
+    fromPrimary.emplace(kPrimaryBytes, stream.view(), resource());
+    fromOutput.emplace(
+        kOutputBytes, stream.view(), rmm::device_async_resource_ref{output});
+  }
+
+  const auto stats = captureDeviceAllocationAttribution();
+  std::size_t occurrences = 0;
+  for (const auto& entry : stats) {
+    occurrences += static_cast<std::size_t>(entry.context == context);
+  }
+  EXPECT_EQ(occurrences, 1u) << "the context must not appear once per resource";
+
+  const auto merged = findContext(stats, context);
+  ASSERT_TRUE(merged.has_value());
+  EXPECT_EQ(merged->currentBytes, kPrimaryBytes + kOutputBytes);
+  EXPECT_EQ(merged->currentAllocations, 2u);
+
+  fromPrimary.reset();
+  fromOutput.reset();
+  // Both resources are process-wide, so leave later cases with only the
+  // fixture's primary one. Freeing first: deallocation reads the maps.
+  resource_.reset();
+  clearDeviceMemoryAttributionResources();
+}
+
 TEST_F(GpuResourcesTest, packedDeviceAllocationKeyedOnPackedBufferOnly) {
   TestCudaStream stream;
   auto packedVector = makePackedVector(stream.view());

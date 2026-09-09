@@ -92,12 +92,19 @@ std::size_t deviceOomOwnerLimit() {
   return limit;
 }
 
+// Defined below, once both attribution resources are declared. Merges the
+// per-context maps of every attribution resource, because they all draw from
+// the same device and ownership is only meaningful across all of them.
+std::vector<DeviceAllocationContextStats> aggregateDeviceAllocationContexts();
+
 class OperatorAttributionResource final {
   struct State;
 
  public:
-  explicit OperatorAttributionResource(rmm::device_async_resource_ref upstream)
-      : upstream_(upstream), state_(std::make_shared<State>()) {}
+  OperatorAttributionResource(
+      rmm::device_async_resource_ref upstream,
+      std::string_view role)
+      : upstream_(upstream), role_(role), state_(std::make_shared<State>()) {}
 
  public:
   struct Allocation {
@@ -243,28 +250,32 @@ class OperatorAttributionResource final {
   }
 
   void dumpFailure(std::size_t requestedBytes) const {
-    std::vector<std::pair<std::string, ContextStats>> snapshot;
-    {
-      std::lock_guard<std::mutex> lock(state_->mutex);
-      snapshot.reserve(state_->contexts.size());
-      for (const auto& entry : state_->contexts) {
-        if (entry.second.currentBytes != 0) {
-          snapshot.push_back(entry);
-        }
-      }
-    }
+    // Reports owners across every attribution resource, not just the one that
+    // refused the allocation. A separate cudf.output_mr is a second consumer
+    // of the same device, so listing only the failing resource's map would
+    // hide whatever the other one is holding.
+    auto snapshot = aggregateDeviceAllocationContexts();
+    snapshot.erase(
+        std::remove_if(
+            snapshot.begin(),
+            snapshot.end(),
+            [](const DeviceAllocationContextStats& entry) {
+              return entry.currentBytes == 0;
+            }),
+        snapshot.end());
     std::sort(
         snapshot.begin(),
         snapshot.end(),
         [](const auto& left, const auto& right) {
-          return left.second.currentBytes > right.second.currentBytes;
+          return left.currentBytes > right.currentBytes;
         });
 
     std::size_t freeBytes = 0;
     std::size_t totalBytes = 0;
     const auto cudaStatus = cudaMemGetInfo(&freeBytes, &totalBytes);
     LOG(ERROR) << "CUDF_DEVICE_OOM triggerContext={" << currentAllocationContext
-               << "} requestedBytes=" << requestedBytes
+               << "} failingResource=" << role_
+               << " requestedBytes=" << requestedBytes
                << " cudaValid=" << (cudaStatus == cudaSuccess)
                << " freeBytes=" << freeBytes << " totalBytes=" << totalBytes
                << " attributedContexts=" << snapshot.size();
@@ -272,20 +283,55 @@ class OperatorAttributionResource final {
         std::min<std::size_t>(snapshot.size(), deviceOomOwnerLimit());
     for (std::size_t index = 0; index < count; ++index) {
       LOG(ERROR) << "CUDF_DEVICE_OOM_OWNER rank=" << (index + 1)
-                 << " currentBytes=" << snapshot[index].second.currentBytes
-                 << " peakBytes=" << snapshot[index].second.peakBytes
-                 << " currentAllocations="
-                 << snapshot[index].second.currentAllocations << " context={"
-                 << snapshot[index].first << "}";
+                 << " currentBytes=" << snapshot[index].currentBytes
+                 << " peakBytes=" << snapshot[index].peakBytes
+                 << " currentAllocations=" << snapshot[index].currentAllocations
+                 << " context={" << snapshot[index].context << "}";
     }
   }
 
   rmm::device_async_resource_ref upstream_;
+  std::string role_;
   std::shared_ptr<State> state_;
 };
 
 std::unique_ptr<OperatorAttributionResource> primaryAttributionResource;
 std::unique_ptr<OperatorAttributionResource> outputAttributionResource;
+
+std::vector<DeviceAllocationContextStats> aggregateDeviceAllocationContexts() {
+  std::vector<DeviceAllocationContextStats> stats;
+  if (primaryAttributionResource != nullptr) {
+    primaryAttributionResource->appendContextStats(stats);
+  }
+  if (outputAttributionResource == nullptr) {
+    // The usual configuration: cudf.output_mr is empty, output_mr_ aliases
+    // mr_, and there is a single map with no duplicate contexts to merge.
+    return stats;
+  }
+  outputAttributionResource->appendContextStats(stats);
+
+  // An operator that allocated from both resources appears once per resource.
+  // Live bytes and live allocation counts add, since both come out of the same
+  // device. Peaks do not add meaningfully: the resources reach their
+  // high-water marks independently, so the sum is an upper bound on the
+  // combined peak rather than a value the context ever reached.
+  std::unordered_map<std::string, std::size_t> positions;
+  std::vector<DeviceAllocationContextStats> merged;
+  merged.reserve(stats.size());
+  for (auto& entry : stats) {
+    const auto position = positions.find(entry.context);
+    if (position == positions.end()) {
+      positions.emplace(entry.context, merged.size());
+      merged.push_back(std::move(entry));
+      continue;
+    }
+    auto& target = merged[position->second];
+    target.currentBytes += entry.currentBytes;
+    target.peakBytes += entry.peakBytes;
+    target.currentAllocations += entry.currentAllocations;
+  }
+  return merged;
+}
 
 std::mutex asyncMemoryPoolsMutex;
 std::vector<cudaMemPool_t> asyncMemoryPools;
@@ -348,7 +394,8 @@ wrapDeviceMemoryResourceForDiagnostics(
       outputResource ? outputAttributionResource : primaryAttributionResource;
   statistics.emplace(std::move(upstream));
   attribution = std::make_unique<OperatorAttributionResource>(
-      rmm::device_async_resource_ref{statistics.value()});
+      rmm::device_async_resource_ref{statistics.value()},
+      outputResource ? "output" : "primary");
   return cuda::mr::any_resource<cuda::mr::device_accessible>{
       rmm::device_async_resource_ref{*attribution}};
 }
@@ -372,14 +419,7 @@ bool reattributeDeviceAllocation(void* pointer, const std::string& newContext) {
 }
 
 std::vector<DeviceAllocationContextStats> captureDeviceAllocationAttribution() {
-  std::vector<DeviceAllocationContextStats> stats;
-  if (primaryAttributionResource != nullptr) {
-    primaryAttributionResource->appendContextStats(stats);
-  }
-  if (outputAttributionResource != nullptr) {
-    outputAttributionResource->appendContextStats(stats);
-  }
-  return stats;
+  return aggregateDeviceAllocationContexts();
 }
 
 std::string currentDeviceAllocationContext() {

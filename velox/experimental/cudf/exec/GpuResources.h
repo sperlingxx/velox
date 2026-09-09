@@ -167,6 +167,11 @@ struct DeviceAllocationContextStats {
 /// disabled. The currentBytes sum equals the RMM live bytes of the same
 /// resources, so this is the programmatic form of the CUDF_DEVICE_OOM owner
 /// list. Copies under the attribution mutex; not for per-batch use.
+///
+/// Each context appears once. When a separate cudf.output_mr is configured, a
+/// context that allocated from both resources has its live bytes and live
+/// allocation count summed; peakBytes is then only an upper bound, because the
+/// two resources reach their high-water marks independently.
 [[nodiscard]] std::vector<DeviceAllocationContextStats>
 captureDeviceAllocationAttribution();
 
