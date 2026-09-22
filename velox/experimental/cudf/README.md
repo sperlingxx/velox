@@ -8,6 +8,38 @@ Velox-cuDF implements the Velox [DriverAdapter](https://github.com/facebookincub
 
 For more information please refer to our blog: "[Extending Velox - GPU Acceleration with cuDF](https://velox-lib.io/blog/extending-velox-with-cudf)."
 
+## Experimental buffered-reader H2D staging
+
+`GLUTEN_CUDF_HYBRID_H2D_STAGING_BYTES` opts the hybrid reader's
+`BufferedInputDataSource` range-fetch path into physical host packing. It is
+disabled when unset or zero. For example, `16777216` requests two staging
+buffers of at most 16 MiB each (the optional pinned pool rounds allocations to
+its size classes). This is a capacity, not a minimum amount of data to wait for.
+The last partial buffer is submitted immediately.
+
+The CPU gathers selected file ranges into one slot while the other slot's H2D
+copy can proceed. A CUDA event protects each slot from reuse until its copy
+finishes. Reusing a busy slot waits for that event; the returned completion
+future drains the final copies before decode. Abandoning the future or a read
+failure also waits before releasing staging. Pinned-allocation fallback to
+pageable memory preserves correctness but can reduce overlap.
+
+This requires `cudf.hive.use_experimental_reader=true` and
+`cudf.hive.use_buffered_input=true`. It does not affect the regular reader or
+the existing remote prepared-host path, and does not change cuDF. The current
+hybrid reader supports a single file, so a Job97 comparison must also use
+`cudf.iceberg.multi_file.max_files=1`. This is a different reader configuration
+from the retained regular-reader Job97 baseline, not an isolated comparison
+of transfer packing in that baseline. No performance improvement is assumed.
+
+The two slots bound additional staging per active fetch. They do not cap the
+existing cache, prefetch memory, or packed device allocation. Large individual
+column chunks may span transfers; their device spans remain contiguous and
+unchanged. CPU packing adds a host copy, and this implementation overlaps that
+work with H2D, not GPU decode with H2D.
+Use CUDA profiling to measure its transfers; the direct-cache H2D counters do
+not count this staging path.
+
 ## Getting started with Velox-cuDF
 
 cuDF supports Linux and WSL2 but not Windows or MacOS. cuDF also has minimum CUDA version, NVIDIA driver and GPU architecture requirements which can be found in the [RAPIDS Installation Guide](https://docs.rapids.ai/install/). Please refer to cuDF's [readme](https://github.com/rapidsai/cudf) and [developer guide](https://github.com/rapidsai/cudf/blob/main/cpp/doxygen/developer_guide/DEVELOPER_GUIDE.md) for more information.

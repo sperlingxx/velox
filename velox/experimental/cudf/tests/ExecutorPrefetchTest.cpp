@@ -39,8 +39,11 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <future>
 #include <mutex>
+#include <optional>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -175,6 +178,279 @@ class FakeCachedBufferedInput final : public dwio::common::BufferedInput {
   const std::shared_ptr<std::atomic<uint64_t>> backedUpBytes_;
   const std::shared_ptr<std::atomic<bool>> streamDestroyed_;
 };
+
+class ObservedBufferedDataSource : public BufferedInputDataSource {
+ public:
+  ObservedBufferedDataSource(
+      std::shared_ptr<dwio::common::BufferedInput> input,
+      std::function<void(size_t)> onRead)
+      : BufferedInputDataSource(std::move(input)), onRead_(std::move(onRead)) {}
+
+  size_t host_read(size_t offset, size_t size, uint8_t* destination) override {
+    onRead_(++reads_);
+    return BufferedInputDataSource::host_read(offset, size, destination);
+  }
+
+ private:
+  std::function<void(size_t)> onRead_;
+  size_t reads_{0};
+};
+
+// Hold the CUDA stream without blocking the submitting CPU. Enqueue only
+// after the staging allocations, which may themselves synchronize CUDA.
+class H2dTestStreamGate {
+ public:
+  void enqueue(rmm::cuda_stream_view stream) {
+    CUDF_CUDA_TRY(cudaLaunchHostFunc(
+        stream.value(),
+        [](void* opaque) {
+          auto& gate = *static_cast<H2dTestStreamGate*>(opaque);
+          std::unique_lock lock(gate.mutex_);
+          gate.cv_.wait(lock, [&] { return gate.released_; });
+        },
+        this));
+  }
+
+  void release() {
+    {
+      std::lock_guard lock(mutex_);
+      released_ = true;
+    }
+    cv_.notify_all();
+  }
+
+ private:
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  bool released_{false};
+};
+
+class HybridH2dStagingTest : public CacheHintRangeStatsTest {
+ protected:
+  void SetUp() override {
+    CacheHintRangeStatsTest::SetUp();
+    if (const auto* value = std::getenv(kSetting)) {
+      previous_ = value;
+    }
+    if (const auto* value = std::getenv(kPoolSetting)) {
+      previousPool_ = value;
+    }
+    ASSERT_EQ(setenv(kSetting, "16", 1), 0);
+    // Returning a slot to the pool does not synchronize CUDA. Otherwise
+    // cudaFreeHost could hide a missing completion wait in the lifetime tests.
+    ASSERT_EQ(setenv(kPoolSetting, "1", 1), 0);
+  }
+
+  void TearDown() override {
+    if (previous_) {
+      setenv(kSetting, previous_->c_str(), 1);
+    } else {
+      unsetenv(kSetting);
+    }
+    if (previousPool_) {
+      setenv(kPoolSetting, previousPool_->c_str(), 1);
+    } else {
+      unsetenv(kPoolSetting);
+    }
+    CacheHintRangeStatsTest::TearDown();
+  }
+
+  std::shared_ptr<ObservedBufferedDataSource> source(
+      const std::string& content,
+      std::function<void(size_t)> onRead = [](size_t) {}) {
+    return std::make_shared<ObservedBufferedDataSource>(
+        std::make_shared<dwio::common::BufferedInput>(
+            std::make_shared<InMemoryReadFile>(content), *pool_),
+        std::move(onRead));
+  }
+
+  FetchedDeviceByteRanges fetch(
+      std::shared_ptr<BufferedInputDataSource> input,
+      const std::vector<cudf::io::text::byte_range_info>& ranges,
+      rmm::cuda_stream_view stream) {
+    return fetchByteRangesAsync(
+        std::move(input),
+        {ranges.data(), ranges.size()},
+        stream,
+        cudf::get_current_device_resource_ref());
+  }
+
+  static constexpr auto kSetting = "GLUTEN_CUDF_HYBRID_H2D_STAGING_BYTES";
+  static constexpr auto kPoolSetting = "GLUTEN_CPP_S3_PINNED_POOL";
+  std::optional<std::string> previous_;
+  std::optional<std::string> previousPool_;
+};
+
+TEST_F(HybridH2dStagingTest, packsSparseRangesAcrossSlotsAndPartialTail) {
+  std::string content(4096, '\0');
+  for (size_t i = 0; i < content.size(); ++i) {
+    content[i] = static_cast<char>(i);
+  }
+  // A large range crosses both staging slots; other ranges share a copy.
+  // Original file gaps are omitted and each device span retains its meaning.
+  const std::vector<cudf::io::text::byte_range_info> ranges{
+      {7, 5}, {1040, 39}, {1800, 0}, {2160, 9}};
+  auto readFile = std::make_shared<tests::utils::CountingReadFile>(content);
+  auto ioStats = std::make_shared<io::IoStatistics>();
+  io::ReaderOptions options(pool_.get());
+  options.setDataIoStats(ioStats);
+  options.setMetadataIoStats(ioStats);
+  options.setLoadQuantum(1024);
+  auto input = std::make_shared<BufferedInputDataSource>(
+      std::make_shared<dwio::common::CachedBufferedInput>(
+          readFile,
+          dwio::common::MetricsLog::voidLog(),
+          StringIdLease(fileIds(), "hybridH2dStaging"),
+          cache_.get(),
+          nullptr,
+          StringIdLease(fileIds(), "hybridH2dStagingGroup"),
+          ioStats,
+          nullptr,
+          nullptr,
+          options));
+  rmm::cuda_stream stream;
+  auto [buffers, spans, completion] = fetch(input, ranges, stream);
+  completion.get();
+  ASSERT_EQ(buffers.size(), 1);
+  ASSERT_EQ(spans.size(), ranges.size());
+  std::string actual(53, '\0');
+  ASSERT_EQ(
+      cudaMemcpy(
+          actual.data(),
+          buffers.front().data(),
+          actual.size(),
+          cudaMemcpyDeviceToHost),
+      cudaSuccess);
+  EXPECT_EQ(
+      actual,
+      content.substr(7, 5) + content.substr(1040, 39) +
+          content.substr(2160, 9));
+  size_t offset = 0;
+  for (size_t i = 0; i < ranges.size(); ++i) {
+    EXPECT_EQ(spans[i].size(), ranges[i].size());
+    EXPECT_EQ(
+        spans[i].data(),
+        static_cast<const uint8_t*>(buffers.front().data()) + offset);
+    offset += ranges[i].size();
+  }
+  const auto coldReads = readFile->numReads();
+  EXPECT_GT(coldReads, 0);
+  auto warm = fetch(input, ranges, stream);
+  std::get<2>(warm).get();
+  EXPECT_EQ(readFile->numReads(), coldReads);
+}
+
+TEST_F(HybridH2dStagingTest, handlesEmptyRangesAndShortReads) {
+  rmm::cuda_stream stream;
+  for (const auto& ranges :
+       {std::vector<cudf::io::text::byte_range_info>{},
+        std::vector<cudf::io::text::byte_range_info>{{0, 0}, {32, 0}}}) {
+    auto [buffers, spans, completion] = fetch(source("abcd"), ranges, stream);
+    EXPECT_NO_THROW(completion.get());
+    EXPECT_EQ(buffers.front().size(), 0);
+    EXPECT_EQ(spans.size(), ranges.size());
+  }
+  EXPECT_THROW(fetch(source("abcd"), {{2, 3}}, stream), VeloxException);
+}
+
+TEST_F(HybridH2dStagingTest, preparesSecondSlotButWaitsBeforeReusingFirst) {
+  rmm::cuda_stream stream;
+  H2dTestStreamGate gate;
+  std::promise<void> secondRead;
+  auto secondReady = secondRead.get_future();
+  std::atomic<size_t> reads{0};
+  auto input = source(std::string(64, 'x'), [&](size_t read) {
+    reads = read;
+    if (read == 1) {
+      gate.enqueue(stream);
+    } else if (read == 2) {
+      secondRead.set_value();
+    }
+  });
+  auto pending = std::async(
+      std::launch::async, [&] { return fetch(input, {{4, 48}}, stream); });
+  SCOPE_EXIT {
+    gate.release();
+    if (pending.valid()) {
+      pending.wait();
+    }
+    stream.synchronize();
+  };
+  EXPECT_EQ(secondReady.wait_for(5s), std::future_status::ready);
+  EXPECT_EQ(pending.wait_for(50ms), std::future_status::timeout);
+  EXPECT_EQ(reads.load(), 2);
+  gate.release();
+  auto [buffers, spans, completion] = pending.get();
+  completion.get();
+  EXPECT_EQ(reads.load(), 3);
+}
+
+TEST_F(HybridH2dStagingTest, waitsForFinalCopiesOnCompletionOrAbandonment) {
+  for (const bool abandon : {false, true}) {
+    rmm::cuda_stream stream;
+    H2dTestStreamGate gate;
+    auto input = source(std::string(64, 'x'), [&](size_t read) {
+      if (read == 1) {
+        gate.enqueue(stream);
+      }
+    });
+    auto submitting = std::async(
+        std::launch::async, [&] { return fetch(input, {{4, 32}}, stream); });
+    std::future<void> completing;
+    SCOPE_EXIT {
+      gate.release();
+      if (submitting.valid()) {
+        submitting.wait();
+      }
+      if (completing.valid()) {
+        completing.wait();
+      }
+      stream.synchronize();
+    };
+    ASSERT_EQ(submitting.wait_for(5s), std::future_status::ready);
+    auto [buffers, spans, completion] = submitting.get();
+    completing = std::async(
+        std::launch::async,
+        [abandon, completion = std::move(completion)]() mutable {
+          if (abandon) {
+            completion = std::future<void>{};
+          } else {
+            completion.get();
+          }
+        });
+    EXPECT_EQ(completing.wait_for(50ms), std::future_status::timeout);
+    gate.release();
+    completing.get();
+  }
+}
+
+TEST_F(HybridH2dStagingTest, drainsSubmittedCopyOnReadFailure) {
+  rmm::cuda_stream stream;
+  H2dTestStreamGate gate;
+  std::promise<void> failedRead;
+  auto failureReached = failedRead.get_future();
+  auto input = source(std::string(64, 'x'), [&](size_t read) {
+    if (read == 1) {
+      gate.enqueue(stream);
+    } else {
+      failedRead.set_value();
+      throw std::runtime_error("injected read failure");
+    }
+  });
+  auto pending = std::async(
+      std::launch::async, [&] { return fetch(input, {{4, 32}}, stream); });
+  SCOPE_EXIT {
+    gate.release();
+    if (pending.valid()) {
+      pending.wait();
+    }
+    stream.synchronize();
+  };
+  EXPECT_EQ(failureReached.wait_for(5s), std::future_status::ready);
+  EXPECT_EQ(pending.wait_for(50ms), std::future_status::timeout);
+  gate.release();
+  EXPECT_THROW(pending.get(), std::runtime_error);
+}
 
 TEST_F(CacheHintRangeStatsTest, countsPhysicalChunkRelativeKeys) {
   constexpr uint64_t kQuantum = 1024;

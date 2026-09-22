@@ -523,7 +523,10 @@ FetchedDeviceByteRanges copyPreparedByteRangesToDevice(
  * @param mr Device memory resource
  *
  * @return A tuple containing the device buffers, the device spans of the
- * fetched data, and a future to wait on the read tasks
+ * fetched data, and a future to wait on the read tasks. Keep the device buffers
+ * alive until completion. With GLUTEN_CUDF_HYBRID_H2D_STAGING_BYTES enabled,
+ * buffered inputs pack into two host slots; events protect slot reuse and the
+ * future drains the remaining H2D copies before decode.
  */
 FetchedDeviceByteRanges fetchByteRangesAsync(
     std::shared_ptr<cudf::io::datasource> dataSource,

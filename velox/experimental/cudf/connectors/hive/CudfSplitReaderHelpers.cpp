@@ -43,6 +43,7 @@
 #endif
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -635,6 +636,88 @@ std::size_t envBytesOrDefault(const char* name, std::size_t defaultValue) {
   return value == nullptr || value[0] == '\0' ? defaultValue
                                               : envBytesOrZero(name);
 }
+
+// Single-reader staging for the hybrid buffered-input path. Both allocations
+// precede the first submission: allocating pinned memory between copies can
+// itself synchronize CUDA. Each event protects just its slot's last H2D copy.
+class BufferedH2dStaging {
+ public:
+  BufferedH2dStaging(size_t capacity, rmm::cuda_stream_view stream)
+      : stream_(stream) {
+    for (auto& slot : slots_) {
+      slot.stream = stream.value();
+      slot.buffer = std::make_unique<
+          facebook::velox::cudf_velox::connector::hive::PinnedHostBuffer>(
+          capacity);
+      CUDF_CUDA_TRY(cudaEventCreateWithFlags(
+          &slot.done, cudaEventDisableTiming | cudaEventBlockingSync));
+    }
+  }
+
+  uint8_t* acquire() {
+    auto& slot = slots_[next_];
+    slot.wait();
+    return slot.buffer->data();
+  }
+
+  void submit(uint8_t* destination, size_t size) {
+    auto& slot = slots_[next_];
+    // If submission or event recording throws, the slot destructor drains
+    // the stream before releasing a possibly still referenced host buffer.
+    slot.pending = true;
+    slot.recorded = false;
+    CUDF_CUDA_TRY(cudaMemcpyAsync(
+        destination,
+        slot.buffer->data(),
+        size,
+        cudaMemcpyHostToDevice,
+        stream_.value()));
+    CUDF_CUDA_TRY(cudaEventRecord(slot.done, stream_.value()));
+    slot.recorded = true;
+    next_ = (next_ + 1) % slots_.size();
+  }
+
+  void finish() {
+    for (auto& slot : slots_) {
+      slot.wait();
+    }
+  }
+
+ private:
+  struct Slot {
+    ~Slot() {
+      if (pending) {
+        if (recorded) {
+          cudaEventSynchronize(done);
+        } else {
+          cudaStreamSynchronize(stream);
+        }
+      }
+      if (done != nullptr) {
+        cudaEventDestroy(done);
+      }
+    }
+
+    void wait() {
+      if (pending) {
+        CUDF_CUDA_TRY(cudaEventSynchronize(done));
+        pending = false;
+      }
+    }
+
+    std::unique_ptr<
+        facebook::velox::cudf_velox::connector::hive::PinnedHostBuffer>
+        buffer;
+    cudaEvent_t done{nullptr};
+    cudaStream_t stream{nullptr};
+    bool pending{false};
+    bool recorded{false};
+  };
+
+  const rmm::cuda_stream_view stream_;
+  std::array<Slot, 2> slots_;
+  size_t next_{0};
+};
 
 bool envFlagEnabled(const char* name) {
   const auto* value = std::getenv(name);
@@ -3730,7 +3813,13 @@ FetchedDeviceByteRanges fetchByteRangesAsync(
       byteRanges.begin(),
       byteRanges.end(),
       std::size_t{0},
-      [&](auto acc, const auto& byteRange) { return acc + byteRange.size(); });
+      [&](auto acc, const auto& byteRange) {
+        VELOX_CHECK_LE(
+            byteRange.size(),
+            std::numeric_limits<size_t>::max() - acc,
+            "Projected byte range total overflow");
+        return acc + byteRange.size();
+      });
 
   if (auto prepared = prepareByteRangesToHost(dataSource, byteRanges)) {
     return copyPreparedByteRangesToDevice(
@@ -3896,7 +3985,8 @@ FetchedDeviceByteRanges fetchByteRangesAsync(
       std::size_t{0},
       [&](auto acc, const auto& byteRange) {
         columnChunkData.emplace_back(
-            bufferData + acc, static_cast<size_t>(byteRange.size()));
+            bufferData == nullptr ? nullptr : bufferData + acc,
+            static_cast<size_t>(byteRange.size()));
         return acc + byteRange.size();
       });
 
@@ -3904,6 +3994,61 @@ FetchedDeviceByteRanges fetchByteRangesAsync(
   // actual load asynchronously.
   if (auto bufferedInput =
           dynamic_cast<BufferedInputDataSource*>(dataSource.get())) {
+    const auto stagingBytes =
+        envBytesOrZero("GLUTEN_CUDF_HYBRID_H2D_STAGING_BYTES");
+    if (stagingBytes != 0) {
+      if (totalSize == 0) {
+        return {
+            std::move(columnChunkBuffers),
+            std::move(columnChunkData),
+            std::async(std::launch::deferred, [] {})};
+      }
+      // Preserve batch cache loading before gathering individual ranges;
+      // otherwise a cold cache would turn packing into serial remote reads.
+      bufferedInput->prefetchToCache({byteRanges.begin(), byteRanges.end()});
+      const auto capacity = std::min(stagingBytes, totalSize);
+      auto staging = std::make_unique<BufferedH2dStaging>(capacity, stream);
+      uint8_t* host = nullptr;
+      size_t staged = 0;
+      size_t deviceOffset = 0;
+      for (const auto& range : byteRanges) {
+        auto offset = static_cast<size_t>(range.offset());
+        auto remaining = static_cast<size_t>(range.size());
+        while (remaining != 0) {
+          if (staged == 0) {
+            host = staging->acquire();
+          }
+          const auto bytes = std::min(remaining, capacity - staged);
+          VELOX_CHECK_EQ(
+              bufferedInput->host_read(offset, bytes, host + staged),
+              bytes,
+              "Short hybrid buffered-input read");
+          offset += bytes;
+          remaining -= bytes;
+          staged += bytes;
+          if (staged == capacity) {
+            staging->submit(bufferData + deviceOffset, staged);
+            deviceOffset += staged;
+            staged = 0;
+          }
+        }
+      }
+      if (staged != 0) {
+        staging->submit(bufferData + deviceOffset, staged);
+      }
+      // The caller can do independent host work before get(). The existing
+      // hybrid reader gets this future before decode. Destruction without
+      // get(), including an I/O exception above, also drains pending copies.
+      auto completion = std::async(
+          std::launch::deferred, [staging = std::move(staging)]() mutable {
+            staging->finish();
+            staging.reset();
+          });
+      return {
+          std::move(columnChunkBuffers),
+          std::move(columnChunkData),
+          std::move(completion)};
+    }
     auto iter =
         cuda::make_zip_iterator(byteRanges.begin(), columnChunkData.begin());
     std::for_each(
