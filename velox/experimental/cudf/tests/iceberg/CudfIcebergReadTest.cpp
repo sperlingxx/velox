@@ -16,6 +16,9 @@
 
 /// Basic end-to-end read tests for the cudf Iceberg connector.
 
+#include "velox/experimental/cudf/connectors/hive/CudfSplitReader.h"
+#include "velox/experimental/cudf/connectors/hive/ExecutorSplitPrefetch.h"
+#include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/tests/iceberg/CudfDeletionVectorTestUtils.h"
 #include "velox/experimental/cudf/tests/iceberg/CudfIcebergTestBase.h"
 
@@ -619,6 +622,206 @@ TEST_F(CudfIcebergReadTest, coalescedMultipleFiles) {
                   .planNode();
 
   assertQuery(plan, splits, "SELECT * FROM tmp", 0);
+}
+
+TEST_F(CudfIcebergReadTest, coalescedProjectedCachePrefetch) {
+  using namespace cudf_velox::connector::hive;
+  // Exercise the S3 cache-prefetch path with local file handles, without an
+  // S3 service or credentials. Distinct file identities and contents catch
+  // accidentally reusing the primary file's plan or data for another member.
+  auto cache = std::make_unique<FileHandleCache>(1024);
+  std::vector<std::shared_ptr<TempFilePath>> files;
+  std::vector<CudfCoalescedFile> sources;
+  uint64_t totalFileBytes = 0;
+  for (int i = 0; i < 4; ++i) {
+    auto file = TempFilePath::create();
+    auto data = makeRowVector(
+        {"c0", "unused"},
+        {makeFlatVector<int64_t>(3 + i, [i](auto row) { return 10 * i + row; }),
+         makeFlatVector<std::string>(
+             3 + i, [](auto row) { return std::string(1024 + row, 'x'); })});
+    writeToFile(file->getPath(), data);
+    const auto path = "s3://cache-prefetch-test" + file->getPath();
+    auto handle = std::make_unique<FileHandle>(FileHandle{
+        filesystems::getFileSystem(file->getPath(), nullptr)
+            ->openFileForRead(file->getPath()),
+        StringIdLease(fileIds(), path),
+        StringIdLease(fileIds(), "cache-prefetch-test")});
+    sources.push_back({path, handle->file->size()});
+    totalFileBytes += sources.back().length;
+    ASSERT_TRUE(cache->add(FileHandleKey{.filename = path}, handle.get(), 1));
+    handle.release();
+    files.push_back(std::move(file));
+  }
+  FileHandleFactory factory(
+      std::move(cache), std::make_unique<FileHandleGenerator>());
+  auto outputType = ROW({"c0"}, {BIGINT()});
+  auto table =
+      std::make_shared<::facebook::velox::connector::hive::HiveTableHandle>(
+          kCudfIcebergConnectorId,
+          "prefetch",
+          common::SubfieldFilters{},
+          nullptr,
+          outputType);
+
+  std::unordered_map<std::string, std::optional<std::string>> savedEnv;
+  auto setEnv = [&](const std::string& key, const std::string& value) {
+    if (!savedEnv.count(key)) {
+      auto* previous = std::getenv(key.c_str());
+      savedEnv[key] =
+          previous ? std::optional<std::string>(previous) : std::nullopt;
+    }
+    setenv(key.c_str(), value.c_str(), 1);
+  };
+  SCOPE_EXIT {
+    for (const auto& [key, value] : savedEnv) {
+      if (value) {
+        setenv(key.c_str(), value->c_str(), 1);
+      } else {
+        unsetenv(key.c_str());
+      }
+    }
+  };
+  setEnv("GLUTEN_CPP_S3_CRT", "0");
+  setEnv("GLUTEN_CPP_S3_AWS_SDK", "0");
+  setEnv("GLUTEN_CUDF_S3_ADAPTIVE_PREFETCH", "0");
+  setEnv("GLUTEN_CUDF_CACHE_HINT_PREPARE_LOADS", "1");
+  setEnv("GLUTEN_CPP_S3_ASYNC_CACHE_READ_GROUPS", "1");
+  setEnv(
+      "GLUTEN_CUDF_CACHE_HINT_FIRST_LOAD_GROUP_READY_MIN_QUERY_REGISTERED_SPLITS",
+      "2");
+
+  // The one-byte window is smaller than every source; demand must still
+  // progress for a group larger than the window. Also cover single-source
+  // reads and both preparation-time and scan-time readiness waits.
+  for (const auto fileCount : {1, 4}) {
+    for (const auto budget : {1, 1024 * 1024}) {
+      for (const bool preload : {false, true}) {
+        // Full readiness, first-load readiness, and nonblocking range demand.
+        for (const auto mode : {0, 1, 2}) {
+          asyncDataCache_->clear();
+          SCOPED_TRACE(
+              fmt::format(
+                  "files={} budget={} preload={} mode={}",
+                  fileCount,
+                  budget,
+                  preload,
+                  mode));
+          setEnv(
+              "GLUTEN_CUDF_CACHE_HINT_READY_SPLIT_PRELOAD",
+              preload ? "1" : "0");
+          setEnv(
+              "GLUTEN_CUDF_CACHE_HINT_FIRST_LOAD_GROUP_READY_SCAN",
+              mode != 0 ? "1" : "0");
+          auto config = std::make_shared<config::ConfigBase>(
+              std::unordered_map<std::string, std::string>{
+                  {CudfHiveConfig::kUseBufferedInputSession, "true"},
+                  {CudfHiveConfig::kPrefetchMaxInFlightBytesSession,
+                   std::to_string(budget)},
+                  {CudfHiveConfig::kExecutorSplitPrefetchConcurrencySession,
+                   "4"}});
+          const auto queryId = fmt::format(
+              "{}-{}-{}-{}-{}",
+              sources[0].filePath,
+              fileCount,
+              budget,
+              preload,
+              mode);
+          ::facebook::velox::connector::ConnectorQueryCtx context(
+              pool_.get(),
+              rootPool_.get(),
+              config.get(),
+              nullptr,
+              {},
+              nullptr,
+              asyncDataCache_.get(),
+              queryId,
+              "task",
+              "scan",
+              0,
+              "");
+          SCOPE_EXIT {
+            ExecutorSplitPrefetch::eraseQuery(ioExecutor_.get(), queryId);
+          };
+          ExecutorSplitPrefetch::setExpectedSplitCount(
+              ioExecutor_.get(), queryId, mode == 1 ? 2 : 1, 2);
+          auto split = std::make_shared<CudfHiveConnectorSplit>(
+              kCudfIcebergConnectorId,
+              sources[0].filePath,
+              // Iceberg whole-file tasks exclude the four-byte PAR1 header.
+              4,
+              sources[0].length - 4,
+              0,
+              std::unordered_map<std::string, std::string>{},
+              std::vector<CudfCoalescedFile>(
+                  sources.begin() + 1, sources.begin() + fileCount));
+          const auto before =
+              ExecutorSplitPrefetch::cacheHintRangeStatsForTest();
+          const auto waitsBefore =
+              ExecutorSplitPrefetch::cacheHintWaitStatsForTest();
+          CudfSplitReader reader(
+              split,
+              table,
+              outputType,
+              {"c0"},
+              &factory,
+              ioExecutor_.get(),
+              &context,
+              std::make_shared<CudfHiveConfig>(config),
+              std::make_shared<io::IoStatistics>(),
+              std::make_shared<IoStats>(),
+              false,
+              nullptr);
+          dwio::common::RuntimeStatistics runtimeStats;
+          reader.prepareSplit(runtimeStats);
+          auto chunk = reader.next(0);
+          ASSERT_TRUE(chunk.has_value());
+          std::vector<int64_t> expected;
+          for (int i = 0; i < fileCount; ++i) {
+            for (int row = 0; row < 3 + i; ++row) {
+              expected.push_back(10 * i + row);
+            }
+          }
+          auto output = with_arrow::toVeloxColumn(
+              chunk.value()->view(),
+              pool_.get(),
+              outputType,
+              reader.stream(),
+              cudf::get_current_device_resource_ref());
+          reader.stream().synchronize();
+          ::facebook::velox::test::assertEqualVectors(
+              makeRowVector({makeFlatVector<int64_t>(expected)}), output);
+          // All four files fit in one decode/output chunk, not four batches.
+          EXPECT_FALSE(reader.next(0).has_value());
+          const auto after =
+              ExecutorSplitPrefetch::cacheHintRangeStatsForTest();
+          EXPECT_EQ(after.logicalRanges - before.logicalRanges, fileCount);
+          EXPECT_GT(after.logicalBytes - before.logicalBytes, 0);
+          EXPECT_LT(after.logicalBytes - before.logicalBytes, totalFileBytes);
+          EXPECT_EQ(
+              after.consumedRanges - before.consumedRanges,
+              after.uniqueRanges - before.uniqueRanges);
+          const auto waits = ExecutorSplitPrefetch::cacheHintWaitStatsForTest();
+          if (mode == 2) {
+            EXPECT_EQ(
+                waits.rangeReadyRequests - waitsBefore.rangeReadyRequests,
+                fileCount);
+            EXPECT_EQ(
+                waits.rangeReadyReleases - waitsBefore.rangeReadyReleases,
+                fileCount);
+          } else {
+            EXPECT_EQ(
+                mode == 1 ? waits.firstLoadGroupWaits -
+                        waitsBefore.firstLoadGroupWaits
+                    : preload
+                    ? waits.splitPreloadWaits - waitsBefore.splitPreloadWaits
+                    : waits.scanWaits - waitsBefore.scanWaits,
+                fileCount);
+          }
+        }
+      }
+    }
+  }
 }
 
 TEST_F(CudfIcebergReadTest, coalescedSchemaEvolution) {

@@ -246,11 +246,13 @@ class CachePrefetchPlanCache {
 };
 
 std::string cachePrefetchPlanKey(
-    const CudfHiveConnectorSplit& split,
+    const std::string& filePath,
+    uint64_t start,
+    uint64_t length,
     const HiveTableHandle& tableHandle,
     const std::vector<std::string>& readColumnNames) {
   std::ostringstream key;
-  key << split.filePath << '\0' << split.start << '\0' << split.length << '\0'
+  key << filePath << '\0' << start << '\0' << length << '\0'
       << tableHandle.toString();
   for (const auto& column : readColumnNames) {
     key << '\0' << column;
@@ -501,34 +503,55 @@ std::optional<std::unique_ptr<cudf::table>> CudfSplitReader::readNextChunk() {
 }
 
 void CudfSplitReader::setupCachePrefetchHint() {
-#ifdef VELOX_ENABLE_S3
-  if (useExperimentalCudfReader_ || !split_->coalescedFiles.empty() ||
-      !split_->filePath.starts_with("s3://") ||
-      connectorQueryCtx_->cache() == nullptr ||
+  if (useExperimentalCudfReader_ || connectorQueryCtx_->cache() == nullptr ||
       !cudfHiveConfig_->useBufferedInputSession(
           connectorQueryCtx_->sessionProperties()) ||
-      fileMetaData_.size() != 1 || readColumnNames_.empty()) {
+      readColumnNames_.empty()) {
     return;
   }
-  auto buffered =
-      std::dynamic_pointer_cast<BufferedInputDataSource>(dataSource_);
+  VELOX_CHECK_EQ(fileMetaData_.size(), 1 + coalescedDataSources_.size());
+
+  // Register every member before waiting. Each source keeps its own cache
+  // identity, admission bytes and load lifetime; the existing scheduler can
+  // overlap files without holding an entire group's budget behind one read.
+  for (size_t sourceIndex = 0; sourceIndex < fileMetaData_.size();
+       ++sourceIndex) {
+    setupCachePrefetchHintForSource(sourceIndex);
+  }
+}
+
+void CudfSplitReader::setupCachePrefetchHintForSource(size_t sourceIndex) {
+  const auto& source =
+      sourceIndex == 0 ? dataSource_ : coalescedDataSources_[sourceIndex - 1];
+  const auto& filePath = sourceIndex == 0
+      ? split_->filePath
+      : split_->coalescedFiles[sourceIndex - 1].filePath;
+  if (!filePath.starts_with("s3://")) {
+    return;
+  }
+  auto buffered = std::dynamic_pointer_cast<BufferedInputDataSource>(source);
   if (!buffered) {
     return;
   }
-
+  // Multi-source readers select whole files. Use those same bounds in the
+  // per-file plan cache, rather than applying the primary split to members.
+  const auto start = split_->coalescedFiles.empty() ? split_->start : 0;
   try {
+    const auto length =
+        split_->coalescedFiles.empty() ? split_->length : source->size();
     auto& planCache = CachePrefetchPlanCache::instance();
     std::string planKey;
     std::shared_ptr<const CachedPrefetchPlan> cachedPlan;
     if (planCache.enabled()) {
-      planKey = cachePrefetchPlanKey(*split_, *tableHandle_, readColumnNames_);
+      planKey = cachePrefetchPlanKey(
+          filePath, start, length, *tableHandle_, readColumnNames_);
       cachedPlan = planCache.get(planKey);
     }
     if (cachedPlan == nullptr) {
       // This reader is a metadata-only planner. It never materializes
       // columns, allocates device input buffers, or changes the regular
       // reader's state.
-      CudfHybridScanReader planner(fileMetaData_.front(), readerOptions_);
+      CudfHybridScanReader planner(fileMetaData_[sourceIndex], readerOptions_);
       auto rowGroups = planner.all_row_groups(readerOptions_);
       if (readerOptions_.get_skip_bytes() > 0 ||
           readerOptions_.get_num_bytes().has_value()) {
@@ -554,12 +577,8 @@ void CudfSplitReader::setupCachePrefetchHint() {
       return;
     }
 
-    cachePrefetchHintKey_ = fmt::format(
-        "{}:{}:{}:{}",
-        connectorQueryCtx_->scanId(),
-        split_->filePath,
-        split_->start,
-        split_->length);
+    const auto hintKey = fmt::format(
+        "{}:{}:{}:{}", connectorQueryCtx_->scanId(), filePath, start, length);
     cachePrefetchQueryId_ = connectorQueryCtx_->queryId();
     const auto* session = connectorQueryCtx_->sessionProperties();
     const auto prepareLoads = prepareCacheHintLoadsEnabled();
@@ -596,10 +615,11 @@ void CudfSplitReader::setupCachePrefetchHint() {
             "Projected cache hint lost its cache-backed input");
       };
     }
+    cachePrefetchHints_.push_back({hintKey, filePath});
     ExecutorSplitPrefetch::registerCacheHint(
         executor_,
         *cachePrefetchQueryId_,
-        *cachePrefetchHintKey_,
+        hintKey,
         cachedPlan->rangeStats,
         std::move(load),
         cudfHiveConfig_->executorSplitPrefetchConcurrencySession(session),
@@ -609,9 +629,8 @@ void CudfSplitReader::setupCachePrefetchHint() {
     ExecutorSplitPrefetch::recordCacheHintFallback();
     LOG(WARNING) << "Falling back to demand reads after cuDF cache hint "
                     "planning failed for "
-                 << split_->filePath << ": " << e.what();
+                 << filePath << ": " << e.what();
   }
-#endif
 }
 
 void CudfSplitReader::waitForCachePrefetchHint() {
@@ -619,49 +638,52 @@ void CudfSplitReader::waitForCachePrefetchHint() {
 }
 
 void CudfSplitReader::waitForCachePrefetchHint(bool splitPreload) {
-  // Split preload only proves that this scan can start. Once a driver actually
-  // consumes the split, let its remaining ranges pass speculative work while
-  // preserving the executor-global request window.
+  // After preload, prioritize each member's remaining demand reads.
   if (!splitPreload && cachePrefetchHintWaited_ &&
-      !cachePrefetchDemandPrioritized_ && cachePrefetchQueryId_ &&
-      cachePrefetchHintKey_) {
-    cachePrefetchDemandPrioritized_ = prioritizeNativeS3File(split_->filePath);
+      !cachePrefetchDemandPrioritized_) {
+    cachePrefetchDemandPrioritized_ = true;
+    for (const auto& hint : cachePrefetchHints_) {
+      cachePrefetchDemandPrioritized_ &= prioritizeNativeS3File(hint.filePath);
+    }
   }
   if (cachePrefetchHintWaited_ || !cachePrefetchQueryId_ ||
-      !cachePrefetchHintKey_) {
+      cachePrefetchHints_.empty()) {
     return;
   }
   cachePrefetchHintWaited_ = true;
-  if (cachePrefetchFirstLoadPolicyEnabled_) {
-    if (!cachePrefetchFirstLoadReady_) {
-      ExecutorSplitPrefetch::requestCacheHint(
-          executor_, *cachePrefetchQueryId_, *cachePrefetchHintKey_);
-      cachePrefetchNonBlockingRequested_ = true;
-      return;
+  for (const auto& hint : cachePrefetchHints_) {
+    if (cachePrefetchFirstLoadPolicyEnabled_) {
+      if (!cachePrefetchFirstLoadReady_) {
+        ExecutorSplitPrefetch::requestCacheHint(
+            executor_, *cachePrefetchQueryId_, hint.key);
+        cachePrefetchNonBlockingRequested_ = true;
+      } else {
+        ExecutorSplitPrefetch::takeCacheHint(
+            executor_,
+            *cachePrefetchQueryId_,
+            hint.key,
+            CacheHintWaitMode::kFirstLoadGroup);
+      }
+    } else {
+      ExecutorSplitPrefetch::takeCacheHint(
+          executor_,
+          *cachePrefetchQueryId_,
+          hint.key,
+          splitPreload ? CacheHintWaitMode::kSplitPreload
+                       : CacheHintWaitMode::kScan);
     }
-    ExecutorSplitPrefetch::takeCacheHint(
-        executor_,
-        *cachePrefetchQueryId_,
-        *cachePrefetchHintKey_,
-        CacheHintWaitMode::kFirstLoadGroup);
-    return;
   }
-  ExecutorSplitPrefetch::takeCacheHint(
-      executor_,
-      *cachePrefetchQueryId_,
-      *cachePrefetchHintKey_,
-      splitPreload ? CacheHintWaitMode::kSplitPreload
-                   : CacheHintWaitMode::kScan);
 }
 
 void CudfSplitReader::releaseCachePrefetchHint() {
-  if (cachePrefetchNonBlockingRequested_ && cachePrefetchQueryId_ &&
-      cachePrefetchHintKey_) {
-    ExecutorSplitPrefetch::releaseCacheHint(
-        executor_, *cachePrefetchQueryId_, *cachePrefetchHintKey_);
+  if (cachePrefetchNonBlockingRequested_ && cachePrefetchQueryId_) {
+    for (const auto& hint : cachePrefetchHints_) {
+      ExecutorSplitPrefetch::releaseCacheHint(
+          executor_, *cachePrefetchQueryId_, hint.key);
+    }
   }
   cachePrefetchQueryId_.reset();
-  cachePrefetchHintKey_.reset();
+  cachePrefetchHints_.clear();
   cachePrefetchDemandPrioritized_ = false;
   cachePrefetchNonBlockingRequested_ = false;
   cachePrefetchFirstLoadPolicyEnabled_ = false;
@@ -1358,7 +1380,7 @@ void CudfSplitReader::createCudfReader() {
 
   // Make the existing TableScan ready-first selection reflect projected cache
   // range readiness, not just footer parsing and reader construction.
-  if (cacheHintReadySplitPreloadEnabled() && cachePrefetchHintKey_) {
+  if (cacheHintReadySplitPreloadEnabled() && !cachePrefetchHints_.empty()) {
     waitForCachePrefetchHint(/*splitPreload=*/true);
   }
 

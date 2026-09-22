@@ -8,6 +8,54 @@ Velox-cuDF implements the Velox [DriverAdapter](https://github.com/facebookincub
 
 For more information please refer to our blog: "[Extending Velox - GPU Acceleration with cuDF](https://velox-lib.io/blog/extending-velox-with-cudf)."
 
+## Regular multi-source reads with projected prefetch
+
+The regular Parquet reader can decode a compatible group of whole files through
+one existing cuDF `chunked_parquet_reader`. Before constructing that reader,
+Flux plans projected cache ranges separately for each file and registers every
+member with the executor prefetch scheduler. Each member retains its own file
+identity, byte reservation, readiness signal, and load lifetime. The existing
+full-load, first-load, and nonblocking range-demand policies apply to every
+member. Planning failures fall back to demand reads for the affected file.
+
+The Spark-Gluten coordinator already groups whole-file Iceberg inputs from the
+same scan and peer with matching partition and metadata values and no delete
+files. Partial-file splits stay separate. Group limits count physical file
+bytes; they are not projected-byte targets, H2D sizes, or decoded GPU-memory
+limits. The reader's chunk/pass limits still bound decoding. A small group can
+produce one output chunk, but larger groups can produce several chunks.
+
+For a bounded Job97 trial, apply this Spark configuration overlay to the retained
+regular-reader configuration (both reader aliases must agree):
+
+```properties
+spark.gluten.sql.columnar.backend.velox.cudf.hive.use_experimental_reader=false
+spark.gluten.velox.cudf.hive.use-experimental-reader=false
+spark.gluten.sql.columnar.backend.velox.cudf.hive.use_buffered_input=true
+spark.gluten.velox.cudf.hive.use-buffered-input=true
+spark.gluten.sql.columnar.backend.velox.cudf.hive.selectivePreloadEnabled=false
+spark.gluten.sql.columnar.backend.velox.cudf.iceberg.multi_file.max_files=4
+spark.gluten.sql.columnar.backend.velox.cudf.iceberg.multi_file.max_file_bytes=67108864
+spark.gluten.sql.columnar.backend.velox.cudf.iceberg.multi_file.target_bytes=67108864
+spark.executorEnv.GLUTEN_CUDF_HYBRID_H2D_STAGING_BYTES=0
+spark.executorEnv.GLUTEN_CUDF_CACHE_HINT_PREPARE_LOADS=1
+spark.executorEnv.GLUTEN_CUDF_CACHE_HINT_READY_SPLIT_PRELOAD=1
+spark.executorEnv.GLUTEN_CPP_S3_ASYNC_CACHE_READ_GROUPS=1
+```
+
+Keep the retained prefetch concurrency, byte window, readiness policy, cache
+capacity, split sizing, and chunk/pass limits fixed when comparing runs. The
+overlay raises the old 16 MiB per-file eligibility cap to 64 MiB while retaining
+a 64 MiB total group cap and four-file maximum. Files still need a compatible
+partner that fits the total cap; the change cannot combine every Job97 split.
+Use `multi_file.max_files=1` as the grouping control on the same rebuilt image.
+
+This path uses unchanged cuDF and does not pack host buffers across its read
+requests. Validate grouped file counts, output batch counts, projected prefetch
+counters, and elapsed time separately; fewer groups do not guarantee fewer H2D
+copies or faster execution. Cache-hint planned/consumed counts are per file
+member, so they can exceed the number of grouped scan splits.
+
 ## Experimental buffered-reader H2D staging
 
 `GLUTEN_CUDF_HYBRID_H2D_STAGING_BYTES` opts the hybrid reader's

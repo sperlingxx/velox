@@ -143,7 +143,7 @@ class CudfSplitReader : public NvtxHelper {
   void prepareExperimentalHostRead();
 
   // Registers metadata-only projected ranges as a best-effort AsyncDataCache
-  // hint for a future regular-reader split.
+  // hint for each source in a future regular-reader split, including groups.
   void setupCachePrefetchHint();
 
   void waitForCachePrefetchHint();
@@ -184,6 +184,8 @@ class CudfSplitReader : public NvtxHelper {
   bool prependRowIndex_{false};
 
  private:
+  void setupCachePrefetchHintForSource(size_t sourceIndex);
+
   // Setup the cuDF reader options
   void setupReaderOptions();
 
@@ -201,7 +203,11 @@ class CudfSplitReader : public NvtxHelper {
   std::unique_ptr<HybridScanState> hybridScanState_;
   bool useExperimentalCudfReader_;
   std::optional<std::string> cachePrefetchQueryId_;
-  std::optional<std::string> cachePrefetchHintKey_;
+  struct CachePrefetchHint {
+    std::string key;
+    std::string filePath;
+  };
+  std::vector<CachePrefetchHint> cachePrefetchHints_;
   bool cachePrefetchHintWaited_{false};
   bool cachePrefetchDemandPrioritized_{false};
   bool cachePrefetchNonBlockingRequested_{false};
