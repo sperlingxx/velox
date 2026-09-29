@@ -220,6 +220,15 @@ class CachedBufferedInput : public BufferedInput {
   std::unique_ptr<SeekableInputStream>
   read(uint64_t offset, uint64_t length, LogType logType) const override;
 
+  /// Returns an exact demand stream whose cache keys follow 'plan'. The plan
+  /// is immutable and owned by the stream, so independent preparation jobs do
+  /// not mutate this BufferedInput's shared hint state.
+  std::unique_ptr<SeekableInputStream> readWithCacheRegionPlan(
+      uint64_t offset,
+      uint64_t length,
+      LogType logType,
+      std::shared_ptr<CacheRegionPlan> plan) const;
+
   /// Schedules load of 'region' on 'executor_'. Fails silently if no memory or
   /// if shouldPreload() is false.
   bool prefetch(velox::common::Region region);
@@ -309,6 +318,10 @@ class CachedBufferedInput : public BufferedInput {
 
   cache::AsyncDataCache* cache() const {
     return cache_;
+  }
+
+  uint64_t cacheLoadQuantum() const {
+    return options_.loadQuantum();
   }
 
   bool hasCache() const override {

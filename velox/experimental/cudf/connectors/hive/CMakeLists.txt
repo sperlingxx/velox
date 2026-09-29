@@ -20,6 +20,7 @@ add_library(
   CudfHiveDataSink.cpp
   CudfHiveDataSource.cpp
   CudfHiveTableHandle.cpp
+  CudfScanPreparation.cpp
   CudfSplitReader.cpp
   CudfSplitReaderHelpers.cpp
   ExecutorReadBroker.cpp

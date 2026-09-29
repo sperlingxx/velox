@@ -2179,6 +2179,7 @@ BlockingReason Task::getSplitOrFuture(
     ContinueFuture& future) {
   EventCompletionNotifier stateChangeNotifier;
   bool notBlocked{false};
+  bool generatedSplitIssued{false};
   {
     std::lock_guard<std::timed_mutex> l(mutex_);
     auto& splitsState = getPlanNodeSplitsStateLocked(planNodeId);
@@ -2186,6 +2187,8 @@ BlockingReason Task::getSplitOrFuture(
     const auto numQueuedBefore = taskStats_.numQueuedTableScanSplits;
     notBlocked = splitsStore->nextSplit(
         driverId, maxPreloadSplits, preload, split, future);
+    generatedSplitIssued = notBlocked && splitsStore->generatesSplits() &&
+        split.hasConnectorSplit() && !split.isBarrier();
     // Wake status waiters when the scan split queue drains while more splits
     // may still arrive, so a coordinator can refill before the task starves.
     // Once noMoreSplits has been signaled there is nothing left to refill, so
@@ -2196,6 +2199,10 @@ BlockingReason Task::getSplitOrFuture(
     }
   }
   stateChangeNotifier.notify();
+  if (generatedSplitIssued) {
+    RECORD_METRIC_VALUE(kMetricTaskSplitsCount, 1);
+    onAddSplit(planNodeId, split);
+  }
   return notBlocked ? BlockingReason::kNotBlocked
                     : BlockingReason::kWaitForSplit;
 }
@@ -2720,6 +2727,7 @@ ContinueFuture Task::terminate(TaskState terminalState) {
   EventCompletionNotifier stateChangeNotifier;
   std::vector<ContinuePromise> barrierPromises;
   std::vector<std::shared_ptr<ExchangeClient>> exchangeClients;
+  std::vector<SplitsStore*> splitsStoresToCancel;
   {
     std::lock_guard<std::timed_mutex> l(mutex_);
     if (taskStats_.executionEndTimeMs == 0) {
@@ -2782,10 +2790,22 @@ ContinueFuture Task::terminate(TaskState terminalState) {
     }
     exchangeClients.swap(exchangeClients_);
 
+    for (auto& [_, state] : splitsStates_) {
+      for (auto& [__, store] : state.groupSplitsStores) {
+        if (store != nullptr) {
+          splitsStoresToCancel.push_back(store.get());
+        }
+      }
+    }
+
     barrierPromises.swap(barrierFinishPromises_);
     // Clear the barrier flag to ensure underBarrier() returns false after task
     // termination.
     barrierRequested_ = false;
+  }
+
+  for (auto* store : splitsStoresToCancel) {
+    store->cancelPendingWork();
   }
 
   taskCompletionNotifier.notify();

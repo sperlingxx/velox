@@ -322,9 +322,20 @@ void CudfHiveDataSource::convertSplit(std::shared_ptr<ConnectorSplit> split) {
 
 void CudfHiveDataSource::addSplit(std::shared_ptr<ConnectorSplit> split) {
   // Virtual method for class-specific conversion of the split
+  activePreparedBatch_ = false;
   convertSplit(split);
 
   cudfSplitReader_ = createCudfSplitReader();
+  if (prepareSplitOnly(split, *cudfSplitReader_, runtimeStats_)) {
+    return;
+  }
+  if (preparedHybridScan_.has_value()) {
+    cudfSplitReader_->setPreparedHybridScan(
+        std::move(preparedHybridScan_.value()));
+    preparedHybridScan_.reset();
+  } else if (!preparedDataSources_.empty()) {
+    cudfSplitReader_->setPreparedDataSources(std::move(preparedDataSources_));
+  }
   cudfSplitReader_->prepareSplit(runtimeStats_);
 
   // TODO: `completedBytes_` should be updated in `next()` as we read more and
@@ -346,6 +357,38 @@ void CudfHiveDataSource::addSplit(std::shared_ptr<ConnectorSplit> split) {
   }
 }
 
+bool CudfHiveDataSource::prepareSplitOnly(
+    const std::shared_ptr<ConnectorSplit>& /*split*/,
+    CudfSplitReader& /*reader*/,
+    dwio::common::RuntimeStatistics& /*runtimeStats*/) {
+  return false;
+}
+
+void CudfHiveDataSource::setPreparedDataSources(
+    std::vector<std::shared_ptr<cudf::io::datasource>> dataSources) {
+  VELOX_CHECK(preparedDataSources_.empty());
+  VELOX_CHECK(!dataSources.empty());
+  preparedDataSources_ = std::move(dataSources);
+}
+
+void CudfHiveDataSource::setPreparedHybridScan(PreparedHybridScanBatch batch) {
+  VELOX_CHECK(!preparedHybridScan_.has_value());
+  VELOX_CHECK(preparedDataSources_.empty());
+  VELOX_CHECK(!batch.dataSources.empty());
+  preparedHybridScan_ = std::move(batch);
+}
+
+void CudfHiveDataSource::recordPreparedBatch(
+    size_t units,
+    size_t sources,
+    uint64_t bytes) {
+  ++readyBatches_;
+  activePreparedBatch_ = true;
+  readyUnits_ += units;
+  readySources_ += sources;
+  readySelectedBytes_ += bytes;
+}
+
 void CudfHiveDataSource::setFromDataSource(
     std::unique_ptr<DataSource> sourceUnique) {
   // The TableScan preloader creates this DataSource through the same
@@ -360,6 +403,15 @@ void CudfHiveDataSource::setFromDataSource(
   runtimeStats_ = std::move(source->runtimeStats_);
   completedRows_ += source->completedRows_;
   completedBytes_ += source->completedBytes_;
+  readyBatches_ += source->readyBatches_;
+  readyUnits_ += source->readyUnits_;
+  readySources_ += source->readySources_;
+  readySelectedBytes_ += source->readySelectedBytes_;
+  preparedLeaseReadCalls_ += source->preparedLeaseReadCalls_;
+  preparedLeaseReadBytes_ += source->preparedLeaseReadBytes_;
+  preparedHybridH2dCopies_ += source->preparedHybridH2dCopies_;
+  preparedHybridH2dBytes_ += source->preparedHybridH2dBytes_;
+  activePreparedBatch_ = source->activePreparedBatch_;
   cudfSplitReader_ = std::move(source->cudfSplitReader_);
   optimizedRemainingFilter_ = std::move(source->optimizedRemainingFilter_);
   cudfRemainingFilterExpression_ =
@@ -396,6 +448,19 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
   VELOX_CHECK_NOT_NULL(cudfSplitReader_, "No split to process.");
   auto chunkOpt = cudfSplitReader_->next(size);
   if (!chunkOpt.has_value()) {
+    if (activePreparedBatch_) {
+      // Retire prepared input ownership at split EOF. Waiting for the next
+      // split handoff can create a replacement dependency on its admission
+      // slot. Legacy readers retain their existing lifetime.
+      const auto [readCalls, readBytes] =
+          cudfSplitReader_->preparedLeaseReadStats();
+      preparedLeaseReadCalls_ += readCalls;
+      preparedLeaseReadBytes_ += readBytes;
+      preparedHybridH2dCopies_ += cudfSplitReader_->preparedHybridH2dCopies();
+      preparedHybridH2dBytes_ += cudfSplitReader_->preparedHybridH2dBytes();
+      cudfSplitReader_.reset();
+      activePreparedBatch_ = false;
+    }
     return nullptr;
   }
   auto cudfTable = std::move(chunkOpt.value());
@@ -459,6 +524,28 @@ CudfHiveDataSource::getRuntimeStats() {
       *ioStatistics_, "", result);
   if (numFilesCoalesced_ > 0) {
     result.emplace("numFilesCoalesced", RuntimeMetric(numFilesCoalesced_));
+  }
+  if (readyBatches_ > 0) {
+    result.emplace("cudfReadyBatches", RuntimeMetric(readyBatches_));
+    result.emplace("cudfReadyUnits", RuntimeMetric(readyUnits_));
+    result.emplace("cudfReadySources", RuntimeMetric(readySources_));
+    result.emplace(
+        "cudfReadySelectedBytes",
+        RuntimeMetric(readySelectedBytes_, RuntimeCounter::Unit::kBytes));
+    result.emplace(
+        "cudfPreparedLeaseReadCalls", RuntimeMetric(preparedLeaseReadCalls_));
+    result.emplace(
+        "cudfPreparedLeaseReadBytes",
+        RuntimeMetric(preparedLeaseReadBytes_, RuntimeCounter::Unit::kBytes));
+    result.emplace(
+        "cudfPreparedHybridH2dCopies", RuntimeMetric(preparedHybridH2dCopies_));
+    result.emplace(
+        "cudfPreparedHybridH2dBytes",
+        RuntimeMetric(preparedHybridH2dBytes_, RuntimeCounter::Unit::kBytes));
+    // Prepared lease datasources have no backing file handle and therefore
+    // cannot perform a post-claim remote or filesystem payload read.
+    result.emplace(
+        "cudfPreparedUnexpectedBackingReads", RuntimeMetric(int64_t{0}));
   }
   result.insert({
       {std::string(Connector::kTotalRemainingFilterTime),

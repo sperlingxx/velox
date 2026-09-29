@@ -1043,8 +1043,19 @@ void CachedBufferedInput::reset() {
 std::unique_ptr<SeekableInputStream> CachedBufferedInput::read(
     uint64_t offset,
     uint64_t length,
-    LogType /*logType*/) const {
-  VELOX_CHECK_LE(offset + length, fileSize_);
+    LogType logType) const {
+  return readWithCacheRegionPlan(
+      offset, length, logType, *cacheRegionPlan_.rlock());
+}
+
+std::unique_ptr<SeekableInputStream>
+CachedBufferedInput::readWithCacheRegionPlan(
+    uint64_t offset,
+    uint64_t length,
+    LogType /*logType*/,
+    std::shared_ptr<CacheRegionPlan> plan) const {
+  VELOX_CHECK_LE(offset, fileSize_);
+  VELOX_CHECK_LE(length, fileSize_ - offset);
   auto stream = std::make_unique<CacheInputStream>(
       const_cast<CachedBufferedInput*>(this),
       ioStatistics_.get(),
@@ -1056,7 +1067,7 @@ std::unique_ptr<SeekableInputStream> CachedBufferedInput::read(
       TrackingId(),
       0,
       options_.loadQuantum(),
-      *cacheRegionPlan_.rlock());
+      std::move(plan));
   if (preloaded()) {
     stream->setPreloadedPin(preloadPin_);
   }

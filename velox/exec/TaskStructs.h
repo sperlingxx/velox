@@ -116,6 +116,16 @@ class SplitsStore {
   /// splits.
   virtual bool allSplitsConsumed() const = 0;
 
+  /// Returns true when this store creates connector splits during nextSplit()
+  /// instead of receiving them through Task::addSplit().
+  virtual bool generatesSplits() const {
+    return false;
+  }
+
+  /// Stops work owned by a split source. Called once Task enters any terminal
+  /// state and always outside the Task mutex.
+  virtual void cancelPendingWork() noexcept {}
+
   /// Add new split into this store.  Some of the waiters previously waiting on
   /// the ContinueFuture after the nextSplit() call should be notified by the
   /// caller of this function by setting values on the `promises` output
@@ -158,7 +168,7 @@ class SplitsStore {
 
   /// Starts asynchronous preload for up to 'maxPreloadSplits' queued splits
   /// without assigning a split to a driver.
-  int preloadSplits(
+  virtual int preloadSplits(
       int maxPreloadSplits,
       const ConnectorSplitPreloadFunc& preload);
 

@@ -18,6 +18,7 @@
 #include "velox/experimental/cudf/connectors/hive/CudfSplitReader.h"
 #include "velox/experimental/cudf/connectors/hive/iceberg/CudfIcebergDataSource.h"
 #include "velox/experimental/cudf/connectors/hive/iceberg/CudfIcebergSplitReader.h"
+#include "velox/experimental/cudf/connectors/hive/iceberg/CudfPreparedIcebergSplit.h"
 
 #include "velox/common/Casts.h"
 #include "velox/connectors/hive/HiveConnectorSplit.h"
@@ -70,6 +71,20 @@ void CudfIcebergDataSource::convertSplit(
   icebergSplit_ =
       checkedPointerCast<const velox_iceberg::HiveIcebergSplit>(split);
 
+  const auto preparedMarker =
+      icebergSplit_->customSplitInfo.find("cudf_prepared_batch");
+  if (preparedMarker != icebergSplit_->customSplitInfo.end() &&
+      preparedMarker->second == "true") {
+    auto prepared = std::static_pointer_cast<CudfPreparedIcebergSplit>(split);
+    recordPreparedBatch(
+        prepared->unitCount(), prepared->sourceCount(), prepared->size());
+    if (prepared->isRowGroupBatch()) {
+      setPreparedHybridScan(prepared->takePreparedHybridScan());
+    } else {
+      setPreparedDataSources(prepared->takeDataSources());
+    }
+  }
+
   // Convert `ConnectorSplit` to `CudfHiveConnectorSplit`
   CudfHiveDataSource::convertSplit(split);
 
@@ -78,6 +93,64 @@ void CudfIcebergDataSource::convertSplit(
     split_->coalescedFiles.push_back(
         {normalizeFilePath(file.filePath), file.length});
   }
+}
+
+bool CudfIcebergDataSource::prepareSplitOnly(
+    const std::shared_ptr<velox_connector::ConnectorSplit>& split,
+    CudfSplitReader& reader,
+    dwio::common::RuntimeStatistics& runtimeStats) {
+  const auto marker = icebergSplit_->customSplitInfo.find("cudf_prepare_file");
+  if (marker == icebergSplit_->customSplitInfo.end() ||
+      marker->second != "true") {
+    return false;
+  }
+
+  auto request =
+      std::static_pointer_cast<const CudfFilePreparationSplit>(split);
+  auto& icebergReader = static_cast<CudfIcebergSplitReader&>(reader);
+  if (request->isRowGroupPlanRequest()) {
+    auto plan = icebergReader.planHostReadyFile(
+        request->admission(), request->cancellationToken(), runtimeStats);
+    if (plan.has_value()) {
+      request->result()->publishPlan(std::move(*plan));
+    } else {
+      request->result()->fallback();
+    }
+    return true;
+  }
+  if (request->isRowGroupPayloadRequest()) {
+    auto dataSource = icebergReader.prepareHostReadyRowGroup(
+        request->rowGroupPlan().ranges,
+        request->admission(),
+        request->cancellationToken());
+    const auto fileSize = static_cast<uint64_t>(dataSource->size());
+    request->result()->publish(
+        CudfPreparedIcebergFile{
+            request->descriptorOrdinal(),
+            request->descriptor(),
+            std::move(dataSource),
+            fileSize,
+            request->metadata(),
+            request->rowGroupPlan().rowGroup,
+            request->rowGroupPlan().logicalBytes});
+    return true;
+  }
+  auto prepared = icebergReader.prepareHostReadyFile(
+      request->admission(), request->cancellationToken(), runtimeStats);
+  if (!prepared.has_value()) {
+    request->result()->fallback();
+    return true;
+  }
+  const auto preparedFileSize =
+      static_cast<uint64_t>(prepared->dataSource->size());
+  request->result()->publish(
+      CudfPreparedIcebergFile{
+          request->descriptorOrdinal(),
+          request->descriptor(),
+          std::move(prepared->dataSource),
+          preparedFileSize,
+          std::move(prepared->metadata)});
+  return true;
 }
 
 std::unique_ptr<CudfSplitReader>

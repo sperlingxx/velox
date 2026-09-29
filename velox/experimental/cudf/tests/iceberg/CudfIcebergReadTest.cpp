@@ -18,6 +18,7 @@
 
 #include "velox/experimental/cudf/connectors/hive/CudfSplitReader.h"
 #include "velox/experimental/cudf/connectors/hive/ExecutorSplitPrefetch.h"
+#include "velox/experimental/cudf/connectors/hive/iceberg/CudfPreparedSplitsStore.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/tests/iceberg/CudfDeletionVectorTestUtils.h"
 #include "velox/experimental/cudf/tests/iceberg/CudfIcebergTestBase.h"
@@ -38,12 +39,17 @@
 #include "velox/type/Timestamp.h"
 #include "velox/type/TimestampConversion.h"
 
+#include <cudf/io/parquet.hpp>
+
 #include <folly/Random.h>
 #include <folly/ScopeGuard.h>
 #include <folly/String.h>
 #include <folly/lang/Bits.h>
 
 #include <atomic>
+#include <chrono>
+#include <fstream>
+#include <iostream>
 
 using namespace facebook::velox::exec::test;
 using namespace facebook::velox::exec;
@@ -92,6 +98,52 @@ class CountingBufferedInputBuilder final
   std::shared_ptr<::facebook::velox::connector::hive::BufferedInputBuilder>
       delegate_;
   std::atomic_uint64_t createCount_{0};
+};
+
+class OwnedFileDataSource final : public cudf::io::datasource {
+ public:
+  explicit OwnedFileDataSource(const std::string& path) {
+    std::ifstream input(path, std::ios::binary | std::ios::ate);
+    VELOX_CHECK(input, "Failed to open prepared test file {}", path);
+    const auto end = input.tellg();
+    VELOX_CHECK(
+        end != std::streampos{-1},
+        "Failed to size prepared test file {}",
+        path);
+    bytes_.resize(static_cast<size_t>(end));
+    input.seekg(0);
+    input.read(
+        reinterpret_cast<char*>(bytes_.data()),
+        static_cast<std::streamsize>(bytes_.size()));
+    VELOX_CHECK(input, "Failed to read prepared test file {}", path);
+  }
+
+  size_t size() const override {
+    return bytes_.size();
+  }
+
+  std::unique_ptr<buffer> host_read(size_t offset, size_t size) override {
+    VELOX_CHECK_LE(offset, bytes_.size());
+    const auto readSize = std::min(size, bytes_.size() - offset);
+    std::vector<uint8_t> result(readSize);
+    if (readSize > 0) {
+      std::memcpy(result.data(), bytes_.data() + offset, readSize);
+    }
+    return buffer::create(std::move(result));
+  }
+
+  size_t host_read(size_t offset, size_t size, uint8_t* destination) override {
+    VELOX_CHECK_LE(offset, bytes_.size());
+    const auto readSize = std::min(size, bytes_.size() - offset);
+    if (readSize > 0) {
+      VELOX_CHECK_NOT_NULL(destination);
+      std::memcpy(destination, bytes_.data() + offset, readSize);
+    }
+    return readSize;
+  }
+
+ private:
+  std::vector<uint8_t> bytes_;
 };
 
 } // namespace
@@ -582,6 +634,1108 @@ TEST_F(CudfIcebergReadTest, multipleSplits) {
                   .planNode();
 
   assertQuery(plan, allSplits, "SELECT * FROM tmp", 0);
+}
+
+TEST_F(CudfIcebergReadTest, generatedReadyFilesRunThroughTableScan) {
+  using cudf_velox::connector::hive::iceberg::CudfPreparedIcebergFile;
+  using cudf_velox::connector::hive::iceberg::CudfPreparedSplitSource;
+  using cudf_velox::connector::hive::iceberg::CudfPreparedSplitsStore;
+
+  auto rowType = ROW({"c0"}, {BIGINT()});
+  std::array<RowVectorPtr, 4> data{
+      makeRowVector({makeFlatVector<int64_t>({0, 1, 2})}),
+      makeRowVector({makeFlatVector<int64_t>({10, 11, 12})}),
+      makeRowVector({makeFlatVector<int64_t>({20, 21, 22})}),
+      makeRowVector({makeFlatVector<int64_t>({30, 31, 32})})};
+  std::array<std::shared_ptr<TempFilePath>, 4> paths{
+      TempFilePath::create(),
+      TempFilePath::create(),
+      TempFilePath::create(),
+      TempFilePath::create()};
+  for (size_t i = 0; i < data.size(); ++i) {
+    writeToFile(paths[i]->getPath(), data[i]);
+  }
+
+  std::shared_ptr<CudfPreparedSplitSource> source;
+  CursorParameters params;
+  params.planNode = makeTableScanPlan(rowType);
+  params.maxDrivers = 2;
+  params.beforeTaskStart = [&](Task& task) {
+    source = std::make_shared<CudfPreparedSplitSource>(
+        task.shared_from_this(), "0", task.queryCtx()->executor());
+    task.setSplitsStore(
+        "0", std::make_unique<CudfPreparedSplitsStore>(source, 2, 1 << 20));
+  };
+  auto cursor = TaskCursor::create(params);
+  ASSERT_NE(source, nullptr);
+  cursor->start();
+
+  const auto makePrepared = [&](uint64_t ordinal) {
+    auto original = makeIcebergSplits(paths[ordinal]->getPath());
+    auto descriptor =
+        std::dynamic_pointer_cast<const HiveIcebergSplit>(original.front());
+    VELOX_CHECK_NOT_NULL(descriptor);
+    auto dataSource =
+        std::make_shared<OwnedFileDataSource>(paths[ordinal]->getPath());
+    return CudfPreparedIcebergFile{
+        ordinal, descriptor, dataSource, dataSource->size()};
+  };
+
+  ASSERT_TRUE(source->publishPrepared(makePrepared(0)));
+  ASSERT_TRUE(source->publishPrepared(makePrepared(2)));
+  std::vector<int64_t> firstValues;
+  while (firstValues.size() < 6) {
+    ASSERT_TRUE(cursor->moveNext());
+    auto output = cursor->current();
+    auto decoded = output->childAt(0)->as<SimpleVector<int64_t>>();
+    for (vector_size_t row = 0; row < output->size(); ++row) {
+      firstValues.push_back(decoded->valueAt(row));
+    }
+  }
+  std::sort(firstValues.begin(), firstValues.end());
+  EXPECT_EQ(firstValues, (std::vector<int64_t>{0, 1, 2, 20, 21, 22}));
+
+  ASSERT_TRUE(source->publishPrepared(makePrepared(1)));
+  ASSERT_TRUE(source->publishPrepared(makePrepared(3)));
+  source->finish();
+
+  std::vector<int64_t> remaining;
+  while (cursor->moveNext()) {
+    auto output = cursor->current();
+    auto decoded = output->childAt(0)->as<SimpleVector<int64_t>>();
+    for (vector_size_t row = 0; row < output->size(); ++row) {
+      remaining.push_back(decoded->valueAt(row));
+    }
+  }
+  std::sort(remaining.begin(), remaining.end());
+  EXPECT_EQ(remaining, (std::vector<int64_t>{10, 11, 12, 30, 31, 32}));
+
+  ASSERT_TRUE(waitForTaskCompletion(cursor->task().get()));
+  ASSERT_TRUE(waitForTaskDriversToFinish(cursor->task().get()));
+  const auto stats = cursor->task()->taskStats();
+  EXPECT_GE(stats.numTotalSplits, 2);
+  EXPECT_LE(stats.numTotalSplits, 4);
+  EXPECT_EQ(stats.numFinishedSplits, stats.numTotalSplits);
+  EXPECT_EQ(stats.numRunningSplits, 0);
+  EXPECT_EQ(cursor->task()->state(), TaskState::kFinished);
+}
+
+TEST_F(CudfIcebergReadTest, preparedRowGroupsRunThroughHybridTableScan) {
+  using cudf_velox::connector::hive::planParquetFileRanges;
+  using cudf_velox::connector::hive::iceberg::CudfPreparedIcebergFile;
+  using cudf_velox::connector::hive::iceberg::CudfPreparedSplitSource;
+  using cudf_velox::connector::hive::iceberg::CudfPreparedSplitsStore;
+
+  constexpr cudf::size_type kRowsPerFile = 60'000;
+  constexpr cudf::size_type kRowsPerGroup = 20'000;
+  auto rowType = ROW({"c0"}, {BIGINT()});
+  std::array<std::shared_ptr<TempFilePath>, 2> paths{
+      TempFilePath::create(), TempFilePath::create()};
+
+  const auto writeRowGroupedFile = [&](const std::string& path, int64_t base) {
+    std::vector<int64_t> values(kRowsPerFile);
+    std::iota(values.begin(), values.end(), base);
+    auto input = makeRowVector({makeFlatVector<int64_t>(values)});
+    const auto stream = cudf::get_default_stream();
+    auto table = with_arrow::toCudfTable(
+        input, input->pool(), stream, cudf::get_current_device_resource_ref());
+    cudf::io::table_input_metadata metadata(table->view());
+    metadata.column_metadata[0].set_name("c0");
+    auto options = cudf::io::parquet_writer_options::builder(
+                       cudf::io::sink_info{path}, table->view())
+                       .metadata(std::move(metadata))
+                       .row_group_size_rows(kRowsPerGroup)
+                       .max_page_size_rows(kRowsPerGroup / 4)
+                       .compression(cudf::io::compression_type::SNAPPY)
+                       .build();
+    cudf::io::write_parquet(options, stream);
+    stream.synchronize();
+  };
+  writeRowGroupedFile(paths[0]->getPath(), 0);
+  writeRowGroupedFile(paths[1]->getPath(), 100'000);
+
+  const std::array<cudf::size_type, 2> selectedRowGroups{2, 1};
+  std::vector<CudfPreparedIcebergFile> prepared;
+  prepared.reserve(paths.size());
+  for (size_t i = 0; i < paths.size(); ++i) {
+    auto original = makeIcebergSplits(paths[i]->getPath());
+    auto descriptor =
+        std::dynamic_pointer_cast<const HiveIcebergSplit>(original.front());
+    VELOX_CHECK_NOT_NULL(descriptor);
+    auto dataSource =
+        std::make_shared<OwnedFileDataSource>(paths[i]->getPath());
+    auto readerOptions = cudf::io::parquet_reader_options::builder().build();
+    readerOptions.set_column_names({"c0"});
+    auto plan = planParquetFileRanges(
+        dataSource, readerOptions, cudf::get_default_stream());
+    ASSERT_EQ(plan.rowGroups.size(), 3);
+    const auto rowGroup = selectedRowGroups[i];
+    const auto preparedBytes = std::accumulate(
+        plan.rowGroups[rowGroup].ranges.begin(),
+        plan.rowGroups[rowGroup].ranges.end(),
+        uint64_t{0},
+        [](uint64_t total, const auto& range) {
+          return total + static_cast<uint64_t>(range.size());
+        });
+    prepared.push_back(
+        CudfPreparedIcebergFile{
+            i,
+            std::move(descriptor),
+            std::move(dataSource),
+            getFileSize(paths[i]->getPath()),
+            std::make_shared<const cudf::io::parquet::FileMetaData>(
+                std::move(plan.metadata)),
+            rowGroup,
+            preparedBytes});
+  }
+
+  std::shared_ptr<CudfPreparedSplitSource> source;
+  CursorParameters params;
+  params.planNode = makeTableScanPlan(rowType);
+  params.maxDrivers = 1;
+  params.beforeTaskStart = [&](Task& task) {
+    source = std::make_shared<CudfPreparedSplitSource>(
+        task.shared_from_this(), "0", task.queryCtx()->executor());
+    task.setSplitsStore(
+        "0", std::make_unique<CudfPreparedSplitsStore>(source, 2, 1 << 30));
+    for (auto& file : prepared) {
+      ASSERT_TRUE(source->publishPrepared(std::move(file)));
+    }
+    source->finish();
+  };
+
+  auto cursor = TaskCursor::create(params);
+  std::vector<int64_t> actual;
+  while (cursor->moveNext()) {
+    auto output = cursor->current();
+    auto decoded = output->childAt(0)->as<SimpleVector<int64_t>>();
+    for (vector_size_t row = 0; row < output->size(); ++row) {
+      actual.push_back(decoded->valueAt(row));
+    }
+  }
+  ASSERT_TRUE(waitForTaskCompletion(cursor->task().get()));
+  ASSERT_TRUE(waitForTaskDriversToFinish(cursor->task().get()));
+  std::sort(actual.begin(), actual.end());
+  std::vector<int64_t> expected(2 * kRowsPerGroup);
+  std::iota(expected.begin(), expected.begin() + kRowsPerGroup, 40'000);
+  std::iota(expected.begin() + kRowsPerGroup, expected.end(), 120'000);
+  EXPECT_EQ(actual, expected);
+  EXPECT_EQ(cursor->task()->taskStats().numTotalSplits, 1);
+  EXPECT_EQ(cursor->task()->state(), TaskState::kFinished);
+}
+
+TEST_F(CudfIcebergReadTest, generatedRowGroupsPrepareThroughTableScan) {
+  using cudf_velox::connector::hive::HostRangeAdmission;
+  using cudf_velox::connector::hive::iceberg::CudfPreparationMode;
+  using cudf_velox::connector::hive::iceberg::CudfPreparedSplitSource;
+  using cudf_velox::connector::hive::iceberg::CudfPreparedSplitsStore;
+
+  constexpr cudf::size_type kRowsPerFile = 60'000;
+  constexpr cudf::size_type kRowsPerGroup = 20'000;
+  auto rowType = ROW({"c0"}, {BIGINT()});
+  auto path = TempFilePath::create();
+  std::vector<int64_t> expected(kRowsPerFile);
+  std::iota(expected.begin(), expected.end(), 0);
+  auto input = makeRowVector({makeFlatVector<int64_t>(expected)});
+  const auto stream = cudf::get_default_stream();
+  auto table = with_arrow::toCudfTable(
+      input, input->pool(), stream, cudf::get_current_device_resource_ref());
+  cudf::io::table_input_metadata metadata(table->view());
+  metadata.column_metadata[0].set_name("c0");
+  auto writerOptions = cudf::io::parquet_writer_options::builder(
+                           cudf::io::sink_info{path->getPath()}, table->view())
+                           .metadata(std::move(metadata))
+                           .row_group_size_rows(kRowsPerGroup)
+                           .max_page_size_rows(kRowsPerGroup / 4)
+                           .compression(cudf::io::compression_type::SNAPPY)
+                           .build();
+  cudf::io::write_parquet(writerOptions, stream);
+  stream.synchronize();
+
+  auto original = makeIcebergSplits(path->getPath());
+  auto descriptor =
+      std::dynamic_pointer_cast<HiveIcebergSplit>(original.front());
+  VELOX_CHECK_NOT_NULL(descriptor);
+  auto admission = std::make_shared<HostRangeAdmission>(64 << 20, 1);
+  std::shared_ptr<CudfPreparedSplitSource> source;
+  CursorParameters params;
+  params.planNode = makeTableScanPlan(rowType);
+  params.maxDrivers = 1;
+  params.queryConfigs = {{core::QueryConfig::kMaxSplitPreloadPerTask, "3"}};
+  params.queryCtx = core::QueryCtx::Builder()
+                        .executor(driverExecutor_.get())
+                        .queryId("generated-row-group-preparation")
+                        .build();
+  params.queryCtx->setConnectorSessionOverridesUnsafe(
+      kCudfIcebergConnectorId,
+      {{cudf_velox::connector::hive::CudfHiveConfig::kUseBufferedInputSession,
+        "true"}});
+  params.beforeTaskStart = [&](Task& task) {
+    source = std::make_shared<CudfPreparedSplitSource>(
+        task.shared_from_this(),
+        "0",
+        task.queryCtx()->executor(),
+        admission,
+        CudfPreparationMode::kRowGroupHybrid);
+    task.setSplitsStore(
+        "0", std::make_unique<CudfPreparedSplitsStore>(source, 3, 1 << 20));
+    ASSERT_TRUE(source->addDescriptor(0, descriptor));
+    source->sealDescriptors();
+  };
+
+  auto cursor = TaskCursor::create(params);
+  std::vector<int64_t> actual;
+  while (cursor->moveNext()) {
+    auto output = cursor->current();
+    auto decoded = output->childAt(0)->as<SimpleVector<int64_t>>();
+    for (vector_size_t row = 0; row < output->size(); ++row) {
+      actual.push_back(decoded->valueAt(row));
+    }
+  }
+  ASSERT_TRUE(waitForTaskCompletion(cursor->task().get()));
+  ASSERT_TRUE(waitForTaskDriversToFinish(cursor->task().get()));
+  std::sort(actual.begin(), actual.end());
+  EXPECT_EQ(actual, expected);
+  EXPECT_EQ(source->preparedCount(), 3);
+  EXPECT_EQ(source->fallbackCount(), 0);
+  const auto sourceMetrics = source->metrics();
+  EXPECT_EQ(sourceMetrics.originalInputs, 1);
+  EXPECT_EQ(sourceMetrics.plannedFiles, 1);
+  EXPECT_EQ(sourceMetrics.totalRowGroups, 3);
+  EXPECT_EQ(sourceMetrics.selectedRowGroups, 3);
+  EXPECT_EQ(sourceMetrics.prunedRowGroups, 0);
+  EXPECT_EQ(sourceMetrics.preparedUnits, 3);
+  EXPECT_GT(sourceMetrics.preparedPayloadBytes, 0);
+  EXPECT_EQ(sourceMetrics.issuedSplits, 3);
+  EXPECT_EQ(sourceMetrics.preparedBatches, 3);
+  EXPECT_EQ(sourceMetrics.issuedPreparedUnits, 3);
+  EXPECT_EQ(sourceMetrics.issuedPreparedSources, 3);
+  EXPECT_EQ(sourceMetrics.preparationFailures, 0);
+  const auto admissionAfterDrivers = admission->snapshot();
+  EXPECT_EQ(admissionAfterDrivers.currentBytes, 0);
+  EXPECT_EQ(admissionAfterDrivers.currentUnits, 0);
+  EXPECT_EQ(admissionAfterDrivers.peakUnits, 1);
+  const auto planStats = toPlanStats(cursor->task()->taskStats());
+  const auto& scanStats = planStats.at("0").customStats;
+  EXPECT_EQ(scanStats.at("cudfReadyBatches").sum, 3);
+  EXPECT_EQ(scanStats.at("cudfReadyUnits").sum, 3);
+  EXPECT_EQ(scanStats.at("cudfReadySources").sum, 3);
+  EXPECT_GT(scanStats.at("cudfReadySelectedBytes").sum, 0);
+  EXPECT_GT(scanStats.at("cudfPreparedLeaseReadCalls").sum, 0);
+  EXPECT_GT(scanStats.at("cudfPreparedLeaseReadBytes").sum, 0);
+  EXPECT_GT(scanStats.at("cudfPreparedHybridH2dCopies").sum, 0);
+  EXPECT_GT(scanStats.at("cudfPreparedHybridH2dBytes").sum, 0);
+  EXPECT_EQ(scanStats.at("cudfPreparedUnexpectedBackingReads").sum, 0);
+  EXPECT_EQ(cursor->task()->state(), TaskState::kFinished);
+}
+
+TEST_F(CudfIcebergReadTest, generatedRowGroupsPreservePushdownFilter) {
+  using cudf_velox::connector::hive::HostRangeAdmission;
+  using cudf_velox::connector::hive::iceberg::CudfPreparationMode;
+  using cudf_velox::connector::hive::iceberg::CudfPreparedSplitSource;
+  using cudf_velox::connector::hive::iceberg::CudfPreparedSplitsStore;
+
+  constexpr cudf::size_type kRowsPerFile = 60'000;
+  constexpr cudf::size_type kRowsPerGroup = 20'000;
+  auto rowType = ROW({"c0"}, {BIGINT()});
+  auto path = TempFilePath::create();
+  std::vector<int64_t> values(kRowsPerFile);
+  std::iota(values.begin(), values.end(), 0);
+  auto input = makeRowVector({makeFlatVector<int64_t>(values)});
+  const auto stream = cudf::get_default_stream();
+  auto table = with_arrow::toCudfTable(
+      input, input->pool(), stream, cudf::get_current_device_resource_ref());
+  cudf::io::table_input_metadata metadata(table->view());
+  metadata.column_metadata[0].set_name("c0");
+  auto writerOptions =
+      cudf::io::parquet_writer_options::builder(
+          cudf::io::sink_info{path->getPath()}, table->view())
+          .metadata(std::move(metadata))
+          .row_group_size_rows(kRowsPerGroup)
+          .max_page_size_rows(kRowsPerGroup / 4)
+          .compression(cudf::io::compression_type::SNAPPY)
+          .stats_level(cudf::io::statistics_freq::STATISTICS_COLUMN)
+          .build();
+  cudf::io::write_parquet(writerOptions, stream);
+  stream.synchronize();
+
+  auto original = makeIcebergSplits(path->getPath());
+  auto descriptor =
+      std::dynamic_pointer_cast<HiveIcebergSplit>(original.front());
+  VELOX_CHECK_NOT_NULL(descriptor);
+  auto admission = std::make_shared<HostRangeAdmission>(64 << 20, 2);
+  std::shared_ptr<CudfPreparedSplitSource> source;
+  CursorParameters params;
+  params.planNode = PlanBuilder()
+                        .startTableScan()
+                        .connectorId(kCudfIcebergConnectorId)
+                        .outputType(rowType)
+                        .dataColumns(rowType)
+                        .subfieldFilters({"c0 BETWEEN 20000 AND 39999"})
+                        .endTableScan()
+                        .planNode();
+  params.maxDrivers = 1;
+  params.queryConfigs = {{core::QueryConfig::kMaxSplitPreloadPerTask, "2"}};
+  params.queryCtx = core::QueryCtx::Builder()
+                        .executor(driverExecutor_.get())
+                        .queryId("generated-row-group-filter")
+                        .build();
+  params.queryCtx->setConnectorSessionOverridesUnsafe(
+      kCudfIcebergConnectorId,
+      {{cudf_velox::connector::hive::CudfHiveConfig::kUseBufferedInputSession,
+        "true"}});
+  params.beforeTaskStart = [&](Task& task) {
+    source = std::make_shared<CudfPreparedSplitSource>(
+        task.shared_from_this(),
+        "0",
+        task.queryCtx()->executor(),
+        admission,
+        CudfPreparationMode::kRowGroupHybrid);
+    task.setSplitsStore(
+        "0", std::make_unique<CudfPreparedSplitsStore>(source, 2, 1 << 20));
+    ASSERT_TRUE(source->addDescriptor(0, descriptor));
+    source->sealDescriptors();
+  };
+
+  auto cursor = TaskCursor::create(params);
+  std::vector<int64_t> actual;
+  while (cursor->moveNext()) {
+    auto output = cursor->current();
+    auto decoded = output->childAt(0)->as<SimpleVector<int64_t>>();
+    for (vector_size_t row = 0; row < output->size(); ++row) {
+      actual.push_back(decoded->valueAt(row));
+    }
+  }
+  ASSERT_TRUE(waitForTaskCompletion(cursor->task().get()));
+  ASSERT_TRUE(waitForTaskDriversToFinish(cursor->task().get()));
+  std::vector<int64_t> expected(kRowsPerGroup);
+  std::iota(expected.begin(), expected.end(), 20'000);
+  EXPECT_EQ(actual, expected);
+  EXPECT_EQ(source->preparedCount(), 1);
+  EXPECT_EQ(source->fallbackCount(), 0);
+  const auto sourceMetrics = source->metrics();
+  EXPECT_EQ(sourceMetrics.originalInputs, 1);
+  EXPECT_EQ(sourceMetrics.plannedFiles, 1);
+  EXPECT_EQ(sourceMetrics.totalRowGroups, 3);
+  EXPECT_EQ(sourceMetrics.selectedRowGroups, 1);
+  EXPECT_EQ(sourceMetrics.prunedRowGroups, 2);
+  EXPECT_EQ(sourceMetrics.preparedUnits, 1);
+  EXPECT_EQ(sourceMetrics.issuedSplits, 1);
+  EXPECT_EQ(sourceMetrics.preparedBatches, 1);
+  EXPECT_EQ(sourceMetrics.issuedPreparedUnits, 1);
+  EXPECT_EQ(sourceMetrics.issuedPreparedSources, 1);
+  EXPECT_EQ(sourceMetrics.preparationFailures, 0);
+  EXPECT_EQ(admission->snapshot().currentBytes, 0);
+  EXPECT_EQ(admission->snapshot().currentUnits, 0);
+}
+
+TEST_F(CudfIcebergReadTest, generatedRowGroupsCloseWhenAllPruned) {
+  using cudf_velox::connector::hive::HostRangeAdmission;
+  using cudf_velox::connector::hive::iceberg::CudfPreparationMode;
+  using cudf_velox::connector::hive::iceberg::CudfPreparedSplitSource;
+  using cudf_velox::connector::hive::iceberg::CudfPreparedSplitsStore;
+
+  constexpr cudf::size_type kRowsPerFile = 60'000;
+  constexpr cudf::size_type kRowsPerGroup = 20'000;
+  auto rowType = ROW({"c0"}, {BIGINT()});
+  auto path = TempFilePath::create();
+  std::vector<int64_t> values(kRowsPerFile);
+  std::iota(values.begin(), values.end(), 0);
+  auto input = makeRowVector({makeFlatVector<int64_t>(values)});
+  const auto stream = cudf::get_default_stream();
+  auto table = with_arrow::toCudfTable(
+      input, input->pool(), stream, cudf::get_current_device_resource_ref());
+  cudf::io::table_input_metadata metadata(table->view());
+  metadata.column_metadata[0].set_name("c0");
+  auto writerOptions =
+      cudf::io::parquet_writer_options::builder(
+          cudf::io::sink_info{path->getPath()}, table->view())
+          .metadata(std::move(metadata))
+          .row_group_size_rows(kRowsPerGroup)
+          .max_page_size_rows(kRowsPerGroup / 4)
+          .compression(cudf::io::compression_type::SNAPPY)
+          .stats_level(cudf::io::statistics_freq::STATISTICS_COLUMN)
+          .build();
+  cudf::io::write_parquet(writerOptions, stream);
+  stream.synchronize();
+
+  auto original = makeIcebergSplits(path->getPath());
+  auto descriptor =
+      std::dynamic_pointer_cast<HiveIcebergSplit>(original.front());
+  VELOX_CHECK_NOT_NULL(descriptor);
+  auto admission = std::make_shared<HostRangeAdmission>(64 << 20, 2);
+  std::shared_ptr<CudfPreparedSplitSource> source;
+  CursorParameters params;
+  params.planNode = PlanBuilder()
+                        .startTableScan()
+                        .connectorId(kCudfIcebergConnectorId)
+                        .outputType(rowType)
+                        .dataColumns(rowType)
+                        .subfieldFilters({"c0 BETWEEN 100000 AND 110000"})
+                        .endTableScan()
+                        .planNode();
+  params.maxDrivers = 1;
+  params.queryConfigs = {{core::QueryConfig::kMaxSplitPreloadPerTask, "2"}};
+  params.queryCtx = core::QueryCtx::Builder()
+                        .executor(driverExecutor_.get())
+                        .queryId("generated-row-group-all-pruned")
+                        .build();
+  params.queryCtx->setConnectorSessionOverridesUnsafe(
+      kCudfIcebergConnectorId,
+      {{cudf_velox::connector::hive::CudfHiveConfig::kUseBufferedInputSession,
+        "true"}});
+  params.beforeTaskStart = [&](Task& task) {
+    source = std::make_shared<CudfPreparedSplitSource>(
+        task.shared_from_this(),
+        "0",
+        task.queryCtx()->executor(),
+        admission,
+        CudfPreparationMode::kRowGroupHybrid);
+    task.setSplitsStore(
+        "0", std::make_unique<CudfPreparedSplitsStore>(source, 2, 1 << 20));
+    ASSERT_TRUE(source->addDescriptor(0, descriptor));
+    source->sealDescriptors();
+  };
+
+  auto cursor = TaskCursor::create(params);
+  EXPECT_FALSE(cursor->moveNext());
+  ASSERT_TRUE(waitForTaskCompletion(cursor->task().get()));
+  ASSERT_TRUE(waitForTaskDriversToFinish(cursor->task().get()));
+  const auto sourceMetrics = source->metrics();
+  EXPECT_EQ(sourceMetrics.originalInputs, 1);
+  EXPECT_EQ(sourceMetrics.plannedFiles, 1);
+  EXPECT_EQ(sourceMetrics.totalRowGroups, 3);
+  EXPECT_EQ(sourceMetrics.selectedRowGroups, 0);
+  EXPECT_EQ(sourceMetrics.prunedRowGroups, 3);
+  EXPECT_EQ(sourceMetrics.preparedUnits, 0);
+  EXPECT_EQ(sourceMetrics.issuedSplits, 0);
+  EXPECT_EQ(sourceMetrics.preparationFailures, 0);
+  EXPECT_EQ(admission->snapshot().currentBytes, 0);
+  EXPECT_EQ(admission->snapshot().currentUnits, 0);
+  EXPECT_EQ(cursor->task()->state(), TaskState::kFinished);
+}
+
+TEST_F(CudfIcebergReadTest, generatedDescriptorsPrepareThroughTableScan) {
+  using cudf_velox::connector::hive::HostRangeAdmission;
+  using cudf_velox::connector::hive::iceberg::CudfPreparedSplitSource;
+  using cudf_velox::connector::hive::iceberg::CudfPreparedSplitsStore;
+
+  auto rowType = ROW({"c0"}, {BIGINT()});
+  std::array<RowVectorPtr, 4> data{
+      makeRowVector({makeFlatVector<int64_t>({0, 1, 2})}),
+      makeRowVector({makeFlatVector<int64_t>({10, 11, 12})}),
+      makeRowVector({makeFlatVector<int64_t>({20, 21, 22})}),
+      makeRowVector({makeFlatVector<int64_t>({30, 31, 32})})};
+  std::array<std::shared_ptr<TempFilePath>, 4> paths{
+      TempFilePath::create(),
+      TempFilePath::create(),
+      TempFilePath::create(),
+      TempFilePath::create()};
+  std::vector<std::shared_ptr<HiveIcebergSplit>> descriptors;
+  descriptors.reserve(paths.size());
+  for (size_t i = 0; i < data.size(); ++i) {
+    writeToFile(paths[i]->getPath(), data[i]);
+    auto splits = makeIcebergSplits(paths[i]->getPath());
+    auto descriptor =
+        std::dynamic_pointer_cast<HiveIcebergSplit>(splits.front());
+    VELOX_CHECK_NOT_NULL(descriptor);
+    descriptors.push_back(std::move(descriptor));
+  }
+
+  auto admission = std::make_shared<HostRangeAdmission>(64 << 20, 4);
+  std::shared_ptr<CudfPreparedSplitSource> source;
+  CursorParameters params;
+  params.planNode = makeTableScanPlan(rowType);
+  params.maxDrivers = 2;
+  params.queryConfigs = {{core::QueryConfig::kMaxSplitPreloadPerTask, "4"}};
+  params.queryCtx = core::QueryCtx::Builder()
+                        .executor(driverExecutor_.get())
+                        .queryId("generated-descriptor-preparation")
+                        .build();
+  params.queryCtx->setConnectorSessionOverridesUnsafe(
+      kCudfIcebergConnectorId,
+      {{cudf_velox::connector::hive::CudfHiveConfig::kUseBufferedInputSession,
+        "true"}});
+  params.beforeTaskStart = [&](Task& task) {
+    source = std::make_shared<CudfPreparedSplitSource>(
+        task.shared_from_this(), "0", task.queryCtx()->executor(), admission);
+    task.setSplitsStore(
+        "0", std::make_unique<CudfPreparedSplitsStore>(source, 2, 1 << 20));
+    for (size_t i = 0; i < descriptors.size(); ++i) {
+      ASSERT_TRUE(source->addDescriptor(i, descriptors[i]));
+    }
+    source->sealDescriptors();
+  };
+
+  auto cursor = TaskCursor::create(params);
+  ASSERT_NE(source, nullptr);
+  std::vector<int64_t> values;
+  while (cursor->moveNext()) {
+    auto output = cursor->current();
+    auto decoded = output->childAt(0)->as<SimpleVector<int64_t>>();
+    for (vector_size_t row = 0; row < output->size(); ++row) {
+      values.push_back(decoded->valueAt(row));
+    }
+  }
+  std::sort(values.begin(), values.end());
+  EXPECT_EQ(
+      values,
+      (std::vector<int64_t>{0, 1, 2, 10, 11, 12, 20, 21, 22, 30, 31, 32}));
+  ASSERT_TRUE(waitForTaskCompletion(cursor->task().get()));
+  ASSERT_TRUE(waitForTaskDriversToFinish(cursor->task().get()));
+  EXPECT_EQ(source->preparedCount(), 4);
+  EXPECT_EQ(source->fallbackCount(), 0);
+  const auto sourceMetrics = source->metrics();
+  EXPECT_EQ(sourceMetrics.originalInputs, 4);
+  EXPECT_EQ(sourceMetrics.preparedUnits, 4);
+  EXPECT_EQ(sourceMetrics.issuedPreparedUnits, 4);
+  EXPECT_EQ(sourceMetrics.issuedPreparedSources, 4);
+  EXPECT_GT(sourceMetrics.preparedPayloadBytes, 0);
+  EXPECT_EQ(sourceMetrics.preparationFailures, 0);
+  const auto releaseDeadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (admission->snapshot().currentUnits != 0 &&
+         std::chrono::steady_clock::now() < releaseDeadline) {
+    std::this_thread::yield();
+  }
+  const auto admissionAfterDrivers = admission->snapshot();
+  EXPECT_EQ(admissionAfterDrivers.currentBytes, 0);
+  EXPECT_EQ(admissionAfterDrivers.currentUnits, 0);
+
+  const auto stats = cursor->task()->taskStats();
+  EXPECT_GE(stats.numTotalSplits, 2);
+  EXPECT_LE(stats.numTotalSplits, 4);
+  EXPECT_EQ(stats.numFinishedSplits, stats.numTotalSplits);
+  EXPECT_EQ(stats.numRunningSplits, 0);
+  EXPECT_EQ(cursor->task()->state(), TaskState::kFinished);
+}
+
+TEST_F(CudfIcebergReadTest, oversizedPreparedDescriptorFallsBack) {
+  using cudf_velox::connector::hive::HostRangeAdmission;
+  using cudf_velox::connector::hive::iceberg::CudfPreparationMode;
+  using cudf_velox::connector::hive::iceberg::CudfPreparedSplitSource;
+  using cudf_velox::connector::hive::iceberg::CudfPreparedSplitsStore;
+
+  auto rowType = ROW({"c0"}, {BIGINT()});
+  auto data = makeRowVector({makeFlatVector<int64_t>({7, 8, 9})});
+  auto path = TempFilePath::create();
+  writeToFile(path->getPath(), data);
+  auto splits = makeIcebergSplits(path->getPath());
+  auto descriptor = std::dynamic_pointer_cast<HiveIcebergSplit>(splits.front());
+  VELOX_CHECK_NOT_NULL(descriptor);
+
+  for (const auto mode :
+       {CudfPreparationMode::kFileRegular,
+        CudfPreparationMode::kRowGroupHybrid}) {
+    auto admission = std::make_shared<HostRangeAdmission>(1, 1);
+    std::shared_ptr<CudfPreparedSplitSource> source;
+    CursorParameters params;
+    params.planNode = makeTableScanPlan(rowType);
+    params.queryConfigs = {{core::QueryConfig::kMaxSplitPreloadPerTask, "1"}};
+    params.queryCtx = core::QueryCtx::Builder()
+                          .executor(driverExecutor_.get())
+                          .queryId(
+                              mode == CudfPreparationMode::kFileRegular
+                                  ? "oversized-file-fallback"
+                                  : "oversized-row-group-fallback")
+                          .build();
+    params.queryCtx->setConnectorSessionOverridesUnsafe(
+        kCudfIcebergConnectorId,
+        {{cudf_velox::connector::hive::CudfHiveConfig::kUseBufferedInputSession,
+          "true"}});
+    params.beforeTaskStart = [&](Task& task) {
+      source = std::make_shared<CudfPreparedSplitSource>(
+          task.shared_from_this(),
+          "0",
+          task.queryCtx()->executor(),
+          admission,
+          mode);
+      task.setSplitsStore(
+          "0", std::make_unique<CudfPreparedSplitsStore>(source, 1, 1 << 20));
+      ASSERT_TRUE(source->addDescriptor(0, descriptor));
+      source->sealDescriptors();
+    };
+
+    auto cursor = TaskCursor::create(params);
+    std::vector<int64_t> values;
+    while (cursor->moveNext()) {
+      auto output = cursor->current();
+      auto decoded = output->childAt(0)->as<SimpleVector<int64_t>>();
+      for (vector_size_t row = 0; row < output->size(); ++row) {
+        values.push_back(decoded->valueAt(row));
+      }
+    }
+    ASSERT_TRUE(waitForTaskCompletion(cursor->task().get()));
+    ASSERT_TRUE(waitForTaskDriversToFinish(cursor->task().get()));
+    EXPECT_EQ(values, (std::vector<int64_t>{7, 8, 9}));
+    EXPECT_EQ(source->preparedCount(), 0);
+    EXPECT_EQ(source->fallbackCount(), 1);
+    EXPECT_EQ(admission->snapshot().currentBytes, 0);
+    EXPECT_EQ(admission->snapshot().currentUnits, 0);
+  }
+}
+
+TEST_F(CudfIcebergReadTest, successfulLimitStopsUnissuedPreparedFiles) {
+  using cudf_velox::connector::hive::iceberg::CudfPreparedIcebergFile;
+  using cudf_velox::connector::hive::iceberg::CudfPreparedSplitSource;
+  using cudf_velox::connector::hive::iceberg::CudfPreparedSplitsStore;
+
+  auto rowType = ROW({"c0"}, {BIGINT()});
+  std::array<std::shared_ptr<TempFilePath>, 4> paths{
+      TempFilePath::create(),
+      TempFilePath::create(),
+      TempFilePath::create(),
+      TempFilePath::create()};
+  for (size_t i = 0; i < paths.size(); ++i) {
+    writeToFile(
+        paths[i]->getPath(),
+        makeRowVector({makeFlatVector<int64_t>(
+            {static_cast<int64_t>(i * 10 + 1),
+             static_cast<int64_t>(i * 10 + 2),
+             static_cast<int64_t>(i * 10 + 3)})}));
+  }
+
+  std::shared_ptr<CudfPreparedSplitSource> source;
+  std::vector<std::weak_ptr<cudf::io::datasource>> preparedSources;
+  CursorParameters params;
+  params.planNode = PlanBuilder()
+                        .startTableScan()
+                        .connectorId(kCudfIcebergConnectorId)
+                        .outputType(rowType)
+                        .dataColumns(rowType)
+                        .endTableScan()
+                        .limit(0, 1, true)
+                        .planNode();
+  params.beforeTaskStart = [&](Task& task) {
+    source = std::make_shared<CudfPreparedSplitSource>(
+        task.shared_from_this(), "0", task.queryCtx()->executor());
+    task.setSplitsStore(
+        "0", std::make_unique<CudfPreparedSplitsStore>(source, 1, 1 << 20));
+    for (size_t i = 0; i < paths.size(); ++i) {
+      auto original = makeIcebergSplits(paths[i]->getPath());
+      auto descriptor =
+          std::dynamic_pointer_cast<const HiveIcebergSplit>(original.front());
+      VELOX_CHECK_NOT_NULL(descriptor);
+      auto dataSource =
+          std::make_shared<OwnedFileDataSource>(paths[i]->getPath());
+      preparedSources.push_back(dataSource);
+      ASSERT_TRUE(source->publishPrepared(
+          CudfPreparedIcebergFile{
+              i,
+              descriptor,
+              std::move(dataSource),
+              getFileSize(paths[i]->getPath())}));
+    }
+  };
+
+  auto cursor = TaskCursor::create(params);
+  int64_t rows = 0;
+  while (cursor->moveNext()) {
+    rows += cursor->current()->size();
+  }
+  EXPECT_EQ(rows, 1);
+  ASSERT_TRUE(waitForTaskCompletion(cursor->task().get()));
+  ASSERT_TRUE(waitForTaskDriversToFinish(cursor->task().get()));
+  EXPECT_EQ(cursor->task()->state(), TaskState::kFinished);
+  EXPECT_EQ(source->preparedCount(), paths.size());
+  EXPECT_EQ(cursor->task()->taskStats().numTotalSplits, 1);
+  size_t releasedSources = 0;
+  for (const auto& weak : preparedSources) {
+    releasedSources += weak.expired();
+  }
+  // The completed Task retains the one issued reader until Task destruction;
+  // all inputs that were never issued must be released by the terminal hook.
+  EXPECT_EQ(releasedSources, paths.size() - 1);
+  EXPECT_FALSE(source->publishFallback(
+      std::make_shared<facebook::velox::connector::hive::HiveConnectorSplit>(
+          kCudfIcebergConnectorId,
+          "file:/tmp/after-limit",
+          dwio::common::FileFormat::PARQUET)));
+}
+
+TEST_F(CudfIcebergReadTest, uniformLocalModeComparison) {
+  using cudf_velox::connector::hive::HostRangeAdmission;
+  using cudf_velox::connector::hive::iceberg::CudfPreparationMode;
+  using cudf_velox::connector::hive::iceberg::CudfPreparedSplitSource;
+  using cudf_velox::connector::hive::iceberg::CudfPreparedSplitsStore;
+
+  enum class Mode { kLegacy, kFileRegular, kRowGroupHybrid };
+  constexpr cudf::size_type kRowsPerFile = 60'000;
+  constexpr cudf::size_type kRowsPerGroup = 20'000;
+  constexpr size_t kRepetitions = 6;
+  auto rowType = ROW({"c0"}, {BIGINT()});
+  std::array<std::shared_ptr<TempFilePath>, 4> paths{
+      TempFilePath::create(),
+      TempFilePath::create(),
+      TempFilePath::create(),
+      TempFilePath::create()};
+  std::vector<int64_t> expected;
+  expected.reserve(paths.size() * kRowsPerFile);
+  const auto stream = cudf::get_default_stream();
+  for (size_t file = 0; file < paths.size(); ++file) {
+    std::vector<int64_t> values(kRowsPerFile);
+    std::iota(
+        values.begin(),
+        values.end(),
+        static_cast<int64_t>(file * kRowsPerFile));
+    expected.insert(expected.end(), values.begin(), values.end());
+    auto input = makeRowVector({makeFlatVector<int64_t>(values)});
+    auto table = with_arrow::toCudfTable(
+        input, input->pool(), stream, cudf::get_current_device_resource_ref());
+    cudf::io::table_input_metadata metadata(table->view());
+    metadata.column_metadata[0].set_name("c0");
+    auto writerOptions =
+        cudf::io::parquet_writer_options::builder(
+            cudf::io::sink_info{paths[file]->getPath()}, table->view())
+            .metadata(std::move(metadata))
+            .row_group_size_rows(kRowsPerGroup)
+            .max_page_size_rows(kRowsPerGroup / 4)
+            .compression(cudf::io::compression_type::SNAPPY)
+            .build();
+    cudf::io::write_parquet(writerOptions, stream);
+  }
+  stream.synchronize();
+
+  std::array<std::shared_ptr<HiveIcebergSplit>, 4> descriptors;
+  for (size_t file = 0; file < paths.size(); ++file) {
+    auto splits = makeIcebergSplits(paths[file]->getPath());
+    descriptors[file] =
+        std::dynamic_pointer_cast<HiveIcebergSplit>(splits.front());
+    VELOX_CHECK_NOT_NULL(descriptors[file]);
+  }
+
+  const auto makeLegacySplit = [&](size_t primary, size_t secondary) {
+    return std::make_shared<HiveIcebergSplit>(
+        kCudfIcebergConnectorId,
+        paths[primary]->getPath(),
+        dwio::common::FileFormat::PARQUET,
+        0,
+        getFileSize(paths[primary]->getPath()),
+        std::unordered_map<std::string, std::optional<std::string>>{},
+        std::nullopt,
+        std::unordered_map<std::string, std::string>{},
+        nullptr,
+        true,
+        std::vector<IcebergDeleteFile>{},
+        std::unordered_map<std::string, std::string>{},
+        std::nullopt,
+        0,
+        std::vector<IcebergCoalescedFile>{
+            {paths[secondary]->getPath(),
+             getFileSize(paths[secondary]->getPath())}});
+  };
+
+  const auto modeName = [](Mode mode) {
+    switch (mode) {
+      case Mode::kLegacy:
+        return "legacy";
+      case Mode::kFileRegular:
+        return "file_regular";
+      case Mode::kRowGroupHybrid:
+        return "row_group_hybrid";
+    }
+    VELOX_UNREACHABLE();
+  };
+
+  const auto run = [&](Mode mode, size_t repetition, bool measured) {
+    std::shared_ptr<CudfPreparedSplitSource> source;
+    std::shared_ptr<HostRangeAdmission> admission;
+    CursorParameters params;
+    params.planNode = makeTableScanPlan(rowType);
+    params.maxDrivers = 1;
+    params.queryConfigs = {{core::QueryConfig::kMaxSplitPreloadPerTask, "12"}};
+    params.queryCtx =
+        core::QueryCtx::Builder()
+            .executor(driverExecutor_.get())
+            .queryId(
+                fmt::format("p4-uniform-{}-{}", modeName(mode), repetition))
+            .build();
+    params.queryCtx->setConnectorSessionOverridesUnsafe(
+        kCudfIcebergConnectorId,
+        {{cudf_velox::connector::hive::CudfHiveConfig::kUseBufferedInputSession,
+          "true"}});
+    params.beforeTaskStart = [&](Task& task) {
+      if (mode == Mode::kLegacy) {
+        task.addSplit("0", Split(makeLegacySplit(0, 1)));
+        task.addSplit("0", Split(makeLegacySplit(2, 3)));
+        task.noMoreSplits("0");
+        return;
+      }
+      admission = std::make_shared<HostRangeAdmission>(256 << 20, 12);
+      source = std::make_shared<CudfPreparedSplitSource>(
+          task.shared_from_this(),
+          "0",
+          task.queryCtx()->executor(),
+          admission,
+          mode == Mode::kFileRegular ? CudfPreparationMode::kFileRegular
+                                     : CudfPreparationMode::kRowGroupHybrid);
+      task.setSplitsStore(
+          "0", std::make_unique<CudfPreparedSplitsStore>(source, 4, 64 << 20));
+      for (size_t file = 0; file < descriptors.size(); ++file) {
+        ASSERT_TRUE(source->addDescriptor(file, descriptors[file]));
+      }
+      source->sealDescriptors();
+    };
+
+    const auto start = std::chrono::steady_clock::now();
+    auto cursor = TaskCursor::create(params);
+    std::optional<std::chrono::steady_clock::time_point> firstOutput;
+    std::vector<int64_t> actual;
+    actual.reserve(expected.size());
+    while (cursor->moveNext()) {
+      if (!firstOutput.has_value()) {
+        firstOutput = std::chrono::steady_clock::now();
+      }
+      auto output = cursor->current();
+      auto decoded = output->childAt(0)->as<SimpleVector<int64_t>>();
+      for (vector_size_t row = 0; row < output->size(); ++row) {
+        actual.push_back(decoded->valueAt(row));
+      }
+    }
+    const auto finish = std::chrono::steady_clock::now();
+    ASSERT_TRUE(waitForTaskCompletion(cursor->task().get()));
+    ASSERT_TRUE(waitForTaskDriversToFinish(cursor->task().get()));
+    ASSERT_TRUE(firstOutput.has_value());
+    std::sort(actual.begin(), actual.end());
+    EXPECT_EQ(actual, expected);
+
+    if (measured) {
+      const auto firstOutputUs =
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              *firstOutput - start)
+              .count();
+      const auto totalUs =
+          std::chrono::duration_cast<std::chrono::microseconds>(finish - start)
+              .count();
+      const auto sourceMetrics = source == nullptr
+          ? CudfPreparedSplitSource::Metrics{}
+          : source->metrics();
+      const auto admissionMetrics = admission == nullptr
+          ? HostRangeAdmission::Snapshot{}
+          : admission->snapshot();
+      const auto planStats = toPlanStats(cursor->task()->taskStats());
+      const auto& customStats = planStats.at("0").customStats;
+      const auto metric = [&](std::string_view name) {
+        const auto it = customStats.find(std::string{name});
+        return it == customStats.end() ? int64_t{0} : it->second.sum;
+      };
+      std::cout << "P4_LOCAL_MODE_METRIC fixture=uniform mode="
+                << modeName(mode) << " repetition=" << repetition
+                << " firstOutputUs=" << firstOutputUs << " totalUs=" << totalUs
+                << " rows=" << actual.size()
+                << " generatedBatches=" << sourceMetrics.preparedBatches
+                << " preparedUnits=" << sourceMetrics.preparedUnits
+                << " fallbackCount="
+                << sourceMetrics.fallbackIneligible +
+              sourceMetrics.fallbackPreparationUnavailable +
+              sourceMetrics.fallbackPreloadDisabled
+                << " payloadBytes=" << sourceMetrics.preparedPayloadBytes
+                << " hostPeakBytes=" << admissionMetrics.peakBytes
+                << " hostPeakUnits=" << admissionMetrics.peakUnits
+                << " h2dCopies=" << metric("cudfPreparedHybridH2dCopies")
+                << " h2dBytes=" << metric("cudfPreparedHybridH2dBytes")
+                << " leaseReadCalls=" << metric("cudfPreparedLeaseReadCalls")
+                << " leaseReadBytes=" << metric("cudfPreparedLeaseReadBytes")
+                << std::endl;
+    }
+  };
+
+  for (const auto mode :
+       {Mode::kLegacy, Mode::kFileRegular, Mode::kRowGroupHybrid}) {
+    run(mode, 0, false);
+  }
+  const std::array<Mode, 3> modes{
+      Mode::kLegacy, Mode::kFileRegular, Mode::kRowGroupHybrid};
+  for (size_t repetition = 0; repetition < kRepetitions; ++repetition) {
+    for (size_t offset = 0; offset < modes.size(); ++offset) {
+      run(modes[(repetition + offset) % modes.size()], repetition, true);
+    }
+  }
+}
+
+TEST_F(CudfIcebergReadTest, delayedInputLocalModeComparison) {
+  using cudf_velox::connector::hive::planParquetFileRanges;
+  using cudf_velox::connector::hive::iceberg::CudfPreparationMode;
+  using cudf_velox::connector::hive::iceberg::CudfPreparedIcebergFile;
+  using cudf_velox::connector::hive::iceberg::CudfPreparedSplitSource;
+  using cudf_velox::connector::hive::iceberg::CudfPreparedSplitsStore;
+
+  enum class Mode { kLegacy, kFileRegular, kRowGroupHybrid };
+  constexpr size_t kRepetitions = 4;
+  auto rowType = ROW({"c0"}, {BIGINT()});
+  std::array<std::shared_ptr<TempFilePath>, 4> paths{
+      TempFilePath::create(),
+      TempFilePath::create(),
+      TempFilePath::create(),
+      TempFilePath::create()};
+  std::array<std::shared_ptr<HiveIcebergSplit>, 4> descriptors;
+  std::array<std::shared_ptr<const cudf::io::parquet::FileMetaData>, 4>
+      metadatas;
+  std::array<uint64_t, 4> preparedBytes{};
+  std::vector<int64_t> expected;
+  auto options = cudf::io::parquet_reader_options::builder().build();
+  options.set_column_names({"c0"});
+  for (size_t file = 0; file < paths.size(); ++file) {
+    auto data = makeRowVector({makeFlatVector<int64_t>(
+        {static_cast<int64_t>(file * 10),
+         static_cast<int64_t>(file * 10 + 1),
+         static_cast<int64_t>(file * 10 + 2)})});
+    writeToFile(paths[file]->getPath(), data);
+    for (vector_size_t row = 0; row < data->size(); ++row) {
+      expected.push_back(
+          data->childAt(0)->as<SimpleVector<int64_t>>()->valueAt(row));
+    }
+    auto splits = makeIcebergSplits(paths[file]->getPath());
+    descriptors[file] =
+        std::dynamic_pointer_cast<HiveIcebergSplit>(splits.front());
+    VELOX_CHECK_NOT_NULL(descriptors[file]);
+    auto dataSource =
+        std::make_shared<OwnedFileDataSource>(paths[file]->getPath());
+    auto plan =
+        planParquetFileRanges(dataSource, options, cudf::get_default_stream());
+    ASSERT_EQ(plan.rowGroups.size(), 1);
+    metadatas[file] = std::make_shared<const cudf::io::parquet::FileMetaData>(
+        std::move(plan.metadata));
+    preparedBytes[file] = plan.rowGroups.front().logicalBytes;
+  }
+
+  const auto modeName = [](Mode mode) {
+    switch (mode) {
+      case Mode::kLegacy:
+        return "legacy";
+      case Mode::kFileRegular:
+        return "file_regular";
+      case Mode::kRowGroupHybrid:
+        return "row_group_hybrid";
+    }
+    VELOX_UNREACHABLE();
+  };
+  const auto makeLegacySplit = [&](size_t primary, size_t secondary) {
+    return std::make_shared<HiveIcebergSplit>(
+        kCudfIcebergConnectorId,
+        paths[primary]->getPath(),
+        dwio::common::FileFormat::PARQUET,
+        0,
+        getFileSize(paths[primary]->getPath()),
+        std::unordered_map<std::string, std::optional<std::string>>{},
+        std::nullopt,
+        std::unordered_map<std::string, std::string>{},
+        nullptr,
+        true,
+        std::vector<IcebergDeleteFile>{},
+        std::unordered_map<std::string, std::string>{},
+        std::nullopt,
+        0,
+        std::vector<IcebergCoalescedFile>{
+            {paths[secondary]->getPath(),
+             getFileSize(paths[secondary]->getPath())}});
+  };
+  const auto makePrepared = [&](size_t file, Mode mode) {
+    auto dataSource =
+        std::make_shared<OwnedFileDataSource>(paths[file]->getPath());
+    if (mode == Mode::kRowGroupHybrid) {
+      return CudfPreparedIcebergFile{
+          file,
+          descriptors[file],
+          std::move(dataSource),
+          getFileSize(paths[file]->getPath()),
+          metadatas[file],
+          cudf::size_type{0},
+          preparedBytes[file]};
+    }
+    return CudfPreparedIcebergFile{
+        file,
+        descriptors[file],
+        std::move(dataSource),
+        getFileSize(paths[file]->getPath())};
+  };
+
+  const auto run = [&](Mode mode, size_t repetition) {
+    std::shared_ptr<Task> task;
+    std::shared_ptr<CudfPreparedSplitSource> source;
+    CursorParameters params;
+    params.planNode = makeTableScanPlan(rowType);
+    params.maxDrivers = 1;
+    params.queryCtx =
+        core::QueryCtx::Builder()
+            .executor(driverExecutor_.get())
+            .queryId(
+                fmt::format("p4-delayed-{}-{}", modeName(mode), repetition))
+            .build();
+    params.beforeTaskStart = [&](Task& value) {
+      task = value.shared_from_this();
+      if (mode == Mode::kLegacy) {
+        return;
+      }
+      source = std::make_shared<CudfPreparedSplitSource>(
+          task,
+          "0",
+          value.queryCtx()->executor(),
+          nullptr,
+          mode == Mode::kFileRegular ? CudfPreparationMode::kFileRegular
+                                     : CudfPreparationMode::kRowGroupHybrid);
+      value.setSplitsStore(
+          "0", std::make_unique<CudfPreparedSplitsStore>(source, 2, 1 << 20));
+      ASSERT_TRUE(source->publishPrepared(makePrepared(0, mode)));
+      ASSERT_TRUE(source->publishPrepared(makePrepared(2, mode)));
+    };
+
+    auto cursor = TaskCursor::create(params);
+    std::atomic_bool delayedPublished{false};
+    const auto start = std::chrono::steady_clock::now();
+    std::thread producer([&]() {
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      delayedPublished.store(true, std::memory_order_release);
+      if (mode == Mode::kLegacy) {
+        task->addSplit("0", Split(makeLegacySplit(0, 1)));
+        task->addSplit("0", Split(makeLegacySplit(2, 3)));
+        task->noMoreSplits("0");
+      } else {
+        VELOX_CHECK(source->publishPrepared(makePrepared(1, mode)));
+        VELOX_CHECK(source->publishPrepared(makePrepared(3, mode)));
+        source->finish();
+      }
+    });
+    std::optional<std::chrono::steady_clock::time_point> firstOutput;
+    bool firstOutputBeforeDelayed{false};
+    std::vector<int64_t> actual;
+    while (cursor->moveNext()) {
+      if (!firstOutput.has_value()) {
+        firstOutput = std::chrono::steady_clock::now();
+        firstOutputBeforeDelayed =
+            !delayedPublished.load(std::memory_order_acquire);
+      }
+      auto output = cursor->current();
+      auto decoded = output->childAt(0)->as<SimpleVector<int64_t>>();
+      for (vector_size_t row = 0; row < output->size(); ++row) {
+        actual.push_back(decoded->valueAt(row));
+      }
+    }
+    const auto finish = std::chrono::steady_clock::now();
+    producer.join();
+    ASSERT_TRUE(firstOutput.has_value());
+    std::sort(actual.begin(), actual.end());
+    EXPECT_EQ(actual, expected);
+    const auto firstOutputUs =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            *firstOutput - start)
+            .count();
+    const auto totalUs =
+        std::chrono::duration_cast<std::chrono::microseconds>(finish - start)
+            .count();
+    std::cout << "P4_LOCAL_MODE_METRIC fixture=delayed_scheduler mode="
+              << modeName(mode) << " repetition=" << repetition
+              << " firstOutputUs=" << firstOutputUs << " totalUs=" << totalUs
+              << " rows=" << actual.size()
+              << " firstOutputBeforeDelayed=" << firstOutputBeforeDelayed
+              << std::endl;
+  };
+
+  for (size_t repetition = 0; repetition < kRepetitions; ++repetition) {
+    run(Mode::kLegacy, repetition);
+    run(Mode::kFileRegular, repetition);
+    run(Mode::kRowGroupHybrid, repetition);
+  }
 }
 
 TEST_F(CudfIcebergReadTest, coalescedMultipleFiles) {

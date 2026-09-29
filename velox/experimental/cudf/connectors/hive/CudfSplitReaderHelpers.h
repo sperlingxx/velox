@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "velox/experimental/cudf/connectors/hive/CudfScanPreparation.h"
 #include "velox/experimental/cudf/connectors/hive/ExecutorSplitPrefetch.h"
 #include "velox/experimental/cudf/connectors/hive/PinnedHostBuffer.h"
 
@@ -195,6 +196,18 @@ class BufferedInputDataSource : public cudf::io::datasource {
       const std::vector<cudf::io::text::byte_range_info>& byteRanges) const;
 
   std::optional<uint64_t> cacheFileNum() const;
+
+  /// Returns the conservative cache allocation charge for these ranges
+  /// without reading their payload. Returns nullopt for a non-cache input.
+  std::optional<uint64_t> hostRangeReservationBytes(
+      const std::vector<cudf::io::text::byte_range_info>& byteRanges) const;
+
+  /// Reads every requested cache range and transfers ownership of the backing
+  /// cache entries into one admitted lease. No device work is started.
+  std::unique_ptr<HostRangeLease> prepareHostRangeLease(
+      const std::vector<cudf::io::text::byte_range_info>& byteRanges,
+      HostRangeAdmission& admission,
+      const folly::CancellationToken& cancellationToken = {});
 
  private:
   size_t readBuffered(size_t offset, size_t size, uint8_t* dst);
