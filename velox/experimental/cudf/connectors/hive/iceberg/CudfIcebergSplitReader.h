@@ -65,6 +65,24 @@ class CudfIcebergSplitReader : public CudfSplitReader {
       bool useExperimentalCudfReader,
       cudf::ast::expression const* subfieldFilterExpr);
 
+  /// Prepares one eligible file for later regular multi-source decoding.
+  /// Returns nullopt when the current datasource transport cannot retain
+  /// cache-backed host ranges.
+  std::optional<PreparedHostReadyDataSource> prepareHostReadyFile(
+      HostRangeAdmission& admission,
+      const folly::CancellationToken& cancellationToken,
+      dwio::common::RuntimeStatistics& runtimeStats);
+
+  std::optional<PreparedParquetFilePlan> planHostReadyFile(
+      HostRangeAdmission& admission,
+      const folly::CancellationToken& cancellationToken,
+      dwio::common::RuntimeStatistics& runtimeStats);
+
+  std::shared_ptr<cudf::io::datasource> prepareHostReadyRowGroup(
+      const std::vector<cudf::io::text::byte_range_info>& ranges,
+      HostRangeAdmission& admission,
+      const folly::CancellationToken& cancellationToken);
+
  protected:
   // Sets up delete file readers and column projection after base state reset.
   void prepareSplitInternal(
@@ -83,6 +101,8 @@ class CudfIcebergSplitReader : public CudfSplitReader {
   std::optional<std::unique_ptr<cudf::table>> readNextChunk() override;
 
  private:
+  bool initializeHostPlanning(dwio::common::RuntimeStatistics& runtimeStats);
+
   // Clear delete readers and column injection
   void resetSplit();
 

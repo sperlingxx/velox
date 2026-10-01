@@ -642,8 +642,12 @@ std::size_t envBytesOrDefault(const char* name, std::size_t defaultValue) {
 // itself synchronize CUDA. Each event protects just its slot's last H2D copy.
 class BufferedH2dStaging {
  public:
-  BufferedH2dStaging(size_t capacity, rmm::cuda_stream_view stream)
-      : stream_(stream) {
+  BufferedH2dStaging(
+      size_t capacity,
+      rmm::cuda_stream_view stream,
+      facebook::velox::cudf_velox::connector::hive::PackedH2dStats* stats =
+          nullptr)
+      : stream_(stream), stats_(stats) {
     for (auto& slot : slots_) {
       slot.stream = stream.value();
       slot.buffer = std::make_unique<
@@ -652,11 +656,15 @@ class BufferedH2dStaging {
       CUDF_CUDA_TRY(cudaEventCreateWithFlags(
           &slot.done, cudaEventDisableTiming | cudaEventBlockingSync));
     }
+    if (stats_) {
+      stats_->peakStagingBytes = slots_[0].buffer->allocatedBytes() +
+          slots_[1].buffer->allocatedBytes();
+    }
   }
 
   uint8_t* acquire() {
     auto& slot = slots_[next_];
-    slot.wait();
+    wait(slot);
     return slot.buffer->data();
   }
 
@@ -672,6 +680,13 @@ class BufferedH2dStaging {
         size,
         cudaMemcpyHostToDevice,
         stream_.value()));
+    if (stats_) {
+      ++stats_->copies;
+      stats_->bytes += size;
+      if (!slot.buffer->isPinned()) {
+        stats_->pageableBytes += size;
+      }
+    }
     CUDF_CUDA_TRY(cudaEventRecord(slot.done, stream_.value()));
     slot.recorded = true;
     next_ = (next_ + 1) % slots_.size();
@@ -679,7 +694,7 @@ class BufferedH2dStaging {
 
   void finish() {
     for (auto& slot : slots_) {
-      slot.wait();
+      wait(slot);
     }
   }
 
@@ -714,7 +729,21 @@ class BufferedH2dStaging {
     bool recorded{false};
   };
 
+  void wait(Slot& slot) {
+    if (!stats_ || !slot.pending) {
+      slot.wait();
+      return;
+    }
+    const auto start = std::chrono::steady_clock::now();
+    slot.wait();
+    stats_->stagingWaitNanos +=
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - start)
+            .count();
+  }
+
   const rmm::cuda_stream_view stream_;
+  facebook::velox::cudf_velox::connector::hive::PackedH2dStats* const stats_;
   std::array<Slot, 2> slots_;
   size_t next_{0};
 };
@@ -3795,6 +3824,97 @@ FetchedDeviceByteRanges copyPreparedByteRangesToDevice(
       std::async(std::launch::deferred, [] {})};
 }
 
+size_t hybridH2dStagingBytes() {
+  return envBytesOrZero("GLUTEN_CUDF_HYBRID_H2D_STAGING_BYTES");
+}
+
+PackedDeviceByteRanges fetchPackedByteRangesToDevice(
+    cudf::host_span<const std::reference_wrapper<cudf::io::datasource>> sources,
+    cudf::host_span<const cudf::io::text::byte_range_info> ranges,
+    cudf::host_span<const cudf::size_type> sourceIndices,
+    size_t stagingBytes,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  constexpr size_t kBufferPaddingMultiple = 8;
+  VELOX_CHECK_GT(stagingBytes, 0);
+  VELOX_CHECK_EQ(ranges.size(), sourceIndices.size());
+  size_t totalSize = 0;
+  for (size_t i = 0; i < ranges.size(); ++i) {
+    VELOX_CHECK_GE(sourceIndices[i], 0);
+    VELOX_CHECK_LT(static_cast<size_t>(sourceIndices[i]), sources.size());
+    const auto& range = ranges[i];
+    VELOX_CHECK_GE(range.offset(), 0);
+    VELOX_CHECK_GE(range.size(), 0);
+    const auto offset = static_cast<size_t>(range.offset());
+    const auto size = static_cast<size_t>(range.size());
+    const auto fileSize = sources[sourceIndices[i]].get().size();
+    VELOX_CHECK_LE(offset, fileSize);
+    VELOX_CHECK_LE(size, fileSize - offset);
+    VELOX_CHECK_LE(size, std::numeric_limits<size_t>::max() - totalSize);
+    totalSize += size;
+  }
+
+  // Declare the device owner before staging: exception unwinding must drain
+  // outstanding copies before freeing either the host or device allocation.
+  PackedDeviceByteRanges result{
+      rmm::device_buffer(
+          cudf::util::round_up_safe<size_t>(totalSize, kBufferPaddingMultiple),
+          stream,
+          mr),
+      {},
+      {}};
+  auto* device = static_cast<uint8_t*>(result.buffer.data());
+  result.spans.reserve(ranges.size());
+  size_t packedOffset = 0;
+  for (const auto& range : ranges) {
+    result.spans.emplace_back(
+        device == nullptr ? nullptr : device + packedOffset, range.size());
+    packedOffset += range.size();
+  }
+  if (totalSize == 0) {
+    return result;
+  }
+
+  const auto capacity = std::min(stagingBytes, totalSize);
+  BufferedH2dStaging staging(capacity, stream, &result.stats);
+  uint8_t* host = nullptr;
+  size_t staged = 0;
+  size_t deviceOffset = 0;
+  for (size_t i = 0; i < ranges.size(); ++i) {
+    auto offset = static_cast<size_t>(ranges[i].offset());
+    auto remaining = static_cast<size_t>(ranges[i].size());
+    while (remaining != 0) {
+      if (staged == 0) {
+        host = staging.acquire();
+      }
+      const auto bytes = std::min(remaining, capacity - staged);
+      const auto start = std::chrono::steady_clock::now();
+      VELOX_CHECK_EQ(
+          sources[sourceIndices[i]].get().host_read(
+              offset, bytes, host + staged),
+          bytes,
+          "Short prepared packed host read");
+      result.stats.gatherNanos +=
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - start)
+              .count();
+      offset += bytes;
+      remaining -= bytes;
+      staged += bytes;
+      if (staged == capacity) {
+        staging.submit(device + deviceOffset, staged);
+        deviceOffset += staged;
+        staged = 0;
+      }
+    }
+  }
+  if (staged != 0) {
+    staging.submit(device + deviceOffset, staged);
+  }
+  staging.finish();
+  return result;
+}
+
 FetchedDeviceByteRanges fetchByteRangesAsync(
     std::shared_ptr<cudf::io::datasource> dataSource,
     cudf::host_span<const cudf::io::text::byte_range_info> byteRanges,
@@ -3994,8 +4114,7 @@ FetchedDeviceByteRanges fetchByteRangesAsync(
   // actual load asynchronously.
   if (auto bufferedInput =
           dynamic_cast<BufferedInputDataSource*>(dataSource.get())) {
-    const auto stagingBytes =
-        envBytesOrZero("GLUTEN_CUDF_HYBRID_H2D_STAGING_BYTES");
+    const auto stagingBytes = hybridH2dStagingBytes();
     if (stagingBytes != 0) {
       if (totalSize == 0) {
         return {

@@ -33,6 +33,7 @@
 
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/experimental/hybrid_scan.hpp>
+#include <cudf/io/experimental/hybrid_scan_multifile.hpp>
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/parquet_schema.hpp>
 #include <cudf/io/types.hpp>
@@ -47,6 +48,16 @@ using CudfParquetReaderPtr = std::unique_ptr<CudfParquetReader>;
 using CudfHybridScanReader =
     cudf::io::parquet::experimental::hybrid_scan_reader;
 using CudfHybridScanReaderPtr = std::unique_ptr<CudfHybridScanReader>;
+
+using CudfHybridScanMultifile =
+    cudf::io::parquet::experimental::hybrid_scan_multifile;
+using CudfHybridScanMultifilePtr = std::unique_ptr<CudfHybridScanMultifile>;
+
+struct PreparedHybridScanBatch {
+  std::vector<std::shared_ptr<cudf::io::datasource>> dataSources;
+  std::vector<std::shared_ptr<const cudf::io::parquet::FileMetaData>> metadatas;
+  std::vector<std::vector<cudf::size_type>> rowGroups;
+};
 
 class CudfSplitReader : public NvtxHelper {
  public:
@@ -67,6 +78,15 @@ class CudfSplitReader : public NvtxHelper {
 
   virtual ~CudfSplitReader();
 
+  /// Installs process-local host-ready datasources before prepareSplit().
+  /// setupCudfDataSource() will not open the split's file paths when set.
+  void setPreparedDataSources(
+      std::vector<std::shared_ptr<cudf::io::datasource>> dataSources);
+
+  /// Installs a fixed selection of independently prepared row groups. Each
+  /// datasource owns every byte Hybrid Scan may request for its selection.
+  void setPreparedHybridScan(PreparedHybridScanBatch batch);
+
   /// Prepare the split: open cudf reader, set up data source and options.
   /// @param runtimeStats Reference to the DataSource's runtime statistics
   void prepareSplit(dwio::common::RuntimeStatistics& runtimeStats);
@@ -84,6 +104,21 @@ class CudfSplitReader : public NvtxHelper {
   /// Get the stream.
   rmm::cuda_stream_view stream() const {
     return stream_;
+  }
+
+  /// Returns reads served by the retained host ranges for this prepared split.
+  std::pair<uint64_t, uint64_t> preparedLeaseReadStats() const;
+
+  uint64_t preparedHybridH2dCopies() const {
+    return preparedHybridH2dCopies_;
+  }
+
+  uint64_t preparedHybridH2dBytes() const {
+    return preparedHybridH2dBytes_;
+  }
+
+  const PackedH2dStats& preparedPackedH2dStats() const {
+    return preparedPackedH2dStats_;
   }
 
  protected:
@@ -127,12 +162,35 @@ class CudfSplitReader : public NvtxHelper {
   // Read file metadatas.
   void fileMetaDatas();
 
+  /// Prepares every byte needed by the current singleton regular-reader split
+  /// and returns a datasource backed only by the retained host lease. Returns
+  /// null when the current transport is not cache-backed.
+  std::optional<PreparedHostReadyDataSource> prepareHostReadyDataSource(
+      HostRangeAdmission& admission,
+      const folly::CancellationToken& cancellationToken);
+
+  /// Plans selected row groups and rejects the file before publication when
+  /// any single unit can never fit the configured admission window.
+  std::optional<PreparedParquetFilePlan> planHostReadyRowGroups(
+      HostRangeAdmission& admission,
+      const folly::CancellationToken& cancellationToken);
+
+  /// Retains exactly one already-planned row group's payload ranges.
+  std::shared_ptr<cudf::io::datasource> prepareHostReadyRowGroup(
+      const std::vector<cudf::io::text::byte_range_info>& ranges,
+      HostRangeAdmission& admission,
+      const folly::CancellationToken& cancellationToken);
+
   // Create the chunked parquet reader.
   void createCudfReader();
 
   // Create the experimental hybrid scan reader.
   // Requires exactly one footer.
   void createExperimentalReader();
+
+  void createPreparedHybridReader();
+
+  void setupPreparedHybridScan();
 
   // Resolve row groups and fetch projected byte ranges for the experimental
   // reader. This is safe to call from split preparation or first next().
@@ -154,6 +212,10 @@ class CudfSplitReader : public NvtxHelper {
 
   // Whether to use the experimental cuDF reader.
   bool useExperimentalCudfReader() const;
+
+  bool hasPreparedHybridScan() const {
+    return preparedHybridScan_.has_value();
+  }
 
   // Returns the original subfield filter.
   cudf::ast::expression const* subfieldFilter() const;
@@ -195,12 +257,27 @@ class CudfSplitReader : public NvtxHelper {
   // cuDF split reader stuff.
   std::shared_ptr<cudf::io::datasource> dataSource_;
   std::vector<std::shared_ptr<cudf::io::datasource>> coalescedDataSources_;
+  std::vector<std::shared_ptr<cudf::io::datasource>> preparedDataSources_;
   std::vector<std::shared_ptr<PinnedHostBuffer>> selectivePreloadBuffers_;
   std::shared_ptr<SplitPrefetchResult> selectivePreloadResult_;
   cudf::io::parquet_reader_options readerOptions_;
   CudfParquetReaderPtr splitReader_;
   CudfHybridScanReaderPtr exptSplitReader_;
   std::unique_ptr<HybridScanState> hybridScanState_;
+  struct PreparedHybridScanState {
+    std::vector<std::shared_ptr<const cudf::io::parquet::FileMetaData>>
+        metadatas;
+    std::vector<std::vector<cudf::size_type>> rowGroups;
+    std::vector<rmm::device_buffer> columnChunkBuffers;
+    std::vector<cudf::device_span<const uint8_t>> columnChunkData;
+    std::unique_ptr<std::once_flag> setupOnce{
+        std::make_unique<std::once_flag>()};
+  };
+  std::optional<PreparedHybridScanState> preparedHybridScan_;
+  CudfHybridScanMultifilePtr multifileHybridReader_;
+  uint64_t preparedHybridH2dCopies_{0};
+  uint64_t preparedHybridH2dBytes_{0};
+  PackedH2dStats preparedPackedH2dStats_;
   bool useExperimentalCudfReader_;
   std::optional<std::string> cachePrefetchQueryId_;
   struct CachePrefetchHint {

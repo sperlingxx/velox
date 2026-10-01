@@ -46,6 +46,69 @@ namespace facebook::velox::exec::test {
 using TempDirectoryPath = facebook::velox::common::testutil::TempDirectoryPath;
 
 namespace {
+
+class TestingGeneratedSplitsStore final : public SplitsStore {
+ public:
+  TestingGeneratedSplitsStore(
+      std::optional<Split> split,
+      std::shared_ptr<std::atomic<uint32_t>> cancelCalls)
+      : SplitsStore(false),
+        split_(std::move(split)),
+        cancelCalls_(std::move(cancelCalls)) {}
+
+  void requestBarrier(
+      uint32_t numDrivers,
+      std::vector<ContinuePromise>& promises) override {
+    addSplit(Split::createBarrier(numDrivers), promises);
+  }
+
+  bool nextSplit(
+      std::optional<uint32_t> driverId,
+      int /*maxPreloadSplits*/,
+      const ConnectorSplitPreloadFunc& /*preload*/,
+      Split& split,
+      ContinueFuture& future) override {
+    if (split_.has_value()) {
+      split = std::move(*split_);
+      split_.reset();
+      ++taskStats_->numTotalSplits;
+      ++taskStats_->numRunningSplits;
+      ++taskStats_->numRunningTableScanSplits;
+      taskStats_->runningTableScanSplitWeights +=
+          split.connectorSplit->splitWeight;
+      taskStats_->lastSplitStartTimeMs = getCurrentTimeMs();
+      if (taskStats_->firstSplitStartTimeMs == 0) {
+        taskStats_->firstSplitStartTimeMs = taskStats_->lastSplitStartTimeMs;
+      }
+      return true;
+    }
+    if (tryGetBarrier(driverId, split)) {
+      return true;
+    }
+    if (noMoreSplits_) {
+      return true;
+    }
+    future = makeFuture();
+    return false;
+  }
+
+  bool allSplitsConsumed() const override {
+    return noMoreSplits_ && !split_.has_value();
+  }
+
+  bool generatesSplits() const override {
+    return true;
+  }
+
+  void cancelPendingWork() noexcept override {
+    cancelCalls_->fetch_add(1, std::memory_order_relaxed);
+  }
+
+ private:
+  std::optional<Split> split_;
+  const std::shared_ptr<std::atomic<uint32_t>> cancelCalls_;
+};
+
 // A test join node whose build is skewed in terms of process time. The driver
 // id 0 processes slower than other drivers if paralelism greater than 1
 class TestSkewedJoinNode : public core::PlanNode {
@@ -627,6 +690,74 @@ TEST_F(TaskTest, createdCount) {
   task->noMoreSplits("0");
   waitForTaskCompletion(task.get());
   ASSERT_EQ(Task::numCreatedTasks(), createdCount + 1);
+}
+
+TEST_F(TaskTest, generatedSplitAccountingAndTerminalCancellation) {
+  auto data = makeRowVector({makeFlatVector<int32_t>({1, 2, 3})});
+  auto task = Task::create(
+      "task-generated-split",
+      PlanBuilder().tableScan(asRowType(data->type())).planFragment(),
+      0,
+      core::QueryCtx::create(),
+      Task::ExecutionMode::kSerial,
+      exec::Consumer{});
+  auto cancelCalls = std::make_shared<std::atomic<uint32_t>>(0);
+  auto connectorSplit = makeHiveConnectorSplit("file:/tmp/generated");
+  const auto splitWeight = connectorSplit->splitWeight;
+  task->setSplitsStore(
+      "0",
+      std::make_unique<TestingGeneratedSplitsStore>(
+          Split(std::move(connectorSplit)), cancelCalls));
+
+  exec::Split split;
+  ContinueFuture future = ContinueFuture::makeEmpty();
+  EXPECT_EQ(
+      task->getSplitOrFuture(
+          /*driverId=*/0,
+          kUngroupedGroupId,
+          "0",
+          /*maxPreloadSplits=*/0,
+          /*preload=*/nullptr,
+          split,
+          future),
+      BlockingReason::kNotBlocked);
+  ASSERT_TRUE(split.hasConnectorSplit());
+  auto stats = task->taskStats();
+  EXPECT_EQ(stats.numTotalSplits, 1);
+  EXPECT_EQ(stats.numQueuedSplits, 0);
+  EXPECT_EQ(stats.numRunningSplits, 1);
+  EXPECT_EQ(stats.numRunningTableScanSplits, 1);
+  EXPECT_EQ(stats.runningTableScanSplitWeights, splitWeight);
+
+  task->splitFinished(true, splitWeight);
+  stats = task->taskStats();
+  EXPECT_EQ(stats.numFinishedSplits, 1);
+  EXPECT_EQ(stats.numRunningSplits, 0);
+  EXPECT_EQ(stats.numRunningTableScanSplits, 0);
+  EXPECT_EQ(stats.runningTableScanSplitWeights, 0);
+
+  task->requestCancel().wait();
+  EXPECT_EQ(cancelCalls->load(std::memory_order_relaxed), 1);
+}
+
+TEST_F(TaskTest, generatedStoreCancelledOnSuccessfulTermination) {
+  auto data = makeRowVector({makeFlatVector<int32_t>({1, 2, 3})});
+  auto task = Task::create(
+      "task-generated-empty",
+      PlanBuilder().tableScan(asRowType(data->type())).planFragment(),
+      0,
+      core::QueryCtx::create(driverExecutor_.get()),
+      Task::ExecutionMode::kParallel);
+  auto cancelCalls = std::make_shared<std::atomic<uint32_t>>(0);
+  task->setSplitsStore(
+      "0",
+      std::make_unique<TestingGeneratedSplitsStore>(std::nullopt, cancelCalls));
+
+  task->start(1);
+  task->noMoreSplits("0");
+  waitForTaskCompletion(task.get());
+  EXPECT_EQ(task->state(), TaskState::kFinished);
+  EXPECT_EQ(cancelCalls->load(std::memory_order_relaxed), 1);
 }
 
 TEST_F(TaskTest, stateChangeFutureOnSplitQueueDrain) {

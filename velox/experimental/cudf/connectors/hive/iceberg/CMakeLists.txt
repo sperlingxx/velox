@@ -20,6 +20,7 @@ add_library(
   CudfIcebergDataSource.cpp
   CudfIcebergDeletionHelpers.cu
   CudfIcebergSplitReader.cpp
+  CudfPreparedSplitsStore.cpp
 )
 
 target_link_libraries(

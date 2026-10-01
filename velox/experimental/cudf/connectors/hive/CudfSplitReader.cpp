@@ -15,6 +15,7 @@
  */
 
 #include "velox/experimental/cudf/CudfNoDefaults.h"
+#include "velox/experimental/cudf/connectors/hive/CudfScanPreparation.h"
 #include "velox/experimental/cudf/connectors/hive/CudfSplitReader.h"
 #include "velox/experimental/cudf/connectors/hive/CudfSplitReaderHelpers.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
@@ -40,6 +41,7 @@
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/experimental/hybrid_scan.hpp>
 #include <cudf/io/parquet.hpp>
+#include <cudf/io/parquet_io_utils.hpp>
 #include <cudf/io/parquet_metadata.hpp>
 #include <cudf/io/text/byte_range_info.hpp>
 #include <cudf/io/types.hpp>
@@ -53,11 +55,13 @@
 #include <nvtx3/nvtx3.hpp>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <deque>
 #include <future>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <ranges>
@@ -406,6 +410,50 @@ CudfSplitReader::~CudfSplitReader() {
   releaseCachePrefetchHint();
 }
 
+std::pair<uint64_t, uint64_t> CudfSplitReader::preparedLeaseReadStats() const {
+  uint64_t calls = 0;
+  uint64_t bytes = 0;
+  const auto account = [&](const auto& source) {
+    if (const auto* prepared =
+            dynamic_cast<const HostRangeLeaseDataSource*>(source.get())) {
+      calls += prepared->hostReadCalls();
+      bytes += prepared->hostReadBytes();
+    }
+  };
+  account(dataSource_);
+  for (const auto& source : coalescedDataSources_) {
+    account(source);
+  }
+  return {calls, bytes};
+}
+
+void CudfSplitReader::setPreparedDataSources(
+    std::vector<std::shared_ptr<cudf::io::datasource>> dataSources) {
+  VELOX_CHECK_NULL(dataSource_);
+  VELOX_CHECK(coalescedDataSources_.empty());
+  VELOX_CHECK(!dataSources.empty());
+  for (const auto& source : dataSources) {
+    VELOX_CHECK_NOT_NULL(source);
+  }
+  preparedDataSources_ = std::move(dataSources);
+}
+
+void CudfSplitReader::setPreparedHybridScan(PreparedHybridScanBatch batch) {
+  VELOX_CHECK(!preparedHybridScan_.has_value());
+  VELOX_CHECK(!batch.dataSources.empty());
+  VELOX_CHECK_EQ(batch.dataSources.size(), batch.metadatas.size());
+  VELOX_CHECK_EQ(batch.dataSources.size(), batch.rowGroups.size());
+  for (size_t i = 0; i < batch.dataSources.size(); ++i) {
+    VELOX_CHECK_NOT_NULL(batch.dataSources[i]);
+    VELOX_CHECK_NOT_NULL(batch.metadatas[i]);
+    VELOX_CHECK(!batch.rowGroups[i].empty());
+  }
+  setPreparedDataSources(std::move(batch.dataSources));
+  preparedHybridScan_.emplace();
+  preparedHybridScan_->metadatas = std::move(batch.metadatas);
+  preparedHybridScan_->rowGroups = std::move(batch.rowGroups);
+}
+
 void CudfSplitReader::setDataSourceContext(
     const ConnectorQueryCtx* connectorQueryCtx,
     dwio::common::RuntimeStatistics& /*runtimeStats*/,
@@ -415,7 +463,9 @@ void CudfSplitReader::setDataSourceContext(
 }
 
 void CudfSplitReader::setupReader() {
-  if (useExperimentalCudfReader_) {
+  if (preparedHybridScan_.has_value()) {
+    createPreparedHybridReader();
+  } else if (useExperimentalCudfReader_) {
     createExperimentalReader();
   } else {
     createCudfReader();
@@ -473,6 +523,18 @@ std::optional<std::unique_ptr<cudf::table>> CudfSplitReader::next(
 
 std::optional<std::unique_ptr<cudf::table>> CudfSplitReader::readNextChunk() {
   auto output_mr = determineCudfMemoryResource();
+
+  if (preparedHybridScan_.has_value()) {
+    VELOX_CHECK_NOT_NULL(
+        multifileHybridReader_,
+        "cuDF multi-file Hybrid Scan reader not present");
+    setupPreparedHybridScan();
+    if (!multifileHybridReader_->has_next_table_chunk()) {
+      return std::nullopt;
+    }
+    return std::move(
+        multifileHybridReader_->materialize_all_columns_chunk().tbl);
+  }
 
   if (!useExperimentalCudfReader_) {
     waitForCachePrefetchHint();
@@ -819,11 +881,23 @@ void CudfSplitReader::resetSplit() {
   splitReader_.reset();
   exptSplitReader_.reset();
   hybridScanState_.reset();
+  multifileHybridReader_.reset();
+  if (preparedHybridScan_.has_value()) {
+    preparedHybridScan_->columnChunkBuffers.clear();
+    preparedHybridScan_->columnChunkData.clear();
+    preparedHybridScan_->setupOnce = std::make_unique<std::once_flag>();
+  }
   dataSource_.reset();
   coalescedDataSources_.clear();
   selectivePreloadBuffers_.clear();
   selectivePreloadResult_.reset();
   fileMetaData_.clear();
+  if (preparedHybridScan_.has_value()) {
+    fileMetaData_.reserve(preparedHybridScan_->metadatas.size());
+    for (const auto& metadata : preparedHybridScan_->metadatas) {
+      fileMetaData_.push_back(*metadata);
+    }
+  }
   cachePrefetchHintWaited_ = false;
   cachePrefetchDemandPrioritized_ = false;
 }
@@ -838,6 +912,15 @@ cudf::ast::expression const* CudfSplitReader::subfieldFilter() const {
 
 void CudfSplitReader::setupCudfDataSource() {
   if (dataSource_) {
+    return;
+  }
+
+  if (!preparedDataSources_.empty()) {
+    VELOX_CHECK_EQ(
+        preparedDataSources_.size(), 1 + split_->coalescedFiles.size());
+    dataSource_ = preparedDataSources_.front();
+    coalescedDataSources_.assign(
+        preparedDataSources_.begin() + 1, preparedDataSources_.end());
     return;
   }
 
@@ -1369,6 +1452,106 @@ void CudfSplitReader::fileMetaDatas() {
       "CudfSplitReader failed to read any parquet metadatas");
 }
 
+std::optional<PreparedHostReadyDataSource>
+CudfSplitReader::prepareHostReadyDataSource(
+    HostRangeAdmission& admission,
+    const folly::CancellationToken& cancellationToken) {
+  VELOX_CHECK(
+      split_->coalescedFiles.empty(),
+      "Host-ready file preparation requires one physical file");
+  setupCudfDataSource();
+  auto buffered =
+      std::dynamic_pointer_cast<BufferedInputDataSource>(dataSource_);
+  if (buffered == nullptr) {
+    return std::nullopt;
+  }
+
+  setupReaderOptions();
+  auto plan = planParquetFileRanges(
+      dataSource_, readerOptions_, stream_, cancellationToken);
+  std::vector<cudf::io::text::byte_range_info> requiredRanges;
+  for (const auto& rowGroup : plan.rowGroups) {
+    requiredRanges.insert(
+        requiredRanges.end(), rowGroup.ranges.begin(), rowGroup.ranges.end());
+  }
+
+  // The regular reader reparses the footer from its prepared datasource.
+  // Retain the header and complete serialized footer in addition to projected
+  // column chunks so every post-claim read is covered by the lease.
+  const auto fileSize = dataSource_->size();
+  VELOX_CHECK_GE(fileSize, 12, "Parquet file is too small");
+  std::array<uint8_t, 8> trailer{};
+  VELOX_CHECK_EQ(
+      dataSource_->host_read(
+          fileSize - trailer.size(), trailer.size(), trailer.data()),
+      trailer.size(),
+      "Short Parquet trailer read");
+  const uint64_t footerSize = static_cast<uint64_t>(trailer[0]) |
+      (static_cast<uint64_t>(trailer[1]) << 8) |
+      (static_cast<uint64_t>(trailer[2]) << 16) |
+      (static_cast<uint64_t>(trailer[3]) << 24);
+  VELOX_CHECK_LE(
+      footerSize, fileSize - trailer.size(), "Invalid Parquet footer size");
+  requiredRanges.emplace_back(0, 4);
+  requiredRanges.emplace_back(
+      fileSize - trailer.size() - footerSize, footerSize + trailer.size());
+
+  auto lease =
+      std::shared_ptr<const HostRangeLease>(buffered->prepareHostRangeLease(
+          requiredRanges, admission, cancellationToken));
+  if (lease == nullptr) {
+    return std::nullopt;
+  }
+  return PreparedHostReadyDataSource{
+      std::make_shared<HostRangeLeaseDataSource>(std::move(lease), fileSize),
+      std::make_shared<const cudf::io::parquet::FileMetaData>(
+          std::move(plan.metadata))};
+}
+
+std::optional<PreparedParquetFilePlan> CudfSplitReader::planHostReadyRowGroups(
+    HostRangeAdmission& admission,
+    const folly::CancellationToken& cancellationToken) {
+  VELOX_CHECK(
+      split_->coalescedFiles.empty(),
+      "Row-group host planning requires one physical file");
+  setupCudfDataSource();
+  auto buffered =
+      std::dynamic_pointer_cast<BufferedInputDataSource>(dataSource_);
+  if (buffered == nullptr) {
+    return std::nullopt;
+  }
+  setupReaderOptions();
+  auto plan = planParquetFileRanges(
+      dataSource_, readerOptions_, stream_, cancellationToken);
+  for (const auto& rowGroup : plan.rowGroups) {
+    const auto bytes = buffered->hostRangeReservationBytes(rowGroup.ranges);
+    if (!bytes.has_value() || !admission.canEverReserve(*bytes, 1)) {
+      return std::nullopt;
+    }
+  }
+  return plan;
+}
+
+std::shared_ptr<cudf::io::datasource> CudfSplitReader::prepareHostReadyRowGroup(
+    const std::vector<cudf::io::text::byte_range_info>& ranges,
+    HostRangeAdmission& admission,
+    const folly::CancellationToken& cancellationToken) {
+  VELOX_CHECK(
+      split_->coalescedFiles.empty(),
+      "Row-group host preparation requires one physical file");
+  setupCudfDataSource();
+  auto buffered =
+      std::dynamic_pointer_cast<BufferedInputDataSource>(dataSource_);
+  VELOX_CHECK_NOT_NULL(
+      buffered, "Planned row-group input lost its cache-backed datasource");
+  auto lease = std::shared_ptr<const HostRangeLease>(
+      buffered->prepareHostRangeLease(ranges, admission, cancellationToken));
+  VELOX_CHECK_NOT_NULL(
+      lease, "Preflighted row group no longer fits host admission");
+  return std::make_shared<HostRangeLeaseDataSource>(
+      std::move(lease), dataSource_->size());
+}
+
 void CudfSplitReader::createCudfReader() {
   // Read file metadatas
   fileMetaDatas();
@@ -1435,6 +1618,107 @@ void CudfSplitReader::createExperimentalReader() {
 
   // Metadata ingested
   fileMetaData_.clear();
+}
+
+void CudfSplitReader::createPreparedHybridReader() {
+  VELOX_CHECK(preparedHybridScan_.has_value());
+  setupCudfDataSource();
+  setupReaderOptions();
+  VELOX_CHECK_EQ(
+      preparedHybridScan_->metadatas.size(), 1 + coalescedDataSources_.size());
+
+  std::vector<cudf::io::parquet::FileMetaData> metadatas;
+  metadatas.reserve(preparedHybridScan_->metadatas.size());
+  for (const auto& metadata : preparedHybridScan_->metadatas) {
+    VELOX_CHECK_NOT_NULL(metadata);
+    metadatas.push_back(*metadata);
+  }
+  multifileHybridReader_ = std::make_unique<CudfHybridScanMultifile>(
+      cudf::host_span<const cudf::io::parquet::FileMetaData>{metadatas},
+      readerOptions_);
+}
+
+void CudfSplitReader::setupPreparedHybridScan() {
+  VELOX_CHECK(preparedHybridScan_.has_value());
+  VELOX_CHECK_NOT_NULL(multifileHybridReader_);
+  std::call_once(*preparedHybridScan_->setupOnce, [&]() {
+    const auto planned = multifileHybridReader_->all_column_chunks_byte_ranges(
+        preparedHybridScan_->rowGroups, readerOptions_);
+    const auto& [ranges, sourceIndices] = planned;
+    VELOX_CHECK_EQ(ranges.size(), sourceIndices.size());
+    preparedHybridH2dCopies_ = ranges.size();
+    preparedHybridH2dBytes_ = 0;
+    for (const auto& range : ranges) {
+      VELOX_CHECK_GE(range.size(), 0);
+      VELOX_CHECK_LE(
+          static_cast<uint64_t>(range.size()),
+          std::numeric_limits<uint64_t>::max() - preparedHybridH2dBytes_,
+          "Prepared Hybrid Scan H2D byte count overflow");
+      preparedHybridH2dBytes_ += static_cast<uint64_t>(range.size());
+    }
+
+    std::vector<std::reference_wrapper<cudf::io::datasource>> sourceRefs;
+    sourceRefs.reserve(1 + coalescedDataSources_.size());
+    sourceRefs.emplace_back(*dataSource_);
+    for (const auto& source : coalescedDataSources_) {
+      sourceRefs.emplace_back(*source);
+    }
+    const auto stagingBytes = hybridH2dStagingBytes();
+    preparedPackedH2dStats_ = {};
+    const bool packReadyLeases =
+        stagingBytes != 0 &&
+        std::all_of(sourceRefs.begin(), sourceRefs.end(), [](auto source) {
+          return dynamic_cast<HostRangeLeaseDataSource*>(&source.get()) !=
+              nullptr;
+        });
+    if (packReadyLeases) {
+      auto packed = fetchPackedByteRangesToDevice(
+          sourceRefs,
+          ranges,
+          sourceIndices,
+          stagingBytes,
+          stream_,
+          get_temp_mr());
+      preparedHybridScan_->columnChunkBuffers.emplace_back(
+          std::move(packed.buffer));
+      preparedHybridScan_->columnChunkData = std::move(packed.spans);
+      preparedPackedH2dStats_ = packed.stats;
+    } else {
+      // Preserve the generic path when staging is disabled or the inputs
+      // are not lease-backed. Packing must never introduce serial backing I/O.
+      std::vector<std::vector<cudf::io::text::byte_range_info>> perSource(
+          sourceRefs.size());
+      for (size_t i = 0; i < ranges.size(); ++i) {
+        VELOX_CHECK_GE(sourceIndices[i], 0);
+        VELOX_CHECK_LT(static_cast<size_t>(sourceIndices[i]), perSource.size());
+        perSource[sourceIndices[i]].push_back(ranges[i]);
+      }
+      auto [buffers, perSourceSpans, reads] =
+          cudf::io::parquet::fetch_byte_ranges_to_device_async(
+              sourceRefs, perSource, stream_, get_temp_mr());
+      reads.get();
+      preparedHybridScan_->columnChunkBuffers = std::move(buffers);
+      preparedHybridScan_->columnChunkData.reserve(ranges.size());
+      for (const auto& spans : perSourceSpans) {
+        preparedHybridScan_->columnChunkData.insert(
+            preparedHybridScan_->columnChunkData.end(),
+            spans.begin(),
+            spans.end());
+      }
+    }
+    VELOX_CHECK_EQ(preparedHybridScan_->columnChunkData.size(), ranges.size());
+
+    multifileHybridReader_->setup_chunking_for_all_columns(
+        cudfHiveConfig_->maxChunkReadLimitSession(
+            connectorQueryCtx_->sessionProperties()),
+        cudfHiveConfig_->maxPassReadLimitSession(
+            connectorQueryCtx_->sessionProperties()),
+        preparedHybridScan_->rowGroups,
+        preparedHybridScan_->columnChunkData,
+        readerOptions_,
+        stream_,
+        determineCudfMemoryResource());
+  });
 }
 
 void CudfSplitReader::totalScanTimeCalculator(void* userData) {

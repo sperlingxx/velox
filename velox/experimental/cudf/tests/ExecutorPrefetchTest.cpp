@@ -452,6 +452,164 @@ TEST_F(HybridH2dStagingTest, drainsSubmittedCopyOnReadFailure) {
   EXPECT_THROW(pending.get(), std::runtime_error);
 }
 
+TEST_F(HybridH2dStagingTest, packsMultipleSourcesInOriginalRangeOrder) {
+  auto first = source("0123456789abcdefghijklmnopqrstuvwxyz");
+  auto second = source("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnop");
+  std::vector<std::reference_wrapper<cudf::io::datasource>> sources{
+      *first, *second};
+  const std::vector<cudf::io::text::byte_range_info> ranges{
+      {2, 5}, {10, 25}, {1, 0}, {1, 9}};
+  // Interleave source indices to detect accidental regrouping of spans.
+  const std::vector<cudf::size_type> indices{1, 0, 1, 1};
+  rmm::cuda_stream stream;
+  for (const size_t capacity : {16, 128}) {
+    auto packed = fetchPackedByteRangesToDevice(
+        sources,
+        ranges,
+        indices,
+        capacity,
+        stream,
+        cudf::get_current_device_resource_ref());
+    ASSERT_EQ(packed.spans.size(), ranges.size());
+    std::string actual(39, '\0');
+    CUDF_CUDA_TRY(cudaMemcpy(
+        actual.data(),
+        packed.buffer.data(),
+        actual.size(),
+        cudaMemcpyDeviceToHost));
+    EXPECT_EQ(actual, "CDEFGabcdefghijklmnopqrstuvwxyBCDEFGHIJ");
+    size_t offset = 0;
+    for (size_t i = 0; i < ranges.size(); ++i) {
+      EXPECT_EQ(
+          packed.spans[i].data(),
+          static_cast<const uint8_t*>(packed.buffer.data()) + offset);
+      EXPECT_EQ(packed.spans[i].size(), ranges[i].size());
+      offset += ranges[i].size();
+    }
+    EXPECT_EQ(packed.stats.bytes, actual.size());
+    EXPECT_EQ(packed.stats.copies, (actual.size() + capacity - 1) / capacity);
+    EXPECT_EQ(packed.stats.pageableBytes, 0);
+    EXPECT_GT(packed.stats.gatherNanos, 0);
+    EXPECT_GT(packed.stats.stagingWaitNanos, 0);
+    EXPECT_GE(
+        packed.stats.peakStagingBytes, 2 * std::min(capacity, actual.size()));
+  }
+}
+
+TEST_F(HybridH2dStagingTest, packedEmptyAndInvalidRanges) {
+  auto input = source("abcd");
+  std::vector<std::reference_wrapper<cudf::io::datasource>> sources{*input};
+  const std::vector<cudf::io::text::byte_range_info> emptyRanges{
+      {0, 0}, {4, 0}};
+  const std::vector<cudf::size_type> indices{0, 0};
+  rmm::cuda_stream stream;
+  const auto mr = cudf::get_current_device_resource_ref();
+  auto empty = fetchPackedByteRangesToDevice(sources, {}, {}, 16, stream, mr);
+  EXPECT_EQ(empty.buffer.size(), 0);
+  EXPECT_TRUE(empty.spans.empty());
+  auto zeros = fetchPackedByteRangesToDevice(
+      sources, emptyRanges, indices, 16, stream, mr);
+  EXPECT_EQ(zeros.spans.size(), 2);
+  EXPECT_EQ(zeros.stats.copies, 0);
+  EXPECT_EQ(zeros.stats.peakStagingBytes, 0);
+  const std::vector<cudf::io::text::byte_range_info> pastEof{{2, 3}};
+  const std::vector<cudf::size_type> validIndex{0};
+  const std::vector<cudf::size_type> badIndex{1};
+  EXPECT_THROW(
+      fetchPackedByteRangesToDevice(
+          sources, pastEof, validIndex, 16, stream, mr),
+      VeloxException);
+  EXPECT_THROW(
+      fetchPackedByteRangesToDevice(sources, pastEof, badIndex, 16, stream, mr),
+      VeloxException);
+  EXPECT_THROW(
+      fetchPackedByteRangesToDevice(sources, pastEof, {}, 16, stream, mr),
+      VeloxException);
+  EXPECT_THROW(
+      fetchPackedByteRangesToDevice(sources, {}, {}, 0, stream, mr),
+      VeloxException);
+}
+
+TEST_F(HybridH2dStagingTest, packedDrainsCopiesOnCompletionAndReadFailure) {
+  for (const bool fail : {false, true}) {
+    rmm::cuda_stream stream;
+    H2dTestStreamGate gate;
+    std::promise<void> secondRead;
+    auto secondReady = secondRead.get_future();
+    auto input = source(std::string(64, 'x'), [&](size_t read) {
+      if (read == 1) {
+        gate.enqueue(stream);
+      } else {
+        secondRead.set_value();
+        if (fail) {
+          throw std::runtime_error("injected packed read failure");
+        }
+      }
+    });
+    auto pending = std::async(std::launch::async, [&] {
+      const std::vector<std::reference_wrapper<cudf::io::datasource>> sources{
+          *input};
+      const std::vector<cudf::io::text::byte_range_info> ranges{{4, 32}};
+      const std::vector<cudf::size_type> indices{0};
+      return fetchPackedByteRangesToDevice(
+          sources,
+          ranges,
+          indices,
+          16,
+          stream,
+          cudf::get_current_device_resource_ref());
+    });
+    SCOPE_EXIT {
+      gate.release();
+      if (pending.valid()) {
+        pending.wait();
+      }
+      stream.synchronize();
+    };
+    EXPECT_EQ(secondReady.wait_for(5s), std::future_status::ready);
+    EXPECT_EQ(pending.wait_for(50ms), std::future_status::timeout);
+    gate.release();
+    if (fail) {
+      EXPECT_THROW(pending.get(), std::runtime_error);
+    } else {
+      auto packed = pending.get();
+      EXPECT_EQ(packed.stats.copies, 2);
+      EXPECT_EQ(packed.stats.bytes, 32);
+    }
+  }
+}
+
+TEST_F(HybridH2dStagingTest, packedRejectsShortRead) {
+  class ShortDataSource final : public BufferedInputDataSource {
+   public:
+    using BufferedInputDataSource::BufferedInputDataSource;
+
+    size_t host_read(size_t offset, size_t size, uint8_t* destination)
+        override {
+      const auto bytes =
+          BufferedInputDataSource::host_read(offset, size, destination);
+      return bytes == 0 ? 0 : bytes - 1;
+    }
+  };
+  auto input = std::make_shared<ShortDataSource>(
+      std::make_shared<dwio::common::BufferedInput>(
+          std::make_shared<InMemoryReadFile>(std::string("abcd")), *pool_));
+  const std::vector<std::reference_wrapper<cudf::io::datasource>> sources{
+      *input};
+  const std::vector<cudf::io::text::byte_range_info> ranges{{0, 4}};
+  const std::vector<cudf::size_type> indices{0};
+  rmm::cuda_stream stream;
+  EXPECT_THROW(
+      fetchPackedByteRangesToDevice(
+          sources,
+          ranges,
+          indices,
+          16,
+          stream,
+          cudf::get_current_device_resource_ref()),
+      VeloxException);
+}
+
 TEST_F(CacheHintRangeStatsTest, countsPhysicalChunkRelativeKeys) {
   constexpr uint64_t kQuantum = 1024;
   std::string content(4 * kQuantum, 'x');

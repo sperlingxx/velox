@@ -90,6 +90,20 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
   // subclass(es).
   virtual void convertSplit(std::shared_ptr<ConnectorSplit> split);
 
+  /// Handles an in-process split that performs preparation without creating a
+  /// reader for the current TableScan driver. Returns true when handled.
+  virtual bool prepareSplitOnly(
+      const std::shared_ptr<ConnectorSplit>& split,
+      CudfSplitReader& reader,
+      dwio::common::RuntimeStatistics& runtimeStats);
+
+  void setPreparedDataSources(
+      std::vector<std::shared_ptr<cudf::io::datasource>> dataSources);
+
+  void setPreparedHybridScan(PreparedHybridScanBatch batch);
+
+  void recordPreparedBatch(size_t units, size_t sources, uint64_t bytes);
+
   std::shared_ptr<CudfHiveConnectorSplit> split_;
   std::shared_ptr<const ::facebook::velox::connector::hive::HiveTableHandle>
       tableHandle_;
@@ -114,6 +128,9 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
 
   bool useExperimentalCudfReader_;
 
+  std::vector<std::shared_ptr<cudf::io::datasource>> preparedDataSources_;
+  std::optional<PreparedHybridScanBatch> preparedHybridScan_;
+
   // Cached combined subfield filter expression owned by 'subfieldTree_'.
   cudf::ast::expression const* subfieldFilterExpr_{nullptr};
 
@@ -128,6 +145,16 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
   size_t completedRows_{0};
   size_t completedBytes_{0};
   int64_t numFilesCoalesced_{0};
+  uint64_t readyBatches_{0};
+  uint64_t readyUnits_{0};
+  uint64_t readySources_{0};
+  uint64_t readySelectedBytes_{0};
+  uint64_t preparedLeaseReadCalls_{0};
+  uint64_t preparedLeaseReadBytes_{0};
+  uint64_t preparedHybridH2dCopies_{0};
+  uint64_t preparedHybridH2dBytes_{0};
+  PackedH2dStats preparedPackedH2dStats_;
+  bool activePreparedBatch_{false};
 
   dwio::common::RuntimeStatistics runtimeStats_;
 

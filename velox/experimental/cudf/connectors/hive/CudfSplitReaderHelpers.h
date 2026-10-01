@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "velox/experimental/cudf/connectors/hive/CudfScanPreparation.h"
 #include "velox/experimental/cudf/connectors/hive/ExecutorSplitPrefetch.h"
 #include "velox/experimental/cudf/connectors/hive/PinnedHostBuffer.h"
 
@@ -195,6 +196,18 @@ class BufferedInputDataSource : public cudf::io::datasource {
       const std::vector<cudf::io::text::byte_range_info>& byteRanges) const;
 
   std::optional<uint64_t> cacheFileNum() const;
+
+  /// Returns the conservative cache allocation charge for these ranges
+  /// without reading their payload. Returns nullopt for a non-cache input.
+  std::optional<uint64_t> hostRangeReservationBytes(
+      const std::vector<cudf::io::text::byte_range_info>& byteRanges) const;
+
+  /// Reads every requested cache range and transfers ownership of the backing
+  /// cache entries into one admitted lease. No device work is started.
+  std::unique_ptr<HostRangeLease> prepareHostRangeLease(
+      const std::vector<cudf::io::text::byte_range_info>& byteRanges,
+      HostRangeAdmission& admission,
+      const folly::CancellationToken& cancellationToken = {});
 
  private:
   size_t readBuffered(size_t offset, size_t size, uint8_t* dst);
@@ -500,6 +513,50 @@ using FetchedDeviceByteRanges = std::tuple<
     std::vector<rmm::device_buffer>,
     std::vector<cudf::device_span<const uint8_t>>,
     std::future<void>>;
+
+/// Payload copies only, not logical ranges or cuDF's internal metadata copies.
+/// Host wait time includes slot reuse and final completion, not GPU copy time.
+struct PackedH2dStats {
+  uint64_t copies{0};
+  uint64_t bytes{0};
+  uint64_t pageableBytes{0};
+  uint64_t gatherNanos{0};
+  uint64_t stagingWaitNanos{0};
+  uint64_t peakStagingBytes{0};
+
+  PackedH2dStats& operator+=(const PackedH2dStats& other) {
+    copies += other.copies;
+    bytes += other.bytes;
+    pageableBytes += other.pageableBytes;
+    gatherNanos += other.gatherNanos;
+    stagingWaitNanos += other.stagingWaitNanos;
+    peakStagingBytes = std::max(peakStagingBytes, other.peakStagingBytes);
+    return *this;
+  }
+};
+
+struct PackedDeviceByteRanges {
+  rmm::device_buffer buffer;
+  std::vector<cudf::device_span<const uint8_t>> spans;
+  PackedH2dStats stats;
+};
+
+/// Per-slot capacity from GLUTEN_CUDF_HYBRID_H2D_STAGING_BYTES. Zero disables
+/// packing; this is independent of the ready-batch grouping byte target.
+size_t hybridH2dStagingBytes();
+
+/// Gather already host-ready ranges across sources into bounded pinned slots
+/// and one device allocation. Spans retain the input order and exact lengths;
+/// file gaps are omitted. Completes H2D before returning. No backing I/O is
+/// initiated here; callers must supply host-ready datasources (prepared leases
+/// in the scan path). Staging capacity must be positive.
+PackedDeviceByteRanges fetchPackedByteRangesToDevice(
+    cudf::host_span<const std::reference_wrapper<cudf::io::datasource>> sources,
+    cudf::host_span<const cudf::io::text::byte_range_info> ranges,
+    cudf::host_span<const cudf::size_type> sourceIndices,
+    size_t stagingBytes,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr);
 
 /// Fetch supported packed remote ranges into host memory only. Returns null
 /// for data sources that use the existing direct/device paths.

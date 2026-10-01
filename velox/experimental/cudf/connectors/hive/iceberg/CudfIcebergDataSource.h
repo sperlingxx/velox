@@ -63,6 +63,11 @@ class CudfIcebergDataSource : public ::facebook::velox::cudf_velox::connector::
   // `CudfHiveConnectorSplit`
   void convertSplit(std::shared_ptr<ConnectorSplit> split) override;
 
+  bool prepareSplitOnly(
+      const std::shared_ptr<ConnectorSplit>& split,
+      CudfSplitReader& reader,
+      dwio::common::RuntimeStatistics& runtimeStats) override;
+
  private:
   std::shared_ptr<const velox_hive::HiveConfig> hiveConfig_;
   std::shared_ptr<const velox_iceberg::HiveIcebergSplit> icebergSplit_;

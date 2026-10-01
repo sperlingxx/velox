@@ -109,6 +109,40 @@ velox_add_cudf_test(
 )
 
 velox_add_cudf_test(
+  NAME velox_cudf_scan_preparation_test
+  SOURCES Main.cpp CudfScanPreparationTest.cpp
+  LIBS
+    velox_cudf_hive_connector
+    velox_cudf_iceberg_connector
+    velox_cudf_exec
+    velox_exec_test_lib
+)
+
+add_executable(
+  velox_cudf_hybrid_scan_multifile_api_test
+  HybridScanMultifileApiTest.cpp
+)
+set_target_properties(
+  velox_cudf_hybrid_scan_multifile_api_test
+  PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CUDF_TESTS_OUTPUT_DIR}
+)
+add_test(
+  NAME velox_cudf_hybrid_scan_multifile_api_test
+  COMMAND velox_cudf_hybrid_scan_multifile_api_test
+  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+)
+set_tests_properties(
+  velox_cudf_hybrid_scan_multifile_api_test
+  PROPERTIES LABELS cuda_driver TIMEOUT 300
+)
+target_link_libraries(
+  velox_cudf_hybrid_scan_multifile_api_test
+  cudf::cudf
+  gtest
+  gtest_main
+)
+
+velox_add_cudf_test(
   NAME velox_cudf_decimal_aggregation_test
   SOURCES Main.cpp DecimalAggregationTest.cpp
   LIBS ${CUDF_TEST_DEFAULT_LIBS} velox_functions_test_lib

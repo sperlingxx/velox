@@ -199,6 +199,14 @@ class PinnedHostBuffer {
     return size_;
   }
 
+  bool isPinned() const {
+    return pinned_;
+  }
+
+  size_t allocatedBytes() const {
+    return pooled_ ? capacity_ : size_;
+  }
+
  private:
   // Keep any executor-wide byte reservation alive until after the allocation
   // is released by the destructor body.

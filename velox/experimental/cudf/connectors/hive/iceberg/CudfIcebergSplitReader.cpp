@@ -114,6 +114,71 @@ CudfIcebergSplitReader::CudfIcebergSplitReader(
       hiveConfig_(hiveConfig),
       initialReadColumnNames_(readColumnNames) {}
 
+std::optional<PreparedHostReadyDataSource>
+CudfIcebergSplitReader::prepareHostReadyFile(
+    HostRangeAdmission& admission,
+    const folly::CancellationToken& cancellationToken,
+    dwio::common::RuntimeStatistics& runtimeStats) {
+  VELOX_CHECK(
+      icebergSplit_->deleteFiles.empty(),
+      "Host-ready file preparation does not support delete files");
+  VELOX_CHECK(
+      icebergSplit_->coalescedFiles.empty(),
+      "Host-ready file preparation requires a singleton descriptor");
+
+  if (!initializeHostPlanning(runtimeStats)) {
+    return std::nullopt;
+  }
+  return prepareHostReadyDataSource(admission, cancellationToken);
+}
+
+std::optional<PreparedParquetFilePlan>
+CudfIcebergSplitReader::planHostReadyFile(
+    HostRangeAdmission& admission,
+    const folly::CancellationToken& cancellationToken,
+    dwio::common::RuntimeStatistics& runtimeStats) {
+  VELOX_CHECK(icebergSplit_->deleteFiles.empty());
+  VELOX_CHECK(icebergSplit_->coalescedFiles.empty());
+  if (!initializeHostPlanning(runtimeStats)) {
+    return std::nullopt;
+  }
+  return planHostReadyRowGroups(admission, cancellationToken);
+}
+
+std::shared_ptr<cudf::io::datasource>
+CudfIcebergSplitReader::prepareHostReadyRowGroup(
+    const std::vector<cudf::io::text::byte_range_info>& ranges,
+    HostRangeAdmission& admission,
+    const folly::CancellationToken& cancellationToken) {
+  VELOX_CHECK(icebergSplit_->deleteFiles.empty());
+  VELOX_CHECK(icebergSplit_->coalescedFiles.empty());
+  CudfSplitReader::resetSplit();
+  resetSplit();
+  stream_ = cudfGlobalStreamPool().get_stream();
+  return CudfSplitReader::prepareHostReadyRowGroup(
+      ranges, admission, cancellationToken);
+}
+
+bool CudfIcebergSplitReader::initializeHostPlanning(
+    dwio::common::RuntimeStatistics& runtimeStats) {
+  CudfSplitReader::resetSplit();
+  resetSplit();
+  fallbackSplits_.clear();
+  runtimeStats_ = &runtimeStats;
+  readColumnNames_ = initialReadColumnNames_;
+  stream_ = cudfGlobalStreamPool().get_stream();
+  cacheSchemaFromMetadata();
+  adaptColumns();
+  noColumnsToRead_ = readColumnNames_.empty();
+  if (noColumnsToRead_) {
+    return false;
+  }
+  deferSubfieldFilter_ =
+      CudfSplitReader::subfieldFilter() != nullptr && !injectedColumns_.empty();
+  prependRowIndex_ = needPrependedRowIndex();
+  return true;
+}
+
 void CudfIcebergSplitReader::resetSplit() {
   deletionVectorReader_.reset();
   positionalDeleteFileReaders_.clear();
@@ -150,7 +215,7 @@ void CudfIcebergSplitReader::prepareSplitInternal(
   resetSplit();
   readColumnNames_ = initialReadColumnNames_;
 
-  if (!split_->coalescedFiles.empty()) {
+  if (!split_->coalescedFiles.empty() && !hasPreparedHybridScan()) {
     if (!loadCoalescedFileMetadataAndCheckSchemas()) {
       VLOG(1) << "Falling back to single-file cuDF readers for an Iceberg "
                  "multi-file split with schema evolution";
